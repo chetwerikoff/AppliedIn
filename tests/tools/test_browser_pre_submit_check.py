@@ -829,6 +829,61 @@ async def test_raw_submit_uses_fresh_page_and_no_final_control_parity(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('drift', ['visibility', 'second_selected_option'])
+async def test_post_marker_unreviewed_control_drift_never_reaches_raw_submit(
+        monkeypatch, tmp_path, drift):
+    """The existing post-marker identity must include all selected values."""
+    controller, page, _target, fixture = _world(monkeypatch, tmp_path)
+    if drift == 'visibility':
+        page['controls'][0]['visible'] = True
+    else:
+        page['controls'].insert(-1, {
+            'selector': '#preferences', 'label': 'Work preferences',
+            'question': 'Work preferences', 'tag': 'select', 'type': 'select',
+            'name': 'preferences', 'value': 'keep', 'multiple': True,
+            'visible': True, 'required': False, 'disabled': False,
+            'options': [{'value': 'keep', 'label': 'Keep'},
+                        {'value': 'other', 'label': 'Other'}],
+            'selected_options': [{'value': 'keep', 'label': 'Keep'}],
+            'in_form': True, 'form_selector': '#app', 'form_action': URL,
+        })
+    original_hold = forms.hold_possible_submission
+
+    def drift_after_marker(pk, step, **kwargs):
+        original_hold(pk, step, **kwargs)
+        if drift == 'visibility':
+            page['controls'][0]['visible'] = False
+        else:
+            page['controls'][-2]['selected_options'].append(
+                {'value': 'other', 'label': 'Other'})
+            assert page['controls'][-2]['value'] == 'keep'
+
+    monkeypatch.setattr(forms, 'hold_possible_submission', drift_after_marker)
+    raw_calls, approved_claims, guards = [], [], []
+    monkeypatch.setattr(forms, 'check_dispatch',
+                        lambda *a, **kw: guards.append('dispatch'))
+    monkeypatch.setattr(forms, 'check_before_committing_click',
+                        lambda *a, **kw: guards.append('after_marker'))
+
+    class FakeRaw:
+        async def call(self, *args, **kwargs):
+            # This is the exact approved-continuation precheck, including the
+            # claimed-generation hook, before the raw Submit effect.
+            await controller.check_pre_submit(
+                self, page, _target,
+                review_before_hold=lambda: approved_claims.append('claimed'))
+            raw_calls.append(args)
+
+    with pytest.raises(forms.Gate, match='Final application form changed after the own hold'):
+        await FakeRaw().call('click', '#submit')
+    assert fixture.held
+    assert approved_claims == ['claimed']
+    assert guards == ['dispatch', 'after_marker']
+    assert raw_calls == []
+    assert not controller.committed
+
+
+@pytest.mark.asyncio
 async def test_final_route_safety_failure_still_maps_to_item_one(
         monkeypatch, tmp_path):
     """Removing final parity cannot bypass existing tenant/CAPTCHA classifier."""
@@ -1449,3 +1504,38 @@ async def test_greenhouse_phone_country_local_choice_item_two(
         assert refused.value.item == 2
         assert refused.value.reason == 'defect_pre_submit_item_2'
         assert not fixture.held and not controller.committed
+
+
+
+@pytest.mark.asyncio
+async def test_review_precheck_keeps_form_unheld_and_not_committed(monkeypatch, tmp_path):
+    """Issue #301: all five predicates run without recording a possible click."""
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    await controller.check_pre_submit(None, page, target, validation_only=True)
+    assert fixture.held is False
+    assert fixture.row["status"] == "submitting"
+    assert controller.committed is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("at_start", "at_boundary"), [
+    (True, False), (False, True), (True, True),
+])
+async def test_submit_review_start_or_boundary_cannot_fall_through(
+        monkeypatch, tmp_path, at_start, at_boundary):
+    from core import flags
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    controller.submit_review_at_start = at_start
+    monkeypatch.setattr(flags, "submit_review_enabled", lambda: at_boundary)
+    review_calls = []
+
+    async def intercept(session, current, receiver, args, kwargs):
+        review_calls.append(tuple(args))
+        raise forms.Gate("synthetic final review refusal", reason="submit_review")
+
+    monkeypatch.setattr(controller, "_review_before_commit", intercept)
+    with pytest.raises(forms.Gate, match="synthetic final review refusal"):
+        await controller.before_ipc(None, ("click", "#submit"), {})
+    assert review_calls == [("click", "#submit")]
+    assert fixture.held is False
+    assert controller.committed is False

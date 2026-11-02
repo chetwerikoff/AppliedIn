@@ -306,6 +306,47 @@ class Session:
         # first navigation, which itself needs no context.
         self._tab_ready = False
         self._lock = asyncio.Lock()
+        # Keep the last transport check even when a session runner is substituted
+        # (e.g. a cooperating backend shim); the native runner repeats it after
+        # its context-sync awaits, immediately before raw IPC.
+        self._run = self._guarded_raw_run
+
+    @staticmethod
+    def _fixed_application_read(args) -> bool:
+        """Exact producer-owned passive readers, never a model-supplied script."""
+        from tools.browser_skill_dom import PAGE, ENTRY_PAGE, GREENHOUSE_PAGE
+        from tools.browser_skill_apply import (
+            _FIXED_CONTROL_WITNESS, _ENTRY_FIXED_CONTROL_WITNESS,
+            _GREENHOUSE_FIXED_CONTROL_WITNESS,
+        )
+        readers = (PAGE, ENTRY_PAGE, GREENHOUSE_PAGE, _FIXED_CONTROL_WITNESS,
+                   _ENTRY_FIXED_CONTROL_WITNESS, _GREENHOUSE_FIXED_CONTROL_WITNESS)
+        return (len(args) == 2 and args[0] == "evaluate"
+                and isinstance(args[1], str) and args[1] in readers)
+
+    def _check_review_raw_effect(self, args) -> None:
+        controller = self._application_controller
+        if self.kind != "apply" or controller is None:
+            return
+        if getattr(controller, "review_effect_args", None) is not None:
+            controller.final_review_effect_guard(self, args)
+        elif getattr(controller, "pending_commit_args", None) is not None:
+            # A normal OFF-mode Submit may have awaited a page or context sync
+            # while review mode turned ON. Check again at the real IPC edge.
+            controller.final_unreviewed_effect_guard(self, args)
+        elif getattr(controller, "committed", False) and not self._fixed_application_read(args):
+            # The transient one-shot permission is gone after its attempt, but
+            # even a direct internal raw runner must never regain write access.
+            raise Unavailable("Raw application IPC refused after committing attempt.")
+
+    async def _guarded_raw_run(self, args, kwargs):
+        self._check_review_raw_effect(args)
+        result = await type(self)._run(self, args, kwargs)
+        controller = self._application_controller
+        if (self.kind == "apply" and controller is not None
+                and getattr(controller, "review_effect_args", None) is not None):
+            controller.review_raw_effect_started = True
+        return result
 
     def bind_application_controller(self, controller):
         """Bind once to the actual application controller; raw calls gain no authority."""
@@ -328,8 +369,63 @@ class Session:
         finally:
             # Stable local PDF bytes alone cannot prove an interrupted upload
             # completed. The final guard cannot accept a failed CLI transfer.
-            await self._application_controller.after_ipc(
-                self, args, kwargs, succeeded=succeeded)
+            try:
+                await self._application_controller.after_ipc(
+                    self, args, kwargs, succeeded=succeeded)
+            finally:
+                controller = self._application_controller
+                holder = getattr(controller, "review_holder", None)
+                try:
+                    if holder is not None and controller.committed:
+                        from tools import submit_review
+                        # Revocation before raw IPC is never a successful reviewer
+                        # continuation, even when the original marker was staged.
+                        if getattr(controller, "review_raw_effect_started", False):
+                            submit_review.finish(holder)
+                        else:
+                            submit_review.invalidate(holder, "invalidated")
+                finally:
+                    # The one committing attempt spent its transient argv grant.
+                    # The permanent committed/submit_hold guards still forbid
+                    # further mutations; fixed read-only confirmation can resume.
+                    controller.review_effect_args = None
+                    controller.pending_commit_args = None
+
+    async def review_screenshot(self) -> bytes:
+        """One read-only screenshot of this owned application tab, never shared.
+
+        BrowserSkill writes an exact PNG into a private temporary directory;
+        the screenshot never enters CLI logs, model prompts, or public artifacts.
+        """
+        from tempfile import mkdtemp
+        from tools import submit_review
+        if (self.kind != "apply" or not self.id
+                or self._application_controller is None
+                or self.owner is not asyncio.current_task()):
+            raise Unavailable("The original application session is unavailable.")
+        directory = Path(mkdtemp(prefix=".capture-", dir=submit_review._private_root()))
+        path = directory / "screenshot.png"
+        try:
+            result = await self._run(("screenshot", "--out", str(path)), {})
+            reported = result.get("path")
+            if reported is None and isinstance(result.get("data"), dict):
+                reported = result["data"].get("path")
+            if (not isinstance(reported, str) or Path(reported).absolute() != path
+                    or path.is_symlink() or not path.is_file()
+                    or path.stat().st_size > 12_000_000):
+                raise Unavailable("The private application screenshot is unavailable.")
+            path.chmod(0o600)
+            data = path.read_bytes()
+            if not data.startswith(b"\x89PNG\r\n\x1a\n") or not data:
+                raise Unavailable("The private application screenshot is not PNG.")
+            return data
+        finally:
+            if not path.is_symlink():
+                path.unlink(missing_ok=True)
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
 
     async def sync_context(self, *, settle: bool = True) -> str:
         """Fetch the latest cooperation context; absent or malformed fails closed.
@@ -392,6 +488,13 @@ class Session:
                             extra += ("--observation", self._observation)
                     # Spent whether or not the action succeeds: never reuse it.
                     self._context = self._observation = ""
+                # Every await above could have changed the effective mode,
+                # company lease, reviewer generation or tab ownership. Inspect
+                # immediately before invoking the raw committing CLI.
+                self._check_review_raw_effect(args)
+                if (self.kind == "apply" and self._application_controller is not None
+                        and getattr(self._application_controller, "review_effect_args", None) is not None):
+                    self._application_controller.review_raw_effect_started = True
                 try:
                     result = await command(*args, *extra, "--session", self.id, **kwargs)
                 except Unavailable as exc:
@@ -460,19 +563,9 @@ class Session:
 
     async def call(self, *args, **kwargs):
         if self.kind == "apply":
-            # At this privileged producer even an otherwise authenticated raw
-            # click or executable evaluation must have zero CLI effect. Only
-            # fixed code-owned observation scripts are harmless raw reads.
-            from tools.browser_skill_dom import PAGE, ENTRY_PAGE, GREENHOUSE_PAGE
-            from tools.browser_skill_apply import (
-                _FIXED_CONTROL_WITNESS, _ENTRY_FIXED_CONTROL_WITNESS,
-                _GREENHOUSE_FIXED_CONTROL_WITNESS,
-            )
-            readers = (PAGE, ENTRY_PAGE, GREENHOUSE_PAGE, _FIXED_CONTROL_WITNESS,
-                       _ENTRY_FIXED_CONTROL_WITNESS, _GREENHOUSE_FIXED_CONTROL_WITNESS)
-            if (len(args) != 2 or args[0] != "evaluate"
-                    or not isinstance(args[1], str)
-                    or not any(args[1] == reader for reader in readers)):
+            # At this producer, only code-owned fixed read-only scripts are
+            # exposed through call(), before and after the one Submit attempt.
+            if not self._fixed_application_read(args):
                 raise Unavailable("Raw application IPC refused before BrowserSkill CLI.")
         return await self._run(args, kwargs)
 

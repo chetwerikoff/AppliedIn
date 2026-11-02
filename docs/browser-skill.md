@@ -107,6 +107,70 @@ BrowserSkill daemon even while AppliedIn itself is already running.
 Use **Check setup** to verify the engine and selected profile connection. A code
 change still requires an AppliedIn restart; the daemon does not hot reload.
 
+## Optional final Submit review (Issue #301)
+
+**OFF by default.** The local dashboard has a separate **Final Submit review**
+switch under Settings. It does not change ordinary apply-mode approvals and never
+submits an application by itself. ON is accepted only for the selected
+`browser_skill` engine; otherwise the exact refusal is
+`submit_review requires the browser_skill engine`. A malformed, absent or
+unreadable Redis value is OFF. Restarting or disabling the review mode does
+not grant outstanding submissions.
+
+With ON observed either at the start of a BrowserSkill application run or at
+the final raw submitting IPC, the *original* dedicated application session
+performs the five existing pre-Submit checks without creating a possible-submit
+hold. The same live task captures one read-only screenshot and the complete
+visible form-owned control inventory. The packet includes labels, current field
+values, selected display captions and their linked hidden machine values,
+selected native options, attachment filename and PDF provenance, plus the exact
+Submit receiver and job identity. If the form cannot be inspected fully, or any
+identity changes during capture, no review grant or click exists.
+
+The packet and PNG exist **only** in a private, time-bounded
+`settings.local_dir/submit-review/` subdirectory (0700 dirs, 0600 files).
+The normal tracking row holds only a pending/rejected/expired state, an opaque
+generation and deadline. Private form values and PNG bytes must not appear in
+agent logs, events, prompts, public artifacts or ordinary dashboard projections.
+Reviewer Reject notes are private and bounded; no reviewer text is a
+persistent approval authority.
+
+The Needs you tab shows **Inspect form & decide** only for a pending generation.
+Its private detail modal exposes the full current inventory, a current PNG and
+separate **Reject · no Submit** and **Approve exact form** actions. This is not
+the ordinary Approve / Resume / Mark applied flow. Every decision carries the
+exact generation. A review expires after **10 monotonic minutes** and a
+generation can be claimed only once. Reject never calls Submit; expiry, stale
+generation, changed packet, missing tab/lease, Redis outage, mode OFF or restart
+invalidate the grant. They require a separately initiated fresh run; ordinary
+retry/revive and bulk approval cannot resume that old generation.
+
+After Approve, the original task alone reads back the same form, compares
+every visible control and hidden linked value, reruns all five checks and
+re-establishes the original duplicate/tenant/PDF/lease checks. Only then does
+the existing independent possible-submission marker protect the final raw
+BrowserSkill click. No application is marked `applied` merely because the owner
+approved: actual employer confirmation remains necessary, and interrupted
+committing effects retain the stronger portal-verification/uncertainty gate.
+
+The private packet GET, Reject/Approve POST and settings toggle POST all
+require local mode, a loopback peer, and the exact expected loopback Host:port.
+Under r09, packet **GET** requires a present Origin to match exactly
+`http://<Host>`; when Origin is absent, `Sec-Fetch-Site` must be
+`same-origin`, `none`, or absent. Anonymous `cross-site` and `same-site`
+GET requests are denied. Both the mode and review-decision **POSTs** require
+Origin exactly `http://<Host>`; missing or foreign Origins, including
+extension schemes, are denied. These route-local guards contain requests to
+the existing first-party loopback boundary, not authentication of other
+processes on the trusted machine (which can spoof these headers).
+
+**Verification boundary:** authoring these files is *not* proof of a successful
+live Submit flow. Tests are offline with synthetic employers and synthetic forms.
+A post-merge operator smoke is permitted only after acceptance, with a single
+synthetic **Reject-only** rehearsal and confirmation of zero raw Submit effects.
+Do not enable the flag, approve real applications, or perform real smoke from
+this implementation task.
+
 ## Greenhouse careers-page wrappers (operator verified)
 
 A custom employer-origin careers page is **not** a Greenhouse board merely

@@ -77,7 +77,16 @@ async def run_task(*args, urls=None, **kwargs):
 
 
 async def apply(*args, **kwargs):
+    # Check before invoking any engine: only BrowserSkill owns the raw final
+    # application IPC guard. No fallback to an unguarded Chrome producer.
     engine = backend()
+    from core import flags
+    if flags.submit_review_enabled():
+        from tools import browser_skill
+        if engine is not browser_skill:
+            reason = "submit_review requires the browser_skill engine"
+            return {"status": "gate", "reason": reason,
+                    "question": reason, "review_route": "hard_refusal"}
     return await engine.apply_chrome(*args, **kwargs)
 
 

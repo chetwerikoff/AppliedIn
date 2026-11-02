@@ -10,11 +10,12 @@ DynamoDB — same contract, different host.
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI
-from fastapi.responses import Response, StreamingResponse
+from fastapi import BackgroundTasks, FastAPI, Request, HTTPException
+from fastapi.responses import Response, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from core.config import get_settings
@@ -302,6 +303,10 @@ def _to_ui(row: dict, artifacts) -> dict:
             (row.get("gate_pending") or {}).get("form_question"), dict),
         "gate_has_call_id": bool(row.get("gate_call_id")),
         **_owner_gate_tokens(row),
+        **({"gate_generation": row.get("gate_generation"),
+            "review_state": row.get("review_state"),
+            "review_expires_at": row.get("review_expires_at")}
+           if row.get("gate_reason") == "submit_review" else {}),
         "possible_submission": row.get("possible_submission") is True,
         "fail_kind": row.get("fail_kind") or "",
         "fail_reason": row.get("fail_reason") or "",
@@ -465,13 +470,73 @@ def _commit_manual_posting(pk: str, stores, inspected: dict) -> bool:
         source_witness=jd.matched_source_witness(current, inspected)))
 
 
+
+
+def _require_submit_review_first_party(request: Request) -> None:
+    """Strict *route-local* first-party containment, not local client auth.
+
+    Host/Origin are spoofable by an already-trusted loopback process. A packet
+    GET may omit Origin for a direct/same-origin browser request; both POSTs
+    require an exact Origin before reading or changing any review state.
+    """
+    from ipaddress import ip_address
+
+    def deny():
+        raise HTTPException(403, "Submit review requires a local first-party request.",
+                            headers={"Cache-Control": "no-store"})
+
+    if get_settings().mode != "local":
+        deny()
+    peer = getattr(request.client, "host", "") if request.client else ""
+    try:
+        if not ip_address(peer).is_loopback:
+            deny()
+    except ValueError:
+        deny()
+    server = request.scope.get("server")
+    if (not isinstance(server, (tuple, list)) or len(server) < 2
+            or type(server[1]) is not int or not 0 < server[1] <= 65535):
+        deny()
+    port = server[1]
+    allowed = {f"localhost:{port}", f"127.0.0.1:{port}", f"[::1]:{port}"}
+    hosts = request.headers.getlist("host")
+    origins = request.headers.getlist("origin")
+    fetch_sites = request.headers.getlist("sec-fetch-site")
+    if (len(hosts) != 1 or hosts[0] not in allowed
+            or len(origins) > 1 or len(fetch_sites) > 1):
+        deny()
+    # Exact equality also rules out extension schemes, credentials, alternate
+    # ports, paths and queries; duplicate/conflicting headers are never trusted.
+    if origins:
+        if origins[0] != "http://" + hosts[0]:
+            deny()
+    elif request.method != "GET" or (fetch_sites and
+                                     fetch_sites[0] not in {"same-origin", "none"}):
+        deny()
+    if request.url.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        deny()
+
+
+def _review_row_conflict(row: dict | None) -> bool:
+    from tools.submit_review import guarded_row
+    return guarded_row(row)
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="AppliedIn")
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        # Route registration/import must not touch the private store or Redis.
+        # Revoke orphaned generations only on ASGI startup, before requests.
+        submit_review.recover_orphans()
+        yield
+
+    app = FastAPI(title="AppliedIn", lifespan=lifespan)
     from discovery.career_ops_api import router as career_ops_router
     app.include_router(career_ops_router)
     from discovery.cosign_api import router as cosign_router
     app.include_router(cosign_router)
     settings = get_settings()
+    from tools import submit_review
 
     @app.get("/steering")
     def get_steering():
@@ -516,6 +581,16 @@ def create_app() -> FastAPI:
         # Live config: same-origin API, real data (not demo). Overrides web/config.js.
         return Response('window.APPLIEDIN_CONFIG = {demo:false, env:"local", apiUrl:""};\n',
                         media_type="application/javascript")
+
+    @app.get("/applications/{pk:path}/submit-review")
+    def submit_review_packet(pk: str, request: Request):
+        _require_submit_review_first_party(request)
+        try:
+            return JSONResponse(submit_review.packet_for(pk),
+                                headers={"Cache-Control": "no-store"})
+        except submit_review.Refused:
+            raise HTTPException(409, "No current approvable review packet.",
+                                headers={"Cache-Control": "no-store"}) from None
 
     @app.get("/applications")
     def applications():
@@ -686,6 +761,7 @@ def create_app() -> FastAPI:
                 "browser_status": browser_status(settings),
                 "queue_age_seconds": None, "paused": flags.paused(),
                 "apply_mode": flags.apply_mode(),
+                "submit_review": flags.submit_review_enabled(),
                 "headless": flags.browser_headless(),
                 "auto_min_score": settings.auto_min_score,
                 "counts_by_status": counts,
@@ -927,6 +1003,8 @@ def create_app() -> FastAPI:
         stores = make_stores(settings)
         if not stores.tracking.get(pk):
             return {"ok": False, "error": "unknown job"}
+        if _review_row_conflict(stores.tracking.get(pk)):
+            return {"ok": False, "error": "Submit review is held or closed; start a separate fresh application run."}
         stores.tracking.set_status(
             pk, Status.APPLIED_MANUAL,
             confirmation_id=str((body or {}).get("confirmation") or
@@ -1052,6 +1130,8 @@ def create_app() -> FastAPI:
         if not profile:
             return {"ok": False, "error": "no such profile"}
         stores = make_stores(settings)
+        if _review_row_conflict(stores.tracking.get(pk) or {}):
+            return {"ok": False, "error": "Submit review is held or closed; start a separate fresh application run."}
         if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
             return {'ok': False, 'error': submit_hold.REASON}
         out = prof.reapply(pk, profile, stores)
@@ -1246,6 +1326,8 @@ def create_app() -> FastAPI:
         row = stores.tracking.get(pk)
         if not row:
             return {"ok": False, "error": "unknown job"}
+        if _review_row_conflict(row):
+            return {"ok": False, "error": "Submit review is held or closed; start a separate fresh application run."}
         profile_id = str((body or {}).get("profile_id") or "")
         if profile_id and not prof.get(profile_id):
             return {"ok": False, "error": f"no profile {profile_id!r}"}
@@ -1562,7 +1644,7 @@ def create_app() -> FastAPI:
         stores = make_stores(settings)
         row = stores.tracking.get(pk) or {}
         q = ApplyQueue(stores.tracking.r)
-        if (row.get("status") != "skipped" or row.get("skip_reason") != "low_score"
+        if (_review_row_conflict(row) or row.get("status") != "skipped" or row.get("skip_reason") != "low_score"
                 or submit_hold.blocked(pk, row, tracking=stores.tracking)
                 or row.get("confirmation_id") or pk in q.in_flight()
                 or any(item["pk"] == pk for item in q.pending())):
@@ -1701,6 +1783,8 @@ def create_app() -> FastAPI:
                         jd_url="", jd_text=text, ats="custom")
         pk = job.pk
         if not stores.tracking.put_new(job):
+            if _review_row_conflict(stores.tracking.get(pk) or {}):
+                return {"ok": False, "error": "Submit review is held or closed; start a separate fresh application run."}
             if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
                 return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
             from tools import posting_guard as pg
@@ -1762,6 +1846,8 @@ def create_app() -> FastAPI:
         pk = job.pk
         is_new = stores.tracking.put_new(job)
         if not is_new:  # already tracked — re-tailor it from scratch
+            if _review_row_conflict(stores.tracking.get(pk) or {}):
+                return {"ok": False, "error": "Submit review is held or closed; start a separate fresh application run."}
             if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
                 return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
             # Do not reset a live/terminal row before its guarded compare.
@@ -1886,6 +1972,8 @@ def create_app() -> FastAPI:
         # the pipeline's next steps stream to the Logs view as they happen.
         from agent.run import resume_job
         stores = make_stores(settings)
+        if _review_row_conflict(stores.tracking.get(pk) or {}):
+            return {"ok": False, "error": "Submit review is held or closed; start a separate fresh application run."}
         if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         disposition = body.get("disposition")
@@ -1981,6 +2069,8 @@ def create_app() -> FastAPI:
             return {"ok": False, "error": error}
         try:
             row = stores.tracking.get(pk) or {}
+            if _review_row_conflict(row):
+                return {"ok": False, "error": "Submit review is held or closed; start a separate fresh application run."}
             if row.get("company") != company:
                 return {"ok": False, "error": "The job company changed; outcome was not recorded."}
             if failure := stopped_application_attempt(pk, stores.tracking):
@@ -2008,6 +2098,8 @@ def create_app() -> FastAPI:
             return {"ok": False, "error": error}
         try:
             row = stores.tracking.get(pk) or {}
+            if _review_row_conflict(row):
+                return {"ok": False, "error": "Submit review is held or closed; start a separate fresh application run."}
             if row.get("company") != company:
                 return {"ok": False, "error": "The job company changed; outcome was not recorded."}
             if failure := stopped_application_attempt(pk, stores.tracking):
@@ -2347,7 +2439,7 @@ def create_app() -> FastAPI:
         return company.strip(), list(dict.fromkeys(pks))
 
     def review_eligible(row: dict) -> bool:
-        return not submit_hold.blocked(row.get('pk', ''), row, tracking=make_stores(settings).tracking) and (row.get("status") == "tailored" or (
+        return not _review_row_conflict(row) and not submit_hold.blocked(row.get('pk', ''), row, tracking=make_stores(settings).tracking) and (row.get("status") == "tailored" or (
             row.get("status") == "needs_human"
             and (
                 row.get("gate_reason") == "approval"
@@ -2464,6 +2556,8 @@ def create_app() -> FastAPI:
                 row = stores.tracking.get(pk) or {}
                 if (row.get("company") or "").strip().lower() != company.lower():
                     raise ValueError("This role does not belong to the selected company.")
+                if _review_row_conflict(row):
+                    raise ValueError("Submit review is not a bulk review action.")
                 if pk in q.in_flight() or submit_hold.blocked(pk, row, tracking=stores.tracking) or row.get("confirmation_id") or row.get("status") == "submitting":
                     raise ValueError(
                         "This role is applying or submitted; refresh its current state."
@@ -2581,6 +2675,10 @@ def create_app() -> FastAPI:
         stores = make_stores(settings)
         if pk and submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
+        if (pk and _review_row_conflict(stores.tracking.get(pk))
+                or not pk and any(_review_row_conflict(row)
+                                  for row in stores.tracking.all())):
+            return {"ok": False, "error": "Submit review is held or closed; start a separate fresh application run."}
         n = ApplyQueue(stores.tracking.r).revive(pk)
         return {"ok": True, "revived": n}
 
@@ -2600,6 +2698,8 @@ def create_app() -> FastAPI:
             return {"ok": False, "error": f"no job {pk!r}"}
         # Never re-queue something already submitted — a duplicate under a real
         # name is worse than a missed application.
+        if _review_row_conflict(row):
+            return {"ok": False, "error": "Submit review is held or closed; start a separate fresh application run."}
         if submit_hold.blocked(pk, row, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if row.get("status") in ("applied", "applied_manual"):
@@ -2710,6 +2810,8 @@ def create_app() -> FastAPI:
         # click — or any bulk action reaching this endpoint — could erase the
         # record of something an employer had already received. The row is worth
         # more than the click.
+        if _review_row_conflict(row):
+            return {"ok": False, "error": "Submit review is held or closed; start a separate fresh application run."}
         if submit_hold.blocked(pk, row, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if status in ("applied", "applied_manual") or row.get("confirmation_id"):
@@ -2756,6 +2858,8 @@ def create_app() -> FastAPI:
             # dispatched a run for a pk that does not exist, which then sat in the
             # in-flight set holding that company's turn against nothing.
             return {"ok": False, "error": "No such job."}
+        if _review_row_conflict(row):
+            return {"ok": False, "error": "Submit review is held or closed; start a separate fresh application run."}
         if submit_hold.blocked(pk, row, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if row.get("status") in ("applied", "applied_manual"):
@@ -2833,6 +2937,8 @@ def create_app() -> FastAPI:
         from core.apply_queue import ApplyQueue
 
         stores = make_stores(settings)
+        if _review_row_conflict(stores.tracking.get(pk)):
+            return {"ok": False, "error": "Submit review is held or closed; start a separate fresh application run."}
         if not stores.tracking.get(pk):
             # set_status writes `self.get(pk) or {"pk": pk}`, so calling it for an
             # unknown pk INVENTS a row. A typo'd id would quietly add a job to the
@@ -2873,6 +2979,8 @@ def create_app() -> FastAPI:
         row = stores.tracking.get(pk) or {}
         if not row:
             return {"ok": False, "error": "no such job"}
+        if _review_row_conflict(row):
+            return {"ok": False, "error": "Submit review is held or closed; start a separate fresh application run."}
         if submit_hold.blocked(pk, row, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if (st := row.get("status")) in ("applied", "applied_manual"):
@@ -2907,13 +3015,71 @@ def create_app() -> FastAPI:
 
     @app.post("/actions/retry/{pk}")
     def retry(pk: str, background: BackgroundTasks):
-        """Re-run a failed/errored job from scratch (clean session, current KB)."""
+        """Explicit fresh preparation for closed reviews; other Retry stays unchanged."""
         from agent.run import retry_job
         stores = make_stores(settings)
-        if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
+        row = stores.tracking.get(pk) or {}
+        if submit_hold.blocked(pk, row, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
+        if _review_row_conflict(row):
+            # Never borrow generic queue/resume/revive authority. The worker
+            # repeats this check before atomically consuming the closed token.
+            if not submit_review.manual_restart_allowed(
+                    pk, row, tracking=stores.tracking):
+                return {"ok": False, "error": "Only an unsent, closed review with no live holder can start a fresh run."}
+            background.add_task(retry_job, pk, explicit_review_restart=True)
+            return {"ok": True, "status": "retrying", "fresh_preparation": True}
         background.add_task(retry_job, pk)
         return {"ok": True, "status": "retrying"}
+
+    @app.post("/actions/submit-review-mode")
+    def set_submit_review_mode(body: dict, request: Request):
+        _require_submit_review_first_party(request)
+        from core import flags
+        from tools import browser_runtime, browser_skill
+        on = (body or {}).get("enabled")
+        if type(on) is not bool:
+            raise HTTPException(422, "enabled must be boolean",
+                                headers={"Cache-Control": "no-store"})
+        if on:
+            try:
+                supported = browser_runtime.backend() is browser_skill
+            except Exception:
+                supported = False
+            if not supported:
+                raise HTTPException(409, "submit_review requires the browser_skill engine",
+                                    headers={"Cache-Control": "no-store"})
+        if not flags.set_submit_review_enabled(on):
+            raise HTTPException(503, "Submit review flag storage is unavailable.",
+                                headers={"Cache-Control": "no-store"})
+        if not on:
+            submit_review.invalidate_all()
+        return JSONResponse({"ok": True, "submit_review": flags.submit_review_enabled()},
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/actions/submit-review/{pk:path}")
+    async def decide_submit_review(pk: str, body: dict, request: Request):
+        _require_submit_review_first_party(request)
+        import asyncio
+        try:
+            decision = body.get("decision")
+            generation = body.get("expected_gate_generation")
+            reason = body.get("reason", "")
+            future = submit_review.claim(pk, generation, decision, reason)
+        except (submit_review.Refused, TypeError, AttributeError):
+            raise HTTPException(409, "Review generation is invalid, stale or consumed.",
+                                headers={"Cache-Control": "no-store"}) from None
+        # The live application worker, not this HTTP handler, performs the
+        # private readback, fresh safety checks and any raw Submit effect.
+        try:
+            outcome = await asyncio.wait_for(
+                asyncio.shield(asyncio.wrap_future(future)), timeout=90)
+        except asyncio.TimeoutError:
+            outcome = {"ok": True, "review_state": "claimed",
+                       "note": "Decision consumed; inspect the updated job state."}
+        status = 200 if outcome.get("ok") else 409
+        return JSONResponse(outcome, status_code=status,
+                            headers={"Cache-Control": "no-store"})
 
     @app.post("/actions/mode")
     def set_mode(body: dict):
@@ -2978,7 +3144,8 @@ def create_app() -> FastAPI:
             if company != "__all__" and (r.get("company") or "").strip().lower() != company:
                 continue
             q_ = (r.get("gate_pending") or {}).get("question", "")
-            if (not submit_hold.blocked(r['pk'], r, tracking=stores.tracking) and (r.get("status") == "tailored"
+            if (not _review_row_conflict(r)
+                    and not submit_hold.blocked(r['pk'], r, tracking=stores.tracking) and (r.get("status") == "tailored"
                     or r.get("gate_reason") == "approval"
                     or q_.startswith("Ready to apply"))):
                 picked.append((r["pk"], r.get("company") or ""))

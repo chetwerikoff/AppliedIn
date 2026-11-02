@@ -267,7 +267,7 @@ PAGE = r"""(() => {
     const shownNative=nativeOptions.slice(0,64);
     for(const chosen of chosenNative)
       if(!shownNative.includes(chosen)) shownNative.push(chosen);
-    return {selector:selector(e), diagnostic_locator:diagnosticLocator(e), label:label(e).slice(0,600),
+    return {selector:selector(e), diagnostic_locator:diagnosticLocator(e), visible:visible(e), label:label(e).slice(0,600),
       ...(hiddenLabel ? {visible:false,associated_label_selector:selector(hiddenLabel),ashby_hidden_choice:true} : {}),
       question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, native_type:nativeType, submit,
       commits_application:commitsApplication(e),
@@ -290,7 +290,10 @@ PAGE = r"""(() => {
         || (e.tagName === 'BUTTON' && e.getAttribute('aria-pressed') === 'true'
           && !!e.closest('div.ashby-application-form-input-yesno')),
       files:e.files ? Array.from(e.files).map(f=>f.name) : [],
+      // Preserve the existing options shape while retaining independent
+      // selection evidence for the private exact-form packet, including multi-select.
       options:shownNative.map(o=>({value:o.value,label:clean(o.textContent)})),
+      selected_options:chosenNative.map(o=>({value:o.value,label:clean(o.textContent)})),
       option_count:nativeOptions.length,
       options_capped:shownNative.length<nativeOptions.length,
       combobox: type === 'combobox' ? (() => {

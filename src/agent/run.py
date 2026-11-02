@@ -1410,6 +1410,9 @@ def retailor(pk: str, note: str | None = None, stores: Any = None) -> dict:
     row = stores.tracking.get(pk)
     if not row:
         return {"result": "missing_row", "pk": pk}
+    from tools import submit_review
+    if submit_review.guarded_row(row):
+        return {"result": "gated", "pk": pk, "reason": "submit_review"}
     status = row.get("status") or ""
     if submit_hold.blocked(pk, row, tracking=stores.tracking):
         return {'result': 'failed', 'pk': pk, 'reason': 'uncertain',
@@ -1601,6 +1604,9 @@ def resume_job(pk: str, answer: str, stores: Any = None, *,
 
     stores = stores or make_stores()
     row = stores.tracking.get(pk) or {}
+    from tools import submit_review
+    if submit_review.guarded_row(row):
+        return {"result": "gated", "pk": pk, "reason": "submit_review"}
     if submit_hold.blocked(pk, row, tracking=stores.tracking):
         return {"result": "failed", "pk": pk, "reason": "uncertain",
                 "detail": "possible submission; check the employer portal before retrying"}
@@ -1752,6 +1758,7 @@ def run_queued(item: dict, q: Any) -> dict:
     left behind by a crash blocks that employer until the process restarts.
     """
     from core.apply_queue import is_retryable
+    from tools import submit_review
 
     pk = item["pk"]
     try:
@@ -1771,8 +1778,14 @@ def run_queued(item: dict, q: Any) -> dict:
                  or result.get("captcha_artifact_diagnostic") is True) else result
         )
         log.info("apply: %s", logged_result)
+        # A no-click review expiry/rejection is terminal for this dispatch.
+        try:
+            protected = submit_review.guarded_row(
+                make_stores().tracking.get(pk) or {})
+        except Exception:
+            protected = True
         again, why = is_retryable(result)
-        if again:
+        if again and not protected:
             # The DETAIL, not the code. `retry()` decides whether a failure spends
             # one of the job's attempts by reading the opening of what it is told,
             # and "Rate limited by the model API…" is an outage that must not.
@@ -1783,12 +1796,17 @@ def run_queued(item: dict, q: Any) -> dict:
         return result
     except Exception as exc:  # noqa: BLE001 — one bad apply must not kill the worker
         log.exception("apply crashed for %s", pk)
+        failed_stores = None
         try:
             failed_stores = make_stores()
             row = failed_stores.tracking.get(pk) or {}
         except Exception:
             row = {"possible_submission": True}  # cannot prove it is safe to retry
-        if row.get('possible_submission') or submit_hold.blocked(pk, row, tracking=failed_stores.tracking):
+        if failed_stores is None or submit_review.guarded_row(row):
+            return {"result": "gated", "pk": pk, "reason": "submit_review",
+                    "detail": "Current review run cannot be automatically retried."}
+        if (row.get('possible_submission')
+                or submit_hold.blocked(pk, row, tracking=failed_stores.tracking)):
             try:
                 make_stores().tracking.set_status(
                     pk, Status.NEEDS_HUMAN, gate_reason="submit_uncertain",
@@ -1814,6 +1832,9 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
     from tools.credentials import get_login
 
     row = stores.tracking.get(pk) or {}
+    from tools import submit_review
+    if submit_review.guarded_row(row):
+        return {"result": "gated", "pk": pk, "reason": "submit_review"}
     company, jd_url = row.get("company", ""), row.get("jd_url", "")
     # Pre-browser JD handoff: neither the queued row nor a transient reader
     # resolution may turn an original relative href into an Apply destination.
@@ -2030,6 +2051,9 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
             from core.models import AnswerScope
             stores.answer_bank.put(q, a, AnswerScope.COMPANY, company=company, source='writer')
 
+    # A consumed review cannot be replaced by a generic BrowserSkill gate/error.
+    if submit_review.guarded_row(stores.tracking.get(pk) or {}):
+        return {"result": "gated", "pk": pk, "reason": "submit_review"}
     status = result.get("status")
     # The durable pre-click marker outranks a transport return that says
     # "gate" or "unknown": the browser might already have committed a form.
@@ -2049,8 +2073,11 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         return {"result": "failed", "pk": pk, "reason": "uncertain", "detail": reason}
     if status == "applied":
         conf = result.get("confirmation") or "submitted"
-        stores.tracking.set_status(pk, Status.APPLIED, confirmation_id=conf,
-                                   **_clear_infra_failure(pk, stores))
+        stores.tracking.set_status(
+            pk, Status.APPLIED, confirmation_id=conf,
+            gate_reason="", gate_pending=None, gate_generation=None,
+            review_state=None, review_expires_at=None,
+            **_clear_infra_failure(pk, stores))
         if getattr(stores.tracking, 'r', None) is not None:
             submit_hold.clear(pk, tracking=stores.tracking)
         _note_rotation_use(pk, stores)
@@ -2275,7 +2302,8 @@ def _active_apply_lease(pk: str, stores: Any) -> bool | None:
         return None
 
 
-def retry_job(pk: str, stores: Any = None) -> dict:
+def retry_job(pk: str, stores: Any = None, *,
+              explicit_review_restart: bool = False) -> dict:
     """Recover a closed unsent job under ONE claim and admitted TAILORING row.
 
     JD attention goes directly ERROR -> TAILORING with durable review-only
@@ -2288,12 +2316,18 @@ def retry_job(pk: str, stores: Any = None) -> dict:
         return _reader_storage_error(pk, stores, None, exc)
     if row is None:
         return {"result": "missing", "pk": pk}
+    from tools import submit_review
     # An independent submit hold is authoritative even if an old writer
     # restored the row's status to FOUND. The public Retry response must not
     # downgrade uncertainty into an innocuous "already_done".
     if submit_hold.blocked(pk, row, tracking=stores.tracking):
         return {"result": "failed", "pk": pk, "reason": "uncertain",
                 "detail": submit_hold.REASON}
+    review_restart = submit_review.guarded_row(row)
+    if review_restart and (
+            not explicit_review_restart or not submit_review.manual_restart_allowed(
+                pk, row, tracking=stores.tracking)):
+        return {"result": "gated", "pk": pk, "reason": "submit_review"}
     status = row.get("status")
     if status in ("applied", "applied_manual"):
         return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
@@ -2301,7 +2335,8 @@ def retry_job(pk: str, stores: Any = None) -> dict:
         from core.events import emit
         emit("response", pk=pk, url=row.get("jd_url"), detail=_ALREADY_RUNNING)
         return {"result": "already_running", "pk": pk}
-    if status not in ("skipped", "failed", "error", "job_gone", "capped"):
+    if (status not in ("skipped", "failed", "error", "job_gone", "capped")
+            and not (review_restart and status == "needs_human")):
         return {"result": "already_done", "pk": pk, "status": status}
     try:
         check = _reader_check(pk, row, stores)
@@ -2321,7 +2356,7 @@ def retry_job(pk: str, stores: Any = None) -> dict:
     # Skip keeps the original failure evidence. Treat it as reader attention
     # even when the current closed status is SKIPPED, so Retry cannot fall
     # back to the full apply graph after an exhausted JD read.
-    jd_attention = (
+    jd_attention = not review_restart and (
         int(row.get("jd_read_attempts") or 0) >= 3
         or row.get("fail_kind") in (
             "jd_reader_exhausted", "jd_tracking_storage_error",
@@ -2337,6 +2372,9 @@ def retry_job(pk: str, stores: Any = None) -> dict:
             check = _reader_check(pk, row, stores)
             if check:
                 return check
+            if review_restart and not submit_review.manual_restart_allowed(
+                    pk, row, tracking=stores.tracking):
+                return {"result": "gated", "pk": pk, "reason": "submit_review"}
             lease = _active_apply_lease(pk, stores)
             if lease is None or lease:
                 return {"result": "refused", "pk": pk, "reason": "apply_lease_unknown"
@@ -2357,7 +2395,24 @@ def retry_job(pk: str, stores: Any = None) -> dict:
                 })
             else:
                 changes["error"] = ""
-            committed, admitted = _reader_patch(pk, row, stores, changes)
+            if review_restart:
+                # Retry is the *only* explicit recovery entrypoint. The spent
+                # packet and PDF must never become a shortcut to a new Submit.
+                changes.update({
+                    "gate_reason": "", "gate_generation": None,
+                    "review_state": None, "review_expires_at": None,
+                    "review_reject_reason": None,
+                    "resume_s3_key": "", "resume_tex_key": "",
+                    "resume_seed": "", "jd_read_prepare_only": True,
+                    "jd_read_revision": int(row.get("jd_read_revision") or 0) + 1,
+                })
+                committed = submit_review.begin_manual_restart(
+                    pk, row, changes, tracking=stores.tracking)
+                admitted = {**row, **{
+                    key: getattr(value, "value", value) if key == "status" else value
+                    for key, value in changes.items()}}
+            else:
+                committed, admitted = _reader_patch(pk, row, stores, changes)
         except Exception as exc:
             return _reader_storage_error(pk, stores, row, exc)
         if not committed:

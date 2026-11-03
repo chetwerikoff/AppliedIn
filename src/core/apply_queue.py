@@ -437,6 +437,31 @@ class ApplyQueue:
                         "ready_in": max(0, int(waiting - now)) if waiting > now else 0})
         return out[:limit]
 
+    def has_pending(self, pk: str) -> bool | None:
+        """Read-only: does ANY pending item exist for this pk?
+
+        Unlike `pending()` this is exact, not capped or reordered. None means
+        absence cannot be established (an unreadable entry); callers treat that
+        as "unknown", never as "no item". Nothing is removed, claimed or leased.
+        """
+        lists = {f"{_KEY}:co:{co}" for co in (self.r.smembers(f"{_KEY}:companies") or [])}
+        scan = getattr(self.r, "scan_iter", None)
+        if callable(scan):
+            lists.update(scan(match=f"{_KEY}:co:*"))
+        unknown = False
+        for key in lists:
+            for raw in (self.r.lrange(key, 0, -1) or []):
+                try:
+                    item = json.loads(raw)
+                except ValueError:
+                    unknown = True
+                    continue
+                if not isinstance(item, dict):
+                    unknown = True
+                elif item.get("pk") == pk:
+                    return True
+        return None if unknown else False
+
     def dead_letters(self) -> list[dict]:
         return [json.loads(x) for x in (self.r.lrange(_DLQ, 0, -1) or [])]
 

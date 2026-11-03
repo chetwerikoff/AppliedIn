@@ -535,17 +535,29 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
 
 
 async def _run_job_async(pk: str, row: dict, stores: Any, *,
-                         prepare_only: bool = False) -> dict:
-    """Settle the actual admitted TAILORING generation, never an old FOUND row."""
+                         prepare_only: bool = False,
+                         guard_recovery: dict | None = None) -> dict:
+    """Settle the actual admitted TAILORING generation, never an old FOUND row.
+
+    `guard_recovery` is the refused `tailored` row of an explicit posting-guard
+    Retry: the JD is reread from the matched source, preparation is review-only
+    and nothing is enqueued.
+    """
     from tools.jd import PostingReadUnavailable
 
     # Original relative URLs can only be processed by the review agent, even
     # after a verified operational read and an earlier application request.
-    prepare_only = bool(prepare_only or _historical_relative(row))
+    prepare_only = bool(prepare_only or _historical_relative(row)
+                        or guard_recovery is not None)
     try:
-        jd_meta = await _jd_meta(row)
+        jd_meta = await (_jd_meta(row, fresh=True) if guard_recovery is not None
+                         else _jd_meta(row))
         jd_text = jd_meta["text"]
-    except JDURLUnresolvable:
+    except JDURLUnresolvable as exc:
+        if guard_recovery is not None:
+            return _guard_recovery_refused(
+                pk, row, guard_recovery, stores, "posting_source_unavailable",
+                f"Current posting source cannot be resolved: {exc}")
         detail = ("Historical posting URL cannot be resolved against a unique safe "
                   "current source. Verify the source manually; nothing was prepared.")
         try:
@@ -566,6 +578,10 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
         return {"result": "error", "pk": pk, "reason": "jd_url_unresolvable",
                 "detail": detail}
     except PostingReadUnavailable as exc:
+        if guard_recovery is not None:
+            return _guard_recovery_refused(
+                pk, row, guard_recovery, stores, "posting_source_unavailable",
+                f"No complete matching current posting source: {exc}")
         try:
             check = _reader_check(pk, row, stores)
             if check:
@@ -625,13 +641,26 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
         check = _reader_check(pk, row, stores)
         if check:
             return check
+        if guard_recovery is not None:
+            problem = _guard_recovery_generation_problem(
+                guard_recovery, row, jd_meta.get("posting_guard"))
+            if problem:
+                return _guard_recovery_refused(
+                    pk, row, guard_recovery, stores, *problem)
         committed_guard = _commit_posting_meta(pk, row, jd_meta, stores)
         if committed_guard is None:
             return {"result": "conflict", "pk": pk, "reason": "posting_guard_state_changed"}
         row = committed_guard
+        if guard_recovery is not None:
+            problem = _guard_recovery_generation_problem(
+                guard_recovery, row, row.get("posting_guard"))
+            if problem:
+                return _guard_recovery_refused(
+                    pk, row, guard_recovery, stores, *problem)
         committed, settled = _reader_patch(pk, row, stores, {
             "jd_read_attempts": 0,
             "jd_read_retry_at": None, "jd_read_error": "",
+            **(_STALE_POSTING_AUTHORITY if guard_recovery is not None else {}),
         })
     except Exception as exc:
         return _reader_storage_error(pk, stores, row, exc)
@@ -723,7 +752,9 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     from .graph import ScorerInvalidOutput
 
     try:
-        result = await _drive_async(runner, pk, msg, stores, prepare_only=prepare_only)
+        extra = {"no_enqueue": True} if guard_recovery is not None else {}
+        result = await _drive_async(runner, pk, msg, stores,
+                                    prepare_only=prepare_only, **extra)
     except ScorerInvalidOutput:
         # No new diagnostics or artifacts: a stale score/PDF must not appear
         # as evidence of this evaluation or enable a downstream approval.
@@ -744,24 +775,92 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     return result
 
 
+def _guard_recovery_generation_problem(
+        original: dict, row: dict, guard: dict | None) -> tuple[str, str] | None:
+    """A Retry that cannot show a NEW generation must not claim to have one."""
+    generation = (guard or {}).get("generation")
+    if not generation:
+        return ("posting_guard_invalid",
+                "The current posting has no valid guard generation.")
+    if generation == (original.get("posting_guard") or {}).get("generation"):
+        return ("posting_guard_generation_unchanged",
+                "The current posting has the same guard generation as the refused "
+                "one; there is nothing new to prepare. Review the posting instead.")
+    if generation == row.get("reviewed_guard_generation"):
+        return ("posting_guard_review_inherited",
+                "A previous review already covers the current guard generation; "
+                "a fresh owner decision cannot be established. Nothing was prepared.")
+    return None
+
+
+def _guard_recovery_refused(pk: str, row: dict, original: dict, stores: Any,
+                            reason: str, detail: str) -> dict:
+    """Return an admitted guard Retry to its refused `tailored` state.
+
+    Admission changed only status and review-only intent, so one conditional
+    write against the admitted generation restores the refusal unchanged.
+    """
+    try:
+        check = _reader_check(pk, row, stores)
+        if check:
+            return check
+        committed, _ = _reader_patch(pk, row, stores, {
+            "status": Status.TAILORED,
+            "jd_read_prepare_only": bool(original.get("jd_read_prepare_only")),
+        })
+    except Exception as exc:
+        return _reader_storage_error(pk, stores, row, exc)
+    if not committed:
+        return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+    from core.events import emit
+    emit("response", pk=pk, url=row.get("jd_url"), detail=detail)
+    return {"result": "refused", "pk": pk, "reason": reason, "detail": detail}
+
+
+# Cleared only after the current posting was re-read and shown to have a NEW
+# guard generation: the refusal, old request, gate answers and old artifacts
+# describe the refused posting. `reviewed_guard_generation` cannot be written by
+# the conditional writer; the new-generation check above covers it.
+_STALE_POSTING_AUTHORITY = {
+    "fail_kind": "", "fail_reason": "", "skip_reason": "", "error": "",
+    "gate_pending": None, "gate_call_id": None, "apply_requested_at": None,
+    "resume_s3_key": "", "resume_tex_key": "",
+}
+
+
 async def _jd_meta(row: dict, *, yielding: bool = True,
-                   approval: bool = False) -> dict:
-    """Guarded JD read with separate operational URL and original source proof."""
+                   approval: bool = False, fresh: bool = False) -> dict:
+    """Guarded JD read with separate operational URL and original source proof.
+
+    `fresh` (explicit posting-guard Retry) always rereads the matched source,
+    whatever the cached length, and never falls back to cached text.
+    """
     from tools import jd as _jd, posting_guard as pg
 
     # Resolve before even considering cached text or opening Chrome/ATS/HTTP.
     url = _reader_url(row)
     historical = _historical_relative(row)
-    if approval:
+    if approval or fresh:
         if historical or not _jd._valid_reader_url(url):
             raise JDURLUnresolvable("Historical relative posting is not an application URL")
-        fresh = await asyncio.to_thread(_jd.fetch_jd_meta, url, "jd")
-        if (not isinstance(fresh, dict)
-                or not isinstance(fresh.get("text"), str)
-                or not pg.valid(fresh["text"], fresh.get("posting_guard"))
-                or not _jd.matched_source_witness(row, fresh)):
+        remote = await asyncio.to_thread(_jd.fetch_jd_meta, url, "jd")
+        if (not isinstance(remote, dict)
+                or not isinstance(remote.get("text"), str)
+                or not pg.valid(remote["text"], remote.get("posting_guard"))
+                or not _jd.matched_source_witness(row, remote)):
             raise _jd.PostingReadUnavailable("No complete matching posting source")
-        return fresh
+        if approval:
+            return remote
+        # Findings already recorded for this posting are never dropped.
+        captured = row.get("jd_text") or ""
+        old = row.get("posting_guard")
+        if not pg.valid(captured, old):
+            old = pg.projection(captured, old)["posting_guard"]
+        combined = pg.merge(remote["text"], remote["posting_guard"], old,
+                            source_witness=True)
+        return {**combined, "source_kind": remote.get("source_kind", ""),
+                "source_url": remote.get("source_url", ""),
+                "reader_effective_url": "", "source_identity": None}
 
     captured = row.get("jd_text") or ""
     old = row.get("posting_guard")
@@ -2302,6 +2401,132 @@ def _active_apply_lease(pk: str, stores: Any) -> bool | None:
         return None
 
 
+_GUARD_REFUSAL = "posting_guard_review_required"
+
+
+def _pending_apply_item(pk: str, stores: Any) -> bool | None:
+    """Read-only: any pending apply-queue item for this pk. None = unknown."""
+    try:
+        inspector = getattr(stores, "queue", None)
+        if callable(getattr(inspector, "has_pending", None)):
+            return inspector.has_pending(pk)
+        client = getattr(stores.tracking, "r", None)
+        if client is None:
+            return None
+        from core.apply_queue import ApplyQueue
+        return ApplyQueue(client).has_pending(pk)
+    except Exception:
+        log.exception("apply-queue pending inspection unavailable for %s", pk)
+        return None
+
+
+def _pending_refusal(pk: str, pending: bool | None) -> dict:
+    if pending is None:
+        return {"result": "refused", "pk": pk, "reason": "apply_queue_unknown",
+                "detail": "Cannot safely inspect pending applications; restore queue inspection."}
+    return {"result": "refused", "pk": pk, "reason": "apply_queue_pending",
+            "detail": "An application for this job is still queued; remove it from the "
+                      "queue first. Nothing was changed."}
+
+
+def _posting_retry_static_refusal(pk: str, row: dict) -> dict | None:
+    if _historical_relative(row):
+        return {"result": "refused", "pk": pk, "reason": _GUARD_REFUSAL,
+                "detail": "Historical relative posting requires manual source review."}
+    if not row.get("jd_url"):
+        return {"result": "refused", "pk": pk, "reason": "no_source_url",
+                "detail": "No posting URL to re-read; nothing was changed."}
+    return None
+
+
+def _retry_row_gate(pk: str, row: dict, stores: Any,
+                    explicit_review_restart: bool) -> tuple[dict | None, bool, bool]:
+    """Row/hold classification shared by Retry and its HTTP precheck.
+
+    Returns (refusal | None, review_restart, posting_retry). `posting_retry` is
+    a closed, unsent `tailored` + posting_guard_review_required row; the
+    marker is NOT origin proof, only the existing protections gate it.
+    """
+    from tools import submit_review
+    # An independent submit hold is authoritative even if an old writer
+    # restored the row's status to FOUND. The public Retry response must not
+    # downgrade uncertainty into an innocuous "already_done".
+    if submit_hold.blocked(pk, row, tracking=stores.tracking):
+        return ({"result": "failed", "pk": pk, "reason": "uncertain",
+                 "detail": submit_hold.REASON}, False, False)
+    status = row.get("status")
+    review_restart = submit_review.guarded_row(row)
+    if review_restart and status == "tailored" and row.get("fail_kind") == _GUARD_REFUSAL:
+        # Never borrow the separately authorized submit_review restart.
+        return ({"result": "gated", "pk": pk, "reason": "submit_review"}, True, False)
+    if review_restart and (
+            not explicit_review_restart or not submit_review.manual_restart_allowed(
+                pk, row, tracking=stores.tracking)):
+        return ({"result": "gated", "pk": pk, "reason": "submit_review"}, True, False)
+    if status in ("applied", "applied_manual"):
+        return ({"result": "duplicate", "pk": pk, "reason": "already_applied"},
+                review_restart, False)
+    if status == "tailoring":
+        from core.events import emit
+        emit("response", pk=pk, url=row.get("jd_url"), detail=_ALREADY_RUNNING)
+        return {"result": "already_running", "pk": pk}, review_restart, False
+    # A closed, unsent posting-guard refusal: explicit Retry re-reads the
+    # current posting and re-prepares for review only. Never a general
+    # tailored restart.
+    posting_retry = (status == "tailored" and not review_restart
+                     and row.get("fail_kind") == _GUARD_REFUSAL)
+    if posting_retry:
+        if row.get("submit_hold") or row.get("confirmation_id"):
+            return ({"result": "failed", "pk": pk, "reason": "uncertain",
+                     "detail": submit_hold.REASON}, False, False)
+        return _posting_retry_static_refusal(pk, row), False, True
+    if (status not in ("skipped", "failed", "error", "job_gone", "capped")
+            and not (review_restart and status == "needs_human")):
+        return ({"result": "already_done", "pk": pk, "status": status},
+                review_restart, False)
+    return None, review_restart, False
+
+
+def _retry_live_gate(pk: str, row: dict, stores: Any, posting_retry: bool) -> dict | None:
+    """Fresh state, claim, lease and (posting Retry) pending-queue inspection."""
+    check = _reader_check(pk, row, stores)
+    if check:
+        return check
+    if _claimed(pk, stores):
+        return {"result": "already_running", "pk": pk}
+    lease = _active_apply_lease(pk, stores)
+    if lease is None:
+        return {"result": "refused", "pk": pk, "reason": "apply_lease_unknown",
+                "detail": "Cannot safely inspect an in-flight application; restore queue inspection."}
+    if lease:
+        return {"result": "already_running", "pk": pk, "reason": "apply_in_flight"}
+    if posting_retry:
+        pending = _pending_apply_item(pk, stores)
+        if pending is not False:
+            return _pending_refusal(pk, pending)
+    return None
+
+
+def retry_precheck(pk: str, stores: Any = None, *,
+                   explicit_review_restart: bool = False) -> dict | None:
+    """Read-only admission predicate for the HTTP route; None = would start.
+
+    Writes, claims and releases nothing; the worker rechecks every condition.
+    """
+    stores = stores or make_stores()
+    try:
+        row = stores.tracking.get(pk)
+        if row is None:
+            return {"result": "missing", "pk": pk}
+        refusal, _review, posting_retry = _retry_row_gate(
+            pk, row, stores, explicit_review_restart)
+        return refusal or _retry_live_gate(pk, row, stores, posting_retry)
+    except Exception as exc:
+        log.exception("retry precheck failed for %s", pk)
+        return {"result": "error", "pk": pk, "reason": "jd_tracking_storage_error",
+                "detail": f"Cannot inspect the job safely: {type(exc).__name__}: {exc}"}
+
+
 def retry_job(pk: str, stores: Any = None, *,
               explicit_review_restart: bool = False) -> dict:
     """Recover a closed unsent job under ONE claim and admitted TAILORING row.
@@ -2317,46 +2542,21 @@ def retry_job(pk: str, stores: Any = None, *,
     if row is None:
         return {"result": "missing", "pk": pk}
     from tools import submit_review
-    # An independent submit hold is authoritative even if an old writer
-    # restored the row's status to FOUND. The public Retry response must not
-    # downgrade uncertainty into an innocuous "already_done".
-    if submit_hold.blocked(pk, row, tracking=stores.tracking):
-        return {"result": "failed", "pk": pk, "reason": "uncertain",
-                "detail": submit_hold.REASON}
-    review_restart = submit_review.guarded_row(row)
-    if review_restart and (
-            not explicit_review_restart or not submit_review.manual_restart_allowed(
-                pk, row, tracking=stores.tracking)):
-        return {"result": "gated", "pk": pk, "reason": "submit_review"}
-    status = row.get("status")
-    if status in ("applied", "applied_manual"):
-        return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
-    if status == "tailoring":
-        from core.events import emit
-        emit("response", pk=pk, url=row.get("jd_url"), detail=_ALREADY_RUNNING)
-        return {"result": "already_running", "pk": pk}
-    if (status not in ("skipped", "failed", "error", "job_gone", "capped")
-            and not (review_restart and status == "needs_human")):
-        return {"result": "already_done", "pk": pk, "status": status}
+    refusal, review_restart, posting_retry = _retry_row_gate(
+        pk, row, stores, explicit_review_restart)
+    if refusal:
+        return refusal
     try:
-        check = _reader_check(pk, row, stores)
-        if check:
-            return check
-        if _claimed(pk, stores):
-            return {"result": "already_running", "pk": pk}
-        lease = _active_apply_lease(pk, stores)
-        if lease is None:
-            return {"result": "refused", "pk": pk, "reason": "apply_lease_unknown",
-                    "detail": "Cannot safely inspect an in-flight application; restore queue inspection."}
-        if lease:
-            return {"result": "already_running", "pk": pk, "reason": "apply_in_flight"}
+        blocked = _retry_live_gate(pk, row, stores, posting_retry)
+        if blocked:
+            return blocked
     except Exception as exc:
         return _reader_storage_error(pk, stores, row, exc)
 
     # Skip keeps the original failure evidence. Treat it as reader attention
     # even when the current closed status is SKIPPED, so Retry cannot fall
     # back to the full apply graph after an exhausted JD read.
-    jd_attention = not review_restart and (
+    jd_attention = not review_restart and not posting_retry and (
         int(row.get("jd_read_attempts") or 0) >= 3
         or row.get("fail_kind") in (
             "jd_reader_exhausted", "jd_tracking_storage_error",
@@ -2379,11 +2579,21 @@ def retry_job(pk: str, stores: Any = None, *,
             if lease is None or lease:
                 return {"result": "refused", "pk": pk, "reason": "apply_lease_unknown"
                         if lease is None else "apply_in_flight"}
+            if posting_retry:
+                pending = _pending_apply_item(pk, stores)
+                if pending is not False:
+                    return _pending_refusal(pk, pending)
             changes = {
                 "status": Status.TAILORING, "fail_reason": "",
                 "fail_kind": "", "skip_reason": "", "gate_pending": None,
                 "gate_call_id": None,
             }
+            if posting_retry:
+                # Admission changes ONLY status and review-only intent. The
+                # refusal marker, old request and old artifacts stay untouched
+                # until the current posting is actually re-read, so a failed
+                # read can restore the closed refusal unchanged.
+                changes = {"status": Status.TAILORING, "jd_read_prepare_only": True}
             if jd_attention:
                 changes.update({
                     "jd_read_attempts": 0, "jd_read_retry_at": None,
@@ -2450,7 +2660,9 @@ def retry_job(pk: str, stores: Any = None, *,
         prepare_only = bool(admitted.get("jd_read_prepare_only")
                             or admitted.get("discovery_source") == "career_ops")
         try:
-            result = _run(_run_job_async(pk, admitted, stores, prepare_only=prepare_only))
+            extra = {"guard_recovery": row} if posting_retry else {}
+            result = _run(_run_job_async(
+                pk, admitted, stores, prepare_only=prepare_only, **extra))
         except Exception as exc:
             from .graph import ScorerModelError
             if not isinstance(exc, ScorerModelError):
@@ -2460,7 +2672,7 @@ def retry_job(pk: str, stores: Any = None, *,
             stores.tracking.set_status(pk, Status.ERROR, match_score=None, error=detail)
             emit("error", pk=pk, detail=detail, url=row.get("jd_url"))
             raise
-        if (result or {}).get("result") == "prepared":
+        if (result or {}).get("result") == "prepared" and not posting_retry:
             try:
                 current = stores.tracking.get(pk) or {}
                 if current.get("apply_requested_at") and not _historical_relative(current):
@@ -2653,7 +2865,7 @@ def _auto_decision(pk: str, stores: Any) -> str:
 
 
 async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
-                       prepare_only: bool = False) -> dict:
+                       prepare_only: bool = False, no_enqueue: bool = False) -> dict:
     """Run the agent, streaming each step's input/response; catch the human gate.
     In AUTO mode the "Ready to apply?" approval is decided by code (score ≥
     threshold, under the daily cap) and the browser apply runs immediately —
@@ -2763,7 +2975,7 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
                             # Review-only recovery never invents approval.
                             # An existing current explicit request remains valid.
                             current = stores.tracking.get(pk) or {}
-                            if current.get("apply_requested_at"):
+                            if current.get("apply_requested_at") and not no_enqueue:
                                 _enqueue_apply(pk, stores, require_request=True)
                         else:
                             _enqueue_apply(pk, stores, require_request=False)
@@ -2807,7 +3019,7 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
             stores.tracking.set_status(pk, Status.FAILED, fail_kind="no_resume",
                                        fail_reason="No PDF was saved. Retry preparation.")
             return {"result": "failed", "pk": pk, "reason": "no_resume"}
-        if row.get("apply_requested_at"):
+        if row.get("apply_requested_at") and not no_enqueue:
             # Check fresh request/status/hold/confirmation inside enqueue, not
             # the row read before preparation or a pre-recovery request.
             queued = _enqueue_apply(pk, stores, require_request=True)

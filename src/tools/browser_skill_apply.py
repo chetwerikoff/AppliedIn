@@ -3022,21 +3022,34 @@ def _question_class(question) -> str:
     return 'other'
 
 
-_REASON_CHARS = re.compile(r"[A-Za-z0-9 .,;:!?'()-]+")
+_REASON_CHARS = re.compile(r"[A-Za-z ,;:!?'()-]+(?:\.(?= |$)[A-Za-z ,;:!?'()-]*)*")
+# Any digit, dotted/slashed token (host name, file name), credential word or very
+# long token is identifier-like: fall back instead of trying to redact it.
 _REASON_UNSAFE = re.compile(
-    r'password|passcode|credential|token|secret|api[\s_-]?key|bearer|\botp\b|\d{5,}|'
-    r'https?|www|\.(?:com|org|net|io|test)\b|[A-Za-z]*\d[A-Za-z0-9]*[A-Za-z][A-Za-z0-9]*|'
-    r'[A-Za-z0-9]{25,}', re.I)
+    r'password|passcode|credential|token|secret|api[\s_-]?key|bearer|\botp\b|'
+    r'\d|https?|www|[A-Za-z0-9]{25,}', re.I)
 _REASON_MAX = 160
 _GENERIC_GATE = 'The observed form needs human inspection.'
 
 
-def _form_gate_message(action: dict, page: dict, facts: dict) -> str:
+def _leaf_strings(value, depth: int = 0):
+    if isinstance(value, str):
+        yield value
+    elif depth < 4 and isinstance(value, dict):
+        for item in value.values():
+            yield from _leaf_strings(item, depth + 1)
+    elif depth < 4 and isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _leaf_strings(item, depth + 1)
+
+
+def _form_gate_message(action: dict, page: dict, facts: dict,
+                       resume_path: str = '') -> str:
     """Generic text plus, when provably safe, a bounded derivative of the model reason.
 
     The reason is untrusted model output. Anything that could carry a selector, URL,
-    identifier, page text, owner fact value or credential falls back to the generic
-    message; the text is never logged."""
+    identifier, attachment name, page text, owner fact value or credential falls back
+    to the generic message; the text is never logged."""
     reason = action.get('question')
     if not isinstance(reason, str):
         return _GENERIC_GATE
@@ -3044,24 +3057,45 @@ def _form_gate_message(action: dict, page: dict, facts: dict) -> str:
     if (not text or not _REASON_CHARS.fullmatch(text) or _REASON_UNSAFE.search(text)
             or _SENSITIVE.search(text) or _SANCTIONS_RX.search(text)):
         return _GENERIC_GATE
-    lowered = text.casefold()
+    lowered = re.sub(r'\s+', ' ', text.casefold())
     owned = [v for v in (facts.values() if isinstance(facts, dict) else ())
              if isinstance(v, (str, int, float)) and len(str(v).strip()) >= 3]
-    haystack = []
+    phrases, attachments = [], []
+    if isinstance(resume_path, str) and resume_path:
+        attachments.append(resume_path)
     if isinstance(page, dict):
         controls = page.get('controls')
         controls = controls if isinstance(controls, list) else []
-        # A control value is prefilled or owner-supplied data: never echo it.
-        owned += [c['value'] for c in controls if isinstance(c, dict)
-                  and isinstance(c.get('value'), str) and len(c['value'].strip()) >= 3]
-        haystack = [page.get('text')] + [c.get(k) for c in controls if isinstance(c, dict)
-                                          for k in ('question', 'label')]
-    if any(str(v).strip().casefold() in lowered for v in owned):
+        for c in (c for c in controls if isinstance(c, dict)):
+            # Prefilled values and attached file names are owner/page data.
+            if isinstance(c.get('value'), str):
+                owned.append(c['value'])
+            attachments += list(_leaf_strings(c.get('files')))
+            phrases += [c.get('question'), c.get('label')]
+        attachments += list(_leaf_strings(page.get('attached_file_displays')))
+        phrases += [page.get('title'), page.get('description')]
+        if isinstance(page.get('text'), str):
+            phrases += re.split(r'[\n\r.!?;:]+', page['text'])
+    for name in attachments:
+        owned += [Path(name).name, Path(name).stem]
+    if any(len(v.strip()) >= 3 and v.strip().casefold() in lowered
+           for v in map(str, owned)):
         return _GENERIC_GATE
-    # Short field names are fine; a long run copied from the page is page content.
-    page_text = ' '.join(re.sub(r'\s+', ' ', h).casefold() for h in haystack
-                         if isinstance(h, str))
-    if any(lowered[i:i + 24] in page_text for i in range(max(0, len(lowered) - 23))):
+    # A reason that reproduces (or is a fragment of) a multiword page phrase copies
+    # page content; single field names alone are ordinary words and stay allowed.
+    for phrase in phrases:
+        if not isinstance(phrase, str):
+            continue
+        phrase = re.sub(r'[^\w ]+', ' ', re.sub(r'\s+', ' ', phrase.casefold())).strip()
+        phrase = re.sub(r' +', ' ', phrase)
+        plain = re.sub(r'[^\w ]+', ' ', lowered)
+        plain = re.sub(r' +', ' ', plain).strip()
+        if phrase.count(' ') >= 1 and (phrase in plain or (
+                plain.count(' ') >= 1 and plain in phrase)):
+            return _GENERIC_GATE
+    if any(lowered[i:i + 24] in ' '.join(
+            re.sub(r'\s+', ' ', p.casefold()) for p in phrases if isinstance(p, str))
+            for i in range(max(0, len(lowered) - 23))):
         return _GENERIC_GATE
     if len(text) > _REASON_MAX:
         text = text[:_REASON_MAX].rsplit(' ', 1)[0].rstrip(' .,;:-') + '...'
@@ -4751,7 +4785,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                        form_question=_ordinary_owner_question(page, field, pk),
                                        reason='owner_question')
                         raise Gate(_GENERIC_GATE if action.get('selector')
-                                   else _form_gate_message(action, page, facts),
+                                   else _form_gate_message(action, page, facts, resume_path),
                                    reason='agent_review_unavailable')
                     if verb == 'navigate':
                         href = action.get('url')

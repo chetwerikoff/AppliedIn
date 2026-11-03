@@ -1062,3 +1062,45 @@ async def test_selector_less_vs_selector_bearing_gate_and_finish_paths(
             assert not result.get('form_question')
             assert ('Model reason' in result['question']) is with_reason
         assert [a[0] for a in harness.calls] == ['upload']
+
+
+def _page_with(**extra):
+    current = page(field('#name', value=''), field(
+        '#code', question='Private access code', label='Code'),
+        field('#resume', kind='file', label='Resume', question='Resume',
+              files=['CandidateCV.pdf']))
+    current['text'] = 'Reference code 4321\nSupport desk opens at the side door'
+    current.update(extra)
+    return current
+
+
+@pytest.mark.parametrize('question', [
+    'Reference code 4321',                       # short copied page identifier
+    'Open jobs.example.co',                     # bare host name, unlisted TLD
+    'CandidateCV.pdf needs review',             # attachment name with extension
+    'CandidateCV needs review',                 # attachment stem
+    'Private access code',                      # exact short page question
+    'The private access code is missing',       # page phrase embedded in prose
+    'Support desk opens at the side door',      # copied page line, no digits
+    'see ./file/path or a/b',                   # slashes are not in the charset
+    'Code 12 needed',                           # any digit
+])
+def test_form_gate_detail_never_copies_short_page_or_attachment_content(question):
+    current = _page_with(attached_file_displays=['CandidateCV.pdf'])
+    assert forms._form_gate_message({'action': 'gate', 'question': question},
+                                    current, {'Name': 'Test User'}) == forms._GENERIC_GATE
+
+
+def test_form_gate_detail_blocks_resume_path_name_and_display_only_attachment():
+    current = page(field('#name', value=''))
+    current['attached_file_displays'] = [{'name': 'DisplayOnlyName.pdf'}]
+    for reason in ('DisplayOnlyName needs a look', 'StagedResumeFile needs a look'):
+        assert forms._form_gate_message(
+            {'action': 'gate', 'question': reason}, current, {},
+            '/tmp/x/StagedResumeFile.pdf') == forms._GENERIC_GATE
+
+
+def test_form_gate_detail_still_allows_a_plain_generic_reason_next_to_page_content():
+    message = forms._form_gate_message(
+        {'action': 'gate', 'question': 'Login is required to continue.'}, _page_with(), {})
+    assert message.endswith('Model reason: Login is required to continue.')

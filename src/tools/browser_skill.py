@@ -730,6 +730,7 @@ async def decision(task: str, page: dict, history: list, *, model: str = "") -> 
         "Return JSON: {action: click|fill|select|choose|combobox|upload|navigate|submit|wait|finish|gate, "
         "selector: string, fact: approved fact KEY or empty, value: option/search text, "
         "essay: boolean, url: observed href, report: object, question: string}. "
+        "A listed fact key IS a stored owner-approved answer that the server fills; it is never a missing fact. "
         "Use fill for text, select for native select, choose for radio/checkbox. "
         "For an APPLICATION native select, leave value empty: the server chooses the option "
         "from the exact human-approved answer. "

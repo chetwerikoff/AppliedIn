@@ -564,7 +564,10 @@ async def test_two_actual_apply_decisions_receive_only_verified_advisory_progres
     assert second['attachment_completed'] is False
     assert {'fact_key': 'Country', 'answer_present': True} in second['approved_choices']
     assert 'Do not replay completed writes' in views[1][0]
-    assert 'Available fact keys:' in views[1][0]
+    assert views[1][0].endswith(NO_REPLAY_TAIL)
+    assert APPLY_KEY_LITERAL + repr(forms._safe_fact_keys(
+        dict(fixture._FACTS), current)) + NO_REPLAY_TAIL in views[1][0]
+    assert 'Available fact keys:' not in views[1][0]
     assert 'Test User' not in repr(second)
     assert 'Test User' not in views[1][0]
     assert all('value' not in receipt for receipt in second['completed_writes'])
@@ -1104,3 +1107,221 @@ def test_form_gate_detail_still_allows_a_plain_generic_reason_next_to_page_conte
     message = forms._form_gate_message(
         {'action': 'gate', 'question': 'Login is required to continue.'}, _page_with(), {})
     assert message.endswith('Model reason: Login is required to continue.')
+
+
+# ---------------------------------------------------------------------------
+# Issue #316: Ashby-shaped choice questions repeat their option labels.
+# Everything below is synthetic and offline; no owner fact, browser or Submit.
+# ---------------------------------------------------------------------------
+
+APPLY_KEY_LITERAL = (
+    '\nAvailable fact keys (each is a stored, owner-approved answer; values are '
+    'deliberately withheld from you and filled by the server when you return '
+    'action fill/choose/combobox with fact set to the exact key; essay keys too, '
+    'with essay true. A listed key is never a missing fact; gate only for a '
+    'required control with no matching key): ')
+NO_REPLAY_TAIL = (
+    '\nDo not replay completed writes. Receipts are advisory; '
+    'the server independently checks the final form and attachment.')
+SKEY = 'Synthetic choice question, with a comma and no short form?'
+LABELS = ('Option Alpha', 'Option Beta')
+
+
+def choice_group(kind='radio', labels=LABELS, *, key=SKEY, name='g1', prefix='o',
+                 repeat=None, **extra):
+    question = key + ' ' + ' '.join(repeat if repeat is not None else labels)
+    return [field(f'#{prefix}{i}', kind=kind, label=label, question=question,
+                  name=name, value=label.lower().replace(' ', '-'), **extra)
+            for i, label in enumerate(labels)]
+
+
+@pytest.mark.parametrize('kind', ['radio', 'checkbox'])
+def test_stripped_question_key_is_offered_for_enabled_group(kind):
+    form = page(*choice_group(kind))
+    facts = {SKEY: 'Option Beta', 'Unrelated synthetic, key with comma': 'x'}
+    assert forms._safe_fact_keys(facts, form) == [SKEY]
+    assert forms._safe_fact_keys(facts, None) == []
+    # Option-label-only concatenation is never promoted to a key.
+    joined = {'Option Alpha, Option Beta': 'Option Beta'}
+    assert forms._safe_fact_keys(joined, form) == []
+
+
+@pytest.mark.parametrize('controls', [
+    # mismatched suffix
+    choice_group(repeat=('Option Alpha', 'Option Gamma')),
+    # question is only the joined labels (empty stripped result)
+    choice_group(key=''),
+    # all controls disabled: no enabled anchor
+    choice_group(disabled=True),
+    # non-string question
+    [field('#a', kind='radio', label='Option Alpha', question=None, name='g'),
+     field('#b', kind='radio', label='Option Beta', question=None, name='g')],
+])
+def test_stripped_question_negatives_offer_nothing(controls):
+    assert forms._safe_fact_keys({SKEY: 'x'}, page(*controls)) == []
+
+
+def test_suffix_never_borrows_labels_from_other_type_or_question():
+    radios = choice_group('radio')
+    boxes = choice_group('checkbox', prefix='c', name='c1',
+                         repeat=('Option Alpha', 'Option Beta'))
+    # A radio anchor whose question needs checkbox labels does not match.
+    mixed = [dict(radios[0]), dict(radios[1], question=radios[0]['question'])]
+    mixed[0]['question'] = mixed[1]['question'] = SKEY + ' Option Gamma Option Delta'
+    mixed.append(dict(boxes[0], question=mixed[0]['question']))
+    assert forms._safe_fact_keys({SKEY: 'x'}, page(*mixed[:2])) == []
+    # Different questions never contribute labels to one another.
+    other = choice_group(key='Another synthetic question, different', prefix='p')
+    assert forms._safe_fact_keys({SKEY: 'x'}, page(
+        radios[0], dict(other[1]))) == []
+
+
+def test_lexical_candidate_for_singleton_cross_name_and_disabled_sibling_is_not_authority():
+    facts = {SKEY: 'Option Beta'}
+    # Enabled anchor + disabled sibling: key offered, no eligible group.
+    sibling = choice_group()
+    sibling[1]['disabled'] = True
+    form = page(*sibling)
+    assert forms._safe_fact_keys(facts, form) == [SKEY]
+    assert forms._approved_choice_metadata(form, facts, [SKEY]) == []
+    # Same question, different radio names: lexical key, no receiving group.
+    cross = choice_group(name='g1')[:1] + choice_group(name='g2', prefix='q')[1:]
+    form = page(*cross)
+    assert forms._safe_fact_keys(facts, form) == [SKEY]
+    assert forms._approved_choice_metadata(form, facts, [SKEY]) == []
+    # Same question across two native forms.
+    split = choice_group()[:1] + choice_group(prefix='q', form_selector='#other')[1:]
+    form = page(*split)
+    assert forms._approved_choice_metadata(form, facts, [SKEY]) == []
+    # Singleton whose question needs only its own label.
+    one = [choice_group(labels=('Option Alpha',))[0]]
+    form = page(*one)
+    assert forms._safe_fact_keys(facts, form) == [SKEY]
+    assert forms._approved_choice_metadata(form, facts, [SKEY]) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['radio', 'checkbox'])
+async def test_suffix_backed_metadata_and_choose_write_stored_option(kind):
+    form = page(*choice_group(kind))
+    facts = {SKEY: 'Option Beta'}
+    keys = forms._safe_fact_keys(facts, form)
+    approved = forms._approved_choice_metadata(form, facts, keys)
+    assert approved == [{'fact_key': SKEY, 'answer_present': True}]
+    assert 'Option Beta' not in repr(approved)
+    session = MemorySession(form)
+    result, filled, evidence = await act(
+        session, form, {'action': 'choose', 'selector': '#o1', 'fact': SKEY}, facts)
+    assert evidence['performed'] is True and filled == {'#o1': 'Option Beta'}
+    assert [args for args, _ in session.calls] == [('click', '#o1')]
+    # The non-matching option is never written, whatever the model proposes.
+    session = MemorySession(form)
+    with pytest.raises(forms.Gate) as caught:
+        await act(session, form, {'action': 'choose', 'selector': '#o0',
+                                  'fact': SKEY}, facts)
+    assert caught.value.reason == 'owner_question' and session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_suffix_fallback_is_refused_for_ineligible_receivers():
+    facts = {SKEY: 'Option Beta'}
+    cases = []
+    single = page(choice_group(labels=('Option Beta',))[0])
+    cases.append((single, '#o0'))
+    sibling = choice_group()
+    sibling[0]['disabled'] = True
+    cases.append((page(*sibling), '#o1'))
+    cross = choice_group(name='g1')[:1] + choice_group(name='g2', prefix='q')[1:]
+    cases.append((page(*cross), '#q1'))
+    duplicate = choice_group(labels=('Option Beta', 'Option Beta'))
+    cases.append((page(*duplicate), '#o1'))
+    absent = choice_group(labels=('Option Gamma', 'Option Delta'))
+    cases.append((page(*absent), '#o1'))
+    for form, selector in cases:
+        assert forms._approved_choice_metadata(form, facts, [SKEY]) == []
+        session = MemorySession(form)
+        with pytest.raises(forms.Gate) as caught:
+            await act(session, form, {'action': 'choose', 'selector': selector,
+                                      'fact': SKEY}, facts)
+        assert caught.value.reason == 'owner_question' and session.calls == []
+
+
+def test_group_two_equal_groups_are_not_a_unique_receiver():
+    first, second = choice_group(), choice_group(prefix='q', name='g2')
+    form = page(*first, *second)
+    assert forms._approved_choice_metadata(form, {SKEY: 'Option Beta'}, [SKEY]) == []
+
+
+def test_fact_key_precedence_and_collisions():
+    members = choice_group()
+    question = members[0]['question']
+    # Exact and complete-question normalized lookups stay first.
+    assert forms._fact_key({question: 'a', SKEY: 'b'}, question, members) == question
+    full_norm = question.upper()
+    assert forms._fact_key({full_norm: 'a', SKEY: 'b'}, question, members) == full_norm
+    # Conflicting full-question collision is ambiguous, never a stripped retry.
+    collision = {question.upper() + ' *': 'a', question.upper(): 'b', SKEY: 'c'}
+    assert forms._fact_key(collision, question, members) is None
+    # Stripped retry needs the receiving group; model-style lookups never get it.
+    assert forms._fact_key({SKEY: 'a'}, question) is None
+    assert forms._fact_key({SKEY: 'a'}, question, members) == SKEY
+    assert forms._fact_key({SKEY: 'a'}, question, members[:1]) is None
+    assert forms._fact_key({SKEY: 'a'}, question, []) is None
+    # Equal values choose the sorted first; differing values are ambiguous.
+    assert forms._fact_key({SKEY.upper(): ' a ', SKEY: 'a'}, question, members) \
+        == min(SKEY, SKEY.upper())
+    assert forms._fact_key({SKEY.upper(): 'b', SKEY: 'a'}, question, members) is None
+
+
+@pytest.mark.asyncio
+async def test_model_assertion_gets_no_suffix_inference():
+    form = page(*choice_group())
+    question = form['controls'][0]['question']
+    facts = {SKEY: 'Option Beta'}
+    # Asserting the full observed question text is not a stored key.
+    session = MemorySession(form)
+    with pytest.raises(forms.Gate):
+        await act(session, form, {'action': 'choose', 'selector': '#o1',
+                                  'fact': question}, facts)
+    assert session.calls == []
+    # Generic fill/combobox lookups keep exact/normalized behaviour only.
+    assert forms._owner_action_answer({'fact': question}, facts) == ''
+    assert forms._owner_action_answer({'fact': SKEY}, facts) == 'Option Beta'
+
+
+@pytest.mark.asyncio
+async def test_suffix_backed_python_none_is_ineligible_even_for_literal_none_option():
+    form = page(*choice_group(labels=('None', 'Option Beta')))
+    facts = {SKEY: None}
+    keys = forms._safe_fact_keys(facts, form)
+    assert keys == [SKEY]  # visibility is unchanged
+    assert forms._approved_choice_metadata(form, facts, keys) == []
+    session = MemorySession(form)
+    with pytest.raises(forms.Gate) as caught:
+        await act(session, form, {'action': 'choose', 'selector': '#o0',
+                                  'fact': SKEY}, facts)
+    assert caught.value.reason == 'owner_question' and session.calls == []
+    # Empty string answer follows the same no-write path.
+    facts = {SKEY: ''}
+    assert forms._approved_choice_metadata(form, facts, [SKEY]) == []
+
+
+def test_exact_normalized_metadata_is_unchanged_for_none_answer():
+    group = [field('#a', kind='radio', label='None', question='Eligibility', name='e'),
+            field('#b', kind='radio', label='Yes', question='Eligibility', name='e')]
+    form = page(*group)
+    assert forms._approved_choice_metadata(
+        form, {'Eligibility': None}, ['Eligibility']) == [
+        {'fact_key': 'Eligibility', 'answer_present': True}]
+
+
+@pytest.mark.parametrize('bad_key', [
+    'Account password, saved login', 'Sanctions screening, export controls',
+    'I agree to the terms, accept all', 'Secret token, private credential'])
+def test_protected_keys_stay_withheld_even_when_stripped_question_matches(bad_key):
+    form = page(*choice_group(key=bad_key))
+    facts = {bad_key: 'Option Beta'}
+    keys = forms._safe_fact_keys(facts, form)
+    assert keys == []
+    assert forms._approved_choice_metadata(form, facts, keys) == []
+

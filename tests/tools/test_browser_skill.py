@@ -2383,6 +2383,27 @@ async def test_application_native_select_prompt_preserves_server_choice_semantic
             'the option from the exact human-approved answer.') in prompt
 
 
+async def test_decision_prompt_states_listed_fact_key_is_stored_answer(monkeypatch):
+    request = {}
+
+    def completion(**kwargs):
+        request.update(kwargs)
+        return {'choices': [{'message': {'content': '{"action":"finish"}'},
+                             'finish_reason': 'stop'}]}
+    monkeypatch.setattr('litellm.completion', completion)
+    monkeypatch.setattr('core.steering.messages', lambda prompt: [
+        {'role': 'system', 'content': prompt}])
+    assert await bsk.decision('Synthetic application', {}, [], model='synthetic') == {
+        'action': 'finish'}
+    prompt = request['messages'][0]['content']
+    assert ('essay: boolean, url: observed href, report: object, question: string}. '
+            'A listed fact key IS a stored owner-approved answer that the server '
+            'fills; it is never a missing fact. '
+            'Use fill for text, select for native select, choose for radio/checkbox. '
+            ) in prompt
+    assert prompt.count('A listed fact key IS a stored owner-approved answer') == 1
+
+
 _REAL_OBSERVE_CONTROLS = forms._observe_controls
 _GH_URL = 'https://job-boards.greenhouse.io/example-co/jobs/123'
 _GH_ALIAS = forms.GreenhouseJobAlias(

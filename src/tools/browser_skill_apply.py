@@ -3467,8 +3467,17 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                     target.get('type') == 'checkbox'
                     and (not isinstance(target.get('question'), str)
                          or not target['question'].strip()))
-                if (len(matches) != 1
-                        or (len(group) == 1 and not label_only_checkbox)
+                # A lone, otherwise valid radio remains supported. Only
+                # siblings split across different owners/names invalidate a
+                # one-member target group; complete independent groups remain
+                # target-owned, not page-globally forbidden.
+                split_singleton = (
+                    len(group) == 1 and not label_only_checkbox
+                    and any(isinstance(c, dict) and c is not group[0]
+                            and c.get('type') == target.get('type')
+                            and c.get('question') == target.get('question')
+                            for c in page.get('controls', [])))
+                if (len(matches) != 1 or split_singleton
                         or (label_only_checkbox and proposed is not None
                             and (not isinstance(proposed, str)
                                  or not _matches_choice(target, proposed.strip())))):

@@ -2699,6 +2699,12 @@ def _choice_members(page: dict, target: dict) -> list[dict]:
     """Only options with one current question, form and radio group are linked."""
     kind = target.get('type')
     question, form = target.get('question'), target.get('form_selector')
+    # A labelled standalone checkbox identifies its own question when PAGE
+    # has no separate group text; radio option labels never substitute for it.
+    label_question = (kind == 'checkbox' and
+                      (not isinstance(question, str) or not question.strip()))
+    if label_question:
+        question = target.get('label')
     if (kind not in {'radio', 'checkbox'} or not isinstance(question, str)
             or not question.strip() or not isinstance(form, str) or not form
             or target.get('in_form') is not True
@@ -2708,7 +2714,9 @@ def _choice_members(page: dict, target: dict) -> list[dict]:
     if not isinstance(controls, list):
         return []
     members = [c for c in controls if isinstance(c, dict)
-               and c.get('type') == kind and c.get('question') == question
+               and c.get('type') == kind
+               and ((c.get('label') == question and not c.get('question'))
+                    if label_question else c.get('question') == question)
                and c.get('form_selector') == form
                and c.get('in_form') is True
                and (kind != 'radio' or c.get('name') == target.get('name'))]
@@ -2717,12 +2725,20 @@ def _choice_members(page: dict, target: dict) -> list[dict]:
             or any(not isinstance(s, str) or not s for s in selectors)
             or len(set(selectors)) != len(selectors)):
         return []
+    if label_question and (len(members) != 1
+                           or members[0].get('selector') != target.get('selector')):
+        return []
     return members
 
 
 def _matches_choice(member: dict, answer: str) -> bool:
     return (_same(member.get('label', ''), answer)
-            or _same(member.get('value', ''), answer))
+            or _same(member.get('value', ''), answer)
+            or (member.get('type') == 'checkbox'
+                and not member.get('question')
+                and _same(member.get('value', ''), 'yes')
+                and isinstance(answer, str)
+                and answer.casefold().strip() in _PRIVACY_AFFIRMATIVE))
 
 
 def _safe_fact_keys(facts: dict) -> list[str]:
@@ -2795,9 +2811,9 @@ def _current_receipt_receiver(page: dict, original: dict) -> dict | None:
 
 
 def _write_intent(before: dict, target: dict, result: dict,
-                  filled: dict) -> dict | None:
+                  filled: dict, evidence: dict | None = None) -> dict | None:
     """Record an executed effect, not a claimed or ledger-only completion."""
-    if (result.get('_write_performed') is not True
+    if (not isinstance(evidence, dict) or evidence.get('performed') is not True
             or result.get('action') not in {'fill', 'select', 'choose', 'combobox'}):
         return None
     selector = target.get('selector')
@@ -2807,7 +2823,7 @@ def _write_intent(before: dict, target: dict, result: dict,
     members = _choice_members(before, target) if kind == 'choose' else []
     return {'action': kind, 'original': deepcopy(target),
             'answer': str(filled[selector]),
-            'option': deepcopy(result.get('_selected_option')),
+            'option': deepcopy(evidence.get('selected_option')),
             'group': frozenset(_receipt_identity(m) for m in members)}
 
 
@@ -3056,7 +3072,7 @@ _PRIVACY_AFFIRMATIVE = frozenset({
 
 async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                             filled: dict, pk: str, job_url: str, ctx,
-                            provenance) -> dict:
+                            provenance, write_evidence: dict | None = None) -> dict:
     """Fill an accessible picker freely, then use its current visible options."""
     target = control(page, action, 'decision-action')
     selector = target['selector']
@@ -3086,14 +3102,16 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         chosen = deepcopy(candidates[0])
     # Missing/hydrating options remain an incomplete readback, not a write Gate.
     filled[selector] = answer
-    return {'action': 'combobox', 'selector': selector, 'label': target.get('label',''),
-            '_write_performed': chosen is not None, '_selected_option': chosen}
+    if write_evidence is not None:
+        write_evidence.update(performed=chosen is not None, selected_option=chosen)
+    return {'action': 'combobox', 'selector': selector, 'label': target.get('label','')}
 
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
                   github: str, pk: str = '', allow_click: bool = False,
                   job_url: str = '', on_committing_click=None,
-                  fixture_context=None, provenance=None) -> dict:
+                  fixture_context=None, provenance=None,
+                  write_evidence: dict | None = None) -> dict:
     """Perform one model-selected preparation action without field grants.
 
     Readback is collected for the model; only check_pre_submit can reject a
@@ -3122,7 +3140,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     if verb == 'combobox':
         return await _execute_combobox(session, page, action, facts=facts,
                                         filled=filled, pk=pk, job_url=job_url,
-                                        ctx=fixture_context, provenance=provenance)
+                                        ctx=fixture_context, provenance=provenance,
+                                        write_evidence=write_evidence)
     if verb in {'fill', 'select', 'choose'} and target is not None:
         value = _owner_action_answer(action, facts)
         if not value:
@@ -3148,6 +3167,11 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         else:
             if 'fact' in action:
                 group = _choice_members(page, target)
+                if (target.get('type') == 'checkbox'
+                        and not target.get('question')
+                        and (_fact_key(facts, target.get('label') or '')
+                             != _fact_key(facts, action['fact']))):
+                    raise _owner_question_gate(page, target, pk)
                 matches = [m for m in group if _matches_choice(m, value)]
                 proposed = action.get('value')
                 if (len(matches) != 1
@@ -3196,9 +3220,10 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         raise Gate('An accessible control selector is missing.')
     # A partial or stale readback is not submission permission; the next model
     # decision can continue filling, and the final guard always re-reads.
+    if write_evidence is not None and verb in {'fill', 'select', 'choose'}:
+        write_evidence['performed'] = wrote
     return {'action': verb, 'label': target.get('label', '') if target else '',
-            'selector': target.get('selector', '') if target else '',
-            '_write_performed': wrote if verb in {'fill', 'select', 'choose'} else False}
+            'selector': target.get('selector', '') if target else ''}
 
 def _fields_report(history: list, filled: dict) -> list[dict]:
     """Report only browser-read-back values, not the immutable bank answer."""
@@ -4620,18 +4645,21 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                          and verb in {'fill', 'select', 'choose', 'combobox'}
                                          else None)
                     original_page = (deepcopy(page) if original_receiver is not None else None)
+                    write_evidence = {}
                     result = await execute(
                         session, page, action, facts=facts, filled=filled,
                         resume_path=resume_path, company=company, jd_text=jd_text,
                         resume_tex=resume_tex, github=github, pk=pk,
                         allow_click=True, job_url=url,
                         on_committing_click=mark_click_started,
-                        fixture_context=ctx, provenance=provenance)
+                        fixture_context=ctx, provenance=provenance,
+                        write_evidence=write_evidence)
                     uploaded = uploaded or bool(result.get('uploaded'))
                     history.append(result)
                     if original_receiver is not None:
                         intent = _write_intent(
-                            original_page, original_receiver, result, filled)
+                            original_page, original_receiver, result, filled,
+                            write_evidence)
                         if intent is not None:
                             write_intents.append(intent)
                     if (result.get('action') == 'upload' and result.get('uploaded') is True

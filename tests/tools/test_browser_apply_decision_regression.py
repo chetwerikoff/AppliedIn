@@ -102,17 +102,23 @@ class MemorySession:
                 target['combobox']['displayed_text'] = chosen['label']
                 target['combobox']['selected_value'] = chosen['value']
                 target['combobox']['hidden_value'] = chosen['value']
+            else:
+                target = next((c for c in controls if c['selector'] == selector), None)
+                if target is not None and target.get('type') == 'checkbox':
+                    target['checked'] = True
         return {}
 
 
 async def act(session, form, action, facts=None):
-    filled = {}
+    filled, evidence = {}, {}
     result = await forms.execute(
         session, form, action, facts=facts or {}, filled=filled,
         resume_path='', company='example-co', jd_text='', resume_tex='',
-        github='', pk=PK, job_url=URL,
+        github='', pk=PK, job_url=URL, write_evidence=evidence,
     )
-    return result, filled
+    # Public execute() receipts must never include private write/option data.
+    assert not {'_write_performed', '_selected_option'} & result.keys()
+    return result, filled, evidence
 
 
 @pytest.mark.asyncio
@@ -124,7 +130,7 @@ async def test_exact_and_normalized_facts_override_model_value(kind, fact_key):
     session = MemorySession(form)
     action = {'action': kind, 'selector': target['selector'], 'fact': fact_key,
               'value': 'Wrong'}
-    result, filled = await act(
+    result, filled, evidence = await act(
         session, form, action, {'Name': 'Test User', 'Full Name': 'Test User'})
     assert result['action'] == kind
     assert filled[target['selector']] == 'Test User'
@@ -176,11 +182,11 @@ async def test_normalization_collision_asks_owner_without_a_write(kind, selector
 async def test_native_select_uses_only_the_single_owner_matching_option():
     form = page(name_select())
     session = MemorySession(form)
-    result, filled = await act(
+    result, filled, evidence = await act(
         session, form, {'action': 'select', 'selector': '#name-select',
                         'fact': 'Name *', 'value': 'Wrong'},
         {'Name': 'Test User'})
-    assert result['_write_performed'] is True
+    assert evidence['performed'] is True
     assert filled == {'#name-select': 'user'}
     assert [args for args, _ in session.calls] == [
         ('select', '#name-select', '--value', 'user')]
@@ -191,15 +197,15 @@ async def test_native_select_uses_only_the_single_owner_matching_option():
     ):
         form = page(name_select(options))
         session = MemorySession(form)
-        result, filled = await act(
+        result, filled, evidence = await act(
             session, form, {'action': 'select', 'selector': '#name-select',
                             'fact': 'Name *', 'value': 'Wrong'},
             {'Name': 'Test User'})
-        assert not session.calls and result['_write_performed'] is False
+        assert not session.calls and evidence['performed'] is False
         assert filled == {'#name-select': 'Test User'}
 
     session = MemorySession(page(name_select()))
-    result, filled = await act(
+    result, filled, evidence = await act(
         session, session.current,
         {'action': 'select', 'selector': '#name-select', 'value': 'Wrong'})
     assert filled == {'#name-select': 'wrong'}
@@ -222,17 +228,17 @@ async def test_owner_choice_cannot_click_a_different_model_selected_member():
         assert not session.calls
 
     session = MemorySession(form)
-    result, filled = await act(
+    result, filled, evidence = await act(
         session, form, {'action': 'choose', 'selector': '#no',
                         'fact': 'Eligibility *'},
         {'Eligibility': 'No'})
-    assert result['_write_performed'] and filled == {'#no': 'No'}
+    assert evidence['performed'] and filled == {'#no': 'No'}
     assert [args for args, _ in session.calls] == [('click', '#no')]
 
     session = MemorySession(form)
-    result, _ = await act(session, form,
+    result, _, evidence = await act(session, form,
                           {'action': 'choose', 'selector': '#yes', 'value': 'Yes'})
-    assert result['_write_performed']
+    assert evidence['performed']
     assert [args for args, _ in session.calls] == [('click', '#yes')]
 
     for altered in (page(field('#yes', kind='radio', label='Yes',
@@ -250,13 +256,60 @@ async def test_owner_choice_cannot_click_a_different_model_selected_member():
 
 
 @pytest.mark.asyncio
+async def test_single_labelled_checkbox_needs_explicit_matching_owner_agreement():
+    """An observed single checkbox can use the owner's affirmative, not a guess."""
+    question = 'I consent to sharing personal data with marketing partners'
+    form = page(field('#marketing', kind='checkbox', label=question,
+                      question='', value='yes'))
+    action = {'action': 'choose', 'selector': '#marketing', 'fact': question}
+    session = MemorySession(form)
+    result, filled, evidence = await act(
+        session, form, action, {question: 'I agree'})
+    assert result == {'action': 'choose', 'selector': '#marketing',
+                      'label': question}
+    assert filled == {'#marketing': 'I agree'} and evidence['performed'] is True
+    assert [args for args, _ in session.calls] == [('click', '#marketing')]
+    intent = forms._write_intent(form, form['controls'][0], result,
+                                 filled, evidence)
+    assert intent is not None
+    assert forms._completed_write_receipts(await session.page(), [intent]) == [
+        {'action': 'choose', 'verified': True}]
+    # A lone Yes/agree checkbox cannot disclose the selected choice in context.
+    assert forms._approved_choice_metadata(form, {question: 'I agree'},
+                                           [question]) == []
+
+    for facts, attempted in (
+        ({}, action),
+        ({question: 'I decline'}, action),
+        ({'Unrelated': 'I agree'}, {**action, 'fact': 'Unrelated'}),
+        ({question: 'I agree'}, {**action, 'value': 'No'}),
+    ):
+        session = MemorySession(form)
+        with pytest.raises(forms.Gate) as caught:
+            await act(session, form, attempted, facts)
+        assert caught.value.reason == 'owner_question'
+        assert caught.value.form_question['selector'] == '#marketing'
+        assert session.calls == []
+
+    ambiguous = page(
+        field('#marketing', kind='checkbox', label=question,
+              question='', value='yes'),
+        field('#marketing-copy', kind='checkbox', label=question,
+              question='', value='yes'))
+    session = MemorySession(ambiguous)
+    with pytest.raises(forms.Gate) as caught:
+        await act(session, ambiguous, action, {question: 'I agree'})
+    assert caught.value.reason == 'owner_question' and session.calls == []
+
+
+@pytest.mark.asyncio
 async def test_omitted_fact_combobox_remains_a_value_only_accessible_action():
     form = page(name_combo())
     session = MemorySession(form)
-    result, filled = await act(
+    result, filled, evidence = await act(
         session, form, {'action': 'combobox', 'selector': '#name-combo',
                         'value': 'Test User'})
-    assert result['_write_performed'] is True
+    assert evidence['performed'] is True
     assert filled == {'#name-combo': 'Test User'}
     assert [args for args, _ in session.calls] == [('click', '#name-right-option')]
 
@@ -275,10 +328,10 @@ async def test_completed_receipt_requires_effect_and_current_private_readback(
     form = page(field('#name'), name_select(), *eligibility(), name_combo())
     session = MemorySession(form)
     original = deepcopy(next(c for c in form['controls'] if c['selector'] == selector))
-    result, filled = await act(
+    result, filled, evidence = await act(
         session, form, action, {'Name': 'Test User', 'Eligibility': 'No'})
-    intent = forms._write_intent(form, original, result, filled)
-    assert intent is not None and result['_write_performed']
+    intent = forms._write_intent(form, original, result, filled, evidence)
+    assert intent is not None and evidence['performed']
     receipts = forms._completed_write_receipts(await session.page(), [intent])
     assert len(receipts) == 1
     assert set(receipts[0]) <= {'action', 'selector', 'verified'}
@@ -417,8 +470,12 @@ async def test_scalar_diagnostic_for_every_started_model_decision(caplog):
             await forms._application_decision_with_log(
                 thrown, '', {}, [], model='synthetic', facts={'Name': 'Test User'},
                 turn=10)
-    logs = [r.args[0] for r in caplog.records
-            if r.msg == 'application decision %s']
+    records = [r for r in caplog.records
+               if r.msg == 'application decision %s']
+    # logging.LogRecord preserves a single mapping argument as a mapping,
+    # rather than a positional tuple; assert its exact scalar-only shape.
+    assert all(isinstance(r.args, dict) for r in records)
+    logs = [r.args for r in records]
     assert len(logs) == 10 and [r['turn'] for r in logs] == list(range(1, 11))
     assert all(set(r) == {'turn', 'verb', 'selector_present',
                            'fact_key_present_in_facts'} for r in logs)

@@ -88,10 +88,15 @@ class MemorySession:
                 {'label': o['label'], 'value': o['value']}
                 for o in target['options'] if o['value'] == args[-1]]
         elif verb == 'click':
-            if selector in {'#yes', '#no'}:
+            target = next((c for c in controls if c['selector'] == selector), None)
+            if target is not None and target.get('type') == 'radio':
+                # Mirror a native radio owner/name even for synthetic #o0/#o1.
                 for c in controls:
-                    if c['selector'] in {'#yes', '#no'}:
-                        c['checked'] = c['selector'] == selector
+                    if (c.get('type') == 'radio'
+                            and c.get('name') == target.get('name')
+                            and c.get('form_selector') == target.get('form_selector')
+                            and c.get('in_form') == target.get('in_form')):
+                        c['checked'] = c is target
             elif selector.endswith('-option'):
                 target = next(c for c in controls if c['selector'] == '#name-combo')
                 options = target['combobox']['options']
@@ -102,10 +107,8 @@ class MemorySession:
                 target['combobox']['displayed_text'] = chosen['label']
                 target['combobox']['selected_value'] = chosen['value']
                 target['combobox']['hidden_value'] = chosen['value']
-            else:
-                target = next((c for c in controls if c['selector'] == selector), None)
-                if target is not None and target.get('type') == 'checkbox':
-                    target['checked'] = True
+            elif target is not None and target.get('type') == 'checkbox':
+                target['checked'] = True
         return {}
 
 
@@ -214,19 +217,39 @@ async def test_native_select_uses_only_the_single_owner_matching_option():
 
 
 @pytest.mark.asyncio
-async def test_owner_choice_cannot_click_a_different_model_selected_member():
+async def test_owner_choice_clicks_stored_member_not_model_target_or_value(monkeypatch):
     form = page(*eligibility())
+    guarded = []
+    original_guard = forms.guarded_value
+
+    def guarded_member(member, value):
+        guarded.append((member['selector'], value))
+        return original_guard(member, value)
+
+    monkeypatch.setattr(forms, 'guarded_value', guarded_member)
     for action in (
-        {'action': 'choose', 'selector': '#yes', 'fact': 'Eligibility *'},
+        {'action': 'choose', 'selector': '#yes', 'fact': 'Eligibility *',
+         'value': 'Yes'},
         {'action': 'choose', 'selector': '#no', 'fact': 'Eligibility *',
          'value': 'Yes'},
     ):
         session = MemorySession(form)
-        with pytest.raises(forms.Gate) as caught:
-            await act(session, form, action, {'Eligibility': 'No'})
-        assert caught.value.reason == 'owner_question'
-        assert caught.value.form_question['selector'] == action['selector']
-        assert not session.calls
+        result, filled, evidence = await act(
+            session, form, action, {'Eligibility': 'No'})
+        assert result == {'action': 'choose', 'selector': '#no', 'label': 'No'}
+        assert filled == {'#no': 'No'} and evidence['performed'] is True
+        assert [args for args, _ in session.calls] == [('click', '#no')]
+        assert guarded[-1] == ('#no', 'No')
+        assert forms._fields_report([result], filled) == [
+            {'label': 'No', 'value': 'No'}]
+        original = next(c for c in form['controls'] if c['selector'] == '#no')
+        intent = forms._write_intent(form, original, result, filled, evidence)
+        assert intent is not None and intent['original']['selector'] == '#no'
+        assert forms._completed_write_receipts(await session.page(), [intent]) == [
+            {'action': 'choose', 'verified': True}]
+        assert forms._write_intent(form, form['controls'][0], result,
+                                   filled, evidence) is None
+        assert forms._model_projection(form, [result])[1] == [{'action': 'choose'}]
 
     session = MemorySession(form)
     result, filled, evidence = await act(
@@ -236,10 +259,11 @@ async def test_owner_choice_cannot_click_a_different_model_selected_member():
     assert evidence['performed'] and filled == {'#no': 'No'}
     assert [args for args, _ in session.calls] == [('click', '#no')]
 
+    # A value-only choose still follows the model's requested member.
     session = MemorySession(form)
-    result, _, evidence = await act(session, form,
-                          {'action': 'choose', 'selector': '#yes', 'value': 'Yes'})
-    assert evidence['performed']
+    result, _, evidence = await act(
+        session, form, {'action': 'choose', 'selector': '#yes', 'value': 'Yes'})
+    assert result['selector'] == '#yes' and evidence['performed']
     assert [args for args, _ in session.calls] == [('click', '#yes')]
 
     for altered in (page(field('#yes', kind='radio', label='Yes',
@@ -254,7 +278,6 @@ async def test_owner_choice_cannot_click_a_different_model_selected_member():
                        if len(altered['controls']) > 1 else '#yes',
                        'fact': 'Eligibility'}, {'Eligibility': 'No'})
         assert caught.value.reason == 'owner_question' and not session.calls
-
 
 @pytest.mark.asyncio
 async def test_single_labelled_checkbox_needs_explicit_matching_owner_agreement():
@@ -1209,18 +1232,26 @@ async def test_suffix_backed_metadata_and_choose_write_stored_option(kind):
     approved = forms._approved_choice_metadata(form, facts, keys)
     assert approved == [{'fact_key': SKEY, 'answer_present': True}]
     assert 'Option Beta' not in repr(approved)
-    session = MemorySession(form)
-    result, filled, evidence = await act(
-        session, form, {'action': 'choose', 'selector': '#o1', 'fact': SKEY}, facts)
-    assert evidence['performed'] is True and filled == {'#o1': 'Option Beta'}
-    assert [args for args, _ in session.calls] == [('click', '#o1')]
-    # The non-matching option is never written, whatever the model proposes.
-    session = MemorySession(form)
-    with pytest.raises(forms.Gate) as caught:
-        await act(session, form, {'action': 'choose', 'selector': '#o0',
-                                  'fact': SKEY}, facts)
-    assert caught.value.reason == 'owner_question' and session.calls == []
-
+    for requested in ('#o1', '#o0'):
+        session = MemorySession(form)
+        result, filled, evidence = await act(
+            session, form,
+            {'action': 'choose', 'selector': requested, 'fact': SKEY,
+             'value': 'Option Alpha'}, facts)
+        assert result == {'action': 'choose', 'selector': '#o1',
+                          'label': 'Option Beta'}
+        assert evidence['performed'] is True and filled == {'#o1': 'Option Beta'}
+        assert [args for args, _ in session.calls] == [('click', '#o1')]
+        current = await session.page()
+        assert [c['selector'] for c in current['controls']
+                if c['checked']] == ['#o1']
+        intent = forms._write_intent(
+            form, form['controls'][1], result, filled, evidence)
+        assert intent is not None
+        assert forms._completed_write_receipts(current, [intent]) == [
+            {'action': 'choose', 'verified': True}]
+        assert forms._model_projection(current, [result])[1] == [
+            {'action': 'choose'}]
 
 @pytest.mark.asyncio
 async def test_suffix_fallback_is_refused_for_ineligible_receivers():
@@ -1386,3 +1417,372 @@ async def test_suffix_backed_choose_keeps_protected_key_exclusions(bad_key):
         await act(session, form, {'action': 'choose', 'selector': '#o1',
                                   'fact': bad_key}, {bad_key: 'Option Beta'})
     assert session.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #318: fact-backed choose is bound to the stored-answer group member.
+# These are synthetic controls and a sealed, offline two-decision apply loop.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['radio', 'checkbox'])
+async def test_matched_member_already_checked_has_no_new_effect_or_receipt(kind):
+    form = page(*choice_group(kind))
+    form['controls'][1]['checked'] = True
+    session = MemorySession(form)
+    result, filled, evidence = await act(
+        session, form, {'action': 'choose', 'selector': '#o0',
+                        'fact': SKEY, 'value': 'Option Alpha'},
+        {SKEY: 'Option Beta'})
+    assert result['selector'] == '#o1' and result['label'] == 'Option Beta'
+    assert filled == {'#o1': 'Option Beta'}
+    assert evidence == {'performed': False} and session.calls == []
+    assert forms._write_intent(form, form['controls'][1], result,
+                               filled, evidence) is None
+    assert forms._completed_write_receipts(await session.page(), []) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', [
+    'missing-match', 'duplicate-answer', 'disabled-sibling', 'unowned',
+    'split-radio-name', 'split-form', 'unrelated-fact', 'outside-group',
+    'duplicate-matched-selector',
+])
+async def test_owner_choice_rejects_invalid_group_or_matched_receiver(case):
+    members = choice_group()
+    facts = {SKEY: 'Option Beta'}
+    requested = '#o0'
+    if case == 'missing-match':
+        facts[SKEY] = 'Option Gamma'
+    elif case == 'duplicate-answer':
+        members = choice_group(labels=('Option Beta', 'Option Beta'))
+    elif case == 'disabled-sibling':
+        members[1]['disabled'] = True
+    elif case == 'unowned':
+        members[0].update(in_form=False, form_selector='')
+    elif case == 'split-radio-name':
+        members[1]['name'] = 'different'
+    elif case == 'split-form':
+        members[1]['form_selector'] = '#another-form'
+    elif case == 'unrelated-fact':
+        facts['Unrelated'] = 'Option Beta'
+    elif case == 'outside-group':
+        requested = '#other'
+        members.append(field('#other', kind='radio', name='other',
+                             label='Yes', question='Other question'))
+    elif case == 'duplicate-matched-selector':
+        members.append(field('#o1', label='Unrelated field',
+                             question='Unrelated field'))
+    form = page(*members)
+    session = MemorySession(form)
+    with pytest.raises(forms.Gate) as caught:
+        await act(session, form,
+                  {'action': 'choose', 'selector': requested,
+                   'fact': 'Unrelated' if case == 'unrelated-fact' else SKEY,
+                   'value': 'Option Alpha'}, facts)
+    assert caught.value.reason == 'owner_question'
+    assert caught.value.form_question['selector'] == requested
+    assert session.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', ['absent', 'disabled', 'duplicated'])
+async def test_requested_selector_retains_control_gate_not_owner_question(case):
+    members = choice_group()
+    requested = '#o0'
+    if case == 'absent':
+        requested = '#nonexistent'
+    elif case == 'disabled':
+        members[0]['disabled'] = True
+    else:
+        members.append(field('#o0', label='Other control', question='Other question'))
+    form = page(*members)
+    session = MemorySession(form)
+    with pytest.raises(forms.ControlGate) as caught:
+        await act(session, form,
+                  {'action': 'choose', 'selector': requested, 'fact': SKEY},
+                  {SKEY: 'Option Beta'})
+    assert caught.value.diagnostics['reason'].startswith(
+        {'absent': 'absent', 'disabled': 'disabled',
+         'duplicated': 'ambiguous'}[case])
+    assert session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_choose_without_selector_keeps_generic_missing_selector_gate():
+    form = page(*choice_group())
+    session = MemorySession(form)
+    with pytest.raises(forms.Gate) as caught:
+        await act(session, form, {'action': 'choose', 'fact': SKEY},
+                  {SKEY: 'Option Beta'})
+    assert not isinstance(caught.value, forms.ControlGate)
+    assert caught.value.reason != 'owner_question'
+    assert 'selector is missing' in str(caught.value)
+    assert session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_complete_same_question_groups_keep_exact_target_owned_authority():
+    first = choice_group()
+    second = choice_group(name='other', prefix='q', form_selector='#other-form')
+    form = page(*first, *second)
+    full = first[0]['question']
+    facts = {full: 'Option Beta'}
+    assert forms._approved_choice_metadata(form, facts, [full]) == []
+    session = MemorySession(form)
+    result, filled, evidence = await act(
+        session, form, {'action': 'choose', 'selector': '#o0',
+                        'fact': full, 'value': 'Option Alpha'}, facts)
+    assert result['selector'] == '#o1' and filled == {'#o1': 'Option Beta'}
+    assert [args for args, _ in session.calls] == [('click', '#o1')]
+    assert evidence['performed'] is True
+    intent = forms._write_intent(form, first[1], result, filled, evidence)
+    assert forms._completed_write_receipts(await session.page(), [intent]) == [
+        {'action': 'choose', 'verified': True}]
+    # The page-wide lexical suffix witness is still not valid for 2+2 groups.
+    session = MemorySession(form)
+    with pytest.raises(forms.Gate) as caught:
+        await act(session, form, {'action': 'choose', 'selector': '#o0',
+                                  'fact': SKEY}, {SKEY: 'Option Beta'})
+    assert caught.value.reason == 'owner_question' and session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_equal_full_and_stripped_keys_accept_only_observed_witness():
+    form = page(*choice_group())
+    full = form['controls'][0]['question']
+    cases = (
+        ({SKEY: ' Option Beta ', full: 'Option Beta'}, SKEY),
+        ({SKEY: 'Option Beta', full: 'Option Beta'}, full),
+        ({SKEY: 'Option Beta', full.upper() + ' *': 'Option Beta'}, SKEY),
+        ({SKEY: 'Option Beta', full: 'Option Beta',
+          full.upper() + ' *': ' Option Beta '}, SKEY),
+    )
+    for facts, asserted in cases:
+        session = MemorySession(form)
+        result, filled, evidence = await act(
+            session, form, {'action': 'choose', 'selector': '#o0',
+                            'fact': asserted, 'value': 'Option Alpha'}, facts)
+        assert result['selector'] == '#o1' and result['label'] == 'Option Beta'
+        assert filled == {'#o1': 'Option Beta'} and evidence['performed']
+        assert [args for args, _ in session.calls] == [('click', '#o1')]
+        assert forms._completed_write_receipts(
+            await session.page(),
+            [forms._write_intent(form, form['controls'][1],
+                                 result, filled, evidence)]) == [
+            {'action': 'choose', 'verified': True}]
+    assert forms._owner_action_answer({'fact': full}, {SKEY: 'Option Beta'}) == ''
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('protected', [
+    'I agree to terms',
+    'I have a professional licence',
+])
+async def test_full_stripped_join_refuses_protected_question_aliases(protected):
+    """An exact full key cannot launder protected stripped-key assertions."""
+    form = page(*choice_group(key=protected, labels=('Yes', 'No')))
+    full = form['controls'][0]['question']
+    facts = {protected: 'Yes', full: 'Yes'}
+    # The full observed key resolves exactly, not via the old suffix fallback.
+    assert forms._fact_key_lookup(facts, full, form['controls'], form) == (full, False)
+    assert forms._group_stripped_question(full, form['controls'], form) == (
+        forms.normalize_label(protected))
+    assert forms._approved_choice_metadata(
+        form, facts, forms._safe_fact_keys(facts, form)) == []
+
+    session = MemorySession(form)
+    filled, evidence = {}, {}
+    with pytest.raises(forms.Gate) as caught:
+        await forms.execute(
+            session, form,
+            {'action': 'choose', 'selector': '#o1', 'fact': protected,
+             'value': 'No'},
+            facts=facts, filled=filled, resume_path='', company='example-co',
+            jd_text='', resume_tex='', github='', pk=PK, job_url=URL,
+            write_evidence=evidence)
+    assert caught.value.reason == 'owner_question'
+    assert caught.value.form_question['selector'] == '#o1'
+    assert session.calls == [] and filled == {} and evidence == {}
+    assert all(not c['checked'] for c in (await session.page())['controls'])
+
+
+@pytest.mark.asyncio
+async def test_new_equivalence_join_refuses_conflicting_full_aliases():
+    form = page(*choice_group())
+    full = form['controls'][0]['question']
+    collision = full.upper() + ' *'
+    cases = (
+        {SKEY: 'Option Beta', full: 'Option Alpha'},
+        {SKEY: 'Option Beta', full: 'Option Beta', collision: 'Option Alpha'},
+        {SKEY: 'Option Beta', full.upper(): 'Option Beta',
+         collision: 'Option Alpha'},
+    )
+    for facts in cases:
+        session = MemorySession(form)
+        with pytest.raises(forms.Gate) as caught:
+            await act(session, form,
+                      {'action': 'choose', 'selector': '#o0',
+                       'fact': SKEY, 'value': 'Option Alpha'}, facts)
+        assert caught.value.reason == 'owner_question' and session.calls == []
+    # The exact lookup precedence outside the new join must not change.
+    assert forms._fact_key({full: 'Option Beta', collision: 'Option Alpha'},
+                           full, form['controls'], form) == full
+    assert forms._owner_action_answer(
+        {'fact': full}, {full: 'Option Beta', collision: 'Option Alpha'}) == 'Option Beta'
+
+
+@pytest.mark.asyncio
+async def test_equivalence_rejects_python_none_empty_and_unrelated_equal_fact():
+    members = choice_group(labels=('None', 'Option Beta'))
+    form = page(*members)
+    full = members[0]['question']
+    cases = (
+        ({SKEY: 'None', full: None}, SKEY),
+        ({SKEY: None, full: 'None'}, SKEY),
+        ({SKEY: 'None', full: ''}, SKEY),
+        ({SKEY: 'None', full: 'None', 'Unrelated': 'None'}, 'Unrelated'),
+    )
+    for facts, asserted in cases:
+        session = MemorySession(form)
+        with pytest.raises(forms.Gate) as caught:
+            await act(session, form, {'action': 'choose', 'selector': '#o1',
+                                      'fact': asserted, 'value': 'Option Beta'}, facts)
+        assert caught.value.reason == 'owner_question' and session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_competing_prechecked_checkbox_never_forges_matched_choice_receipt():
+    form = page(*choice_group('checkbox'))
+    form['controls'][0]['checked'] = True
+    session = MemorySession(form)
+    result, filled, evidence = await act(
+        session, form, {'action': 'choose', 'selector': '#o0', 'fact': SKEY},
+        {SKEY: 'Option Beta'})
+    assert evidence['performed'] is True
+    assert [args for args, _ in session.calls] == [('click', '#o1')]
+    intent = forms._write_intent(
+        form, form['controls'][1], result, filled, evidence)
+    assert intent is not None
+    assert [c['checked'] for c in (await session.page())['controls']] == [True, True]
+    assert forms._completed_write_receipts(await session.page(), [intent]) == []
+    stale = await session.page()
+    stale['controls'][1]['checked'] = False
+    assert forms._completed_write_receipts(stale, [intent]) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('readback', ['verified', 'already-checked', 'no-effect'])
+async def test_two_decision_apply_receipts_bind_the_actual_choice_member(
+        tmp_path, monkeypatch, readback):
+    """No Submit, live browser, Redis or owner data: sealed fixture and stub."""
+    document = tmp_path / 'Synthetic-Resume.pdf'
+    document.write_bytes(b'%PDF-1.4\nsynthetic only\n')
+    authority = fixture._SyntheticRun(str(document))
+    monkeypatch.setattr(fixture, '_daemon_origin', lambda: True)
+    # This fixture extends the stock closed synthetic fact map with Eligibility.
+    monkeypatch.setattr(fixture._SyntheticRun, 'matches', lambda self_, **kw: True)
+    monkeypatch.setattr(fixture._SyntheticRun, 'facade', lambda self, raw: raw)
+    current = page(*eligibility())
+    current['url'] = fixture.URL
+    for c in current['controls']:
+        c['form_action'] = fixture.URL
+    if readback == 'already-checked':
+        current['controls'][1]['checked'] = True
+    memory = MemorySession(current)
+    views = []
+
+    async def scripted(self, task, model_page, history, *, model):
+        assert self is authority and model == 'synthetic-fixture'
+        views.append((task, deepcopy(model_page), deepcopy(history)))
+        if len(views) == 1:
+            return {'action': 'choose', 'selector': '#yes',
+                    'fact': 'Eligibility', 'value': 'Yes'}
+        return {'action': 'gate'}
+
+    class RawSession:
+        def __init__(self, kind):
+            assert kind == 'apply'
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def navigate(self, url):
+            assert url == fixture.URL
+            return await memory.page()
+
+        async def page(self):
+            return await memory.page()
+
+        async def call(self, *args, **kwargs):
+            if readback == 'no-effect':
+                memory.calls.append((args, kwargs))
+                return {}
+            return await memory.call(*args, **kwargs)
+
+    monkeypatch.setattr(fixture._SyntheticRun, 'decision', scripted)
+    monkeypatch.setattr(bsk, 'Session', RawSession)
+    token = fixture._SESSION_ENTRY.set(authority)
+    try:
+        result = await forms.apply(
+            fixture.URL, fixture.COMPANY,
+            {**fixture._FACTS, 'Eligibility': 'No'}, 'synthetic-fixture',
+            pk=fixture.PK, resume_path=authority.resume_path,
+            fixture_context=authority)
+    finally:
+        fixture._SESSION_ENTRY.reset(token)
+    assert result['status'] == 'gate' and len(views) == 2
+    assert views[0][1]['completed_writes'] == []
+    expected = ([{'action': 'choose', 'verified': True}]
+                if readback == 'verified' else [])
+    assert views[1][1]['completed_writes'] == expected
+    assert views[1][2] == [{'action': 'choose'}]
+    assert views[1][1]['attachment_completed'] is False
+    assert views[1][1]['approved_choices'] == [
+        {'fact_key': 'Eligibility', 'answer_present': True}]
+    assert [args for args, _ in memory.calls] == (
+        [('click', '#no')] if readback != 'already-checked' else [])
+    assert 'No' not in repr(views[1][1]['completed_writes'])
+    assert 'No' not in repr(views[1][2])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('split', ['radio-name', 'form-owner'])
+async def test_exact_full_key_cannot_turn_split_sibling_into_group_authority(split):
+    members = choice_group()
+    full = members[0]['question']
+    if split == 'radio-name':
+        members[1]['name'] = 'another-name'
+    else:
+        members[1]['form_selector'] = '#other-form'
+    form = page(*members)
+    session = MemorySession(form)
+    with pytest.raises(forms.Gate) as caught:
+        await act(session, form,
+                  {'action': 'choose', 'selector': '#o1', 'fact': full,
+                   'value': 'Option Beta'}, {full: 'Option Beta'})
+    assert caught.value.reason == 'owner_question'
+    assert session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_independent_exact_key_single_radio_preserves_existing_choice_path():
+    """A standalone radio has no split sibling and still uses its stored fact."""
+    form = page(field('#only', kind='radio', label='Yes',
+                      question='Synthetic standalone', name='standalone', value='yes'))
+    session = MemorySession(form)
+    result, filled, evidence = await act(
+        session, form, {'action': 'choose', 'selector': '#only',
+                        'fact': 'Synthetic standalone', 'value': 'No'},
+        {'Synthetic standalone': 'Yes'})
+    assert result['selector'] == '#only' and evidence['performed'] is True
+    assert filled == {'#only': 'Yes'}
+    assert [args for args, _ in session.calls] == [('click', '#only')]
+    intent = forms._write_intent(form, form['controls'][0],
+                                 result, filled, evidence)
+    assert forms._completed_write_receipts(await session.page(), [intent]) == [
+        {'action': 'choose', 'verified': True}]

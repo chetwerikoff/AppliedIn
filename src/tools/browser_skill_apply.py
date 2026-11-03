@@ -3468,6 +3468,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                     and (not isinstance(target.get('question'), str)
                          or not target['question'].strip()))
                 if (len(matches) != 1
+                        or (len(group) == 1 and not label_only_checkbox)
                         or (label_only_checkbox and proposed is not None
                             and (not isinstance(proposed, str)
                                  or not _matches_choice(target, proposed.strip())))):

@@ -596,7 +596,13 @@ _ASHBY_ROOT = r"""
   // emptied every reversible scope after #220. Any other attribute is unsafe.
   const inertSibling=(e,styled=false)=>{
     if(!['DIV','SPAN'].includes(e.tagName) || Array.from(e.attributes).some(a=>
-       !(styled && (a.name==='class' || /^data-/i.test(a.name))))) return false;
+       !(styled && (a.name==='class' || /^data-/i.test(a.name) ||
+         (a.name==='aria-hidden' && a.value==='true' &&
+          e.parentElement===wrapper && wrapper?.tagName==='DIV' &&
+          wrapper.id==='form' && !wrapper.getAttribute('class') &&
+          container?.tagName==='DIV' && exactSubmit?.tagName==='BUTTON' &&
+          exactSubmit.parentElement===wrapper && paneSafe &&
+          (!surveyWrappers.length || surveyValid)))))) return false;
     const nodes=[e,...Array.from(e.querySelectorAll('*'))];
     const interactive=query+',iframe,[contenteditable],[role],[tabindex],summary,details,form,object,embed,area[href],audio[controls],video[controls],label[for],[autofocus],[controls]';
     return !e.querySelectorAll(interactive).length && nodes.every(n=>
@@ -606,7 +612,15 @@ _ASHBY_ROOT = r"""
   // description links. Links are never receivers, targets or click authority.
   const linkOnlySibling=e=>{
     if(!['DIV','SPAN','P'].includes(e.tagName) || Array.from(e.attributes).some(a=>
-       !(a.name==='class' || /^data-/i.test(a.name)))) return false;
+       !(a.name==='class' || /^data-/i.test(a.name) ||
+         (a.name==='aria-hidden' && a.value==='true' &&
+          Array.from(e.attributes).some(b=>
+            b.name==='class' || /^data-/i.test(b.name)) &&
+          e.parentElement===wrapper && wrapper?.tagName==='DIV' &&
+          wrapper.id==='form' && !wrapper.getAttribute('class') &&
+          container?.tagName==='DIV' && exactSubmit?.tagName==='BUTTON' &&
+          exactSubmit.parentElement===wrapper && paneSafe &&
+          (!surveyWrappers.length || surveyValid))))) return false;
     const nodes=[e,...Array.from(e.querySelectorAll('*'))];
     const interactive=query+',iframe,[contenteditable],[role],[tabindex],summary,details,form,object,embed,area[href],audio[controls],video[controls],label,[autofocus],[controls],[form],[formaction]';
     const links=Array.from(e.querySelectorAll('a[href]'));

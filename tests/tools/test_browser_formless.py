@@ -2321,3 +2321,294 @@ def test_final_formless_boundary_ignores_only_hidden_backing_with_real_yes_no(
     else:
         with pytest.raises(forms.Gate, match='lost a receiver'):
             forms._formless_boundary(page, provenance)
+
+# Issue #320: React Aria decoration must not make an unproven wrapper an upload root.
+_ISSUE320_LIVE = dict(
+    liveForm='uploader', survey=True, surveyChoices=True, liveLocation=True,
+    liveLocationToggle=True, liveAttestations=True, mainRadio=True)
+_ISSUE320_DECORATED = ('callout', 'pane', 'container', 'submit', 'inert', 'legal')
+
+
+def _issue320_spec(**changes):
+    return dict(root=False, formless=True, url=entry('ashby'),
+                **{**_ISSUE320_LIVE, **changes})
+
+
+def _issue320_provenance():
+    from tests.tools.test_browser_application_entry import JOB
+    return forms.ApplicationEntryProvenance(
+        PK, COMPANY, 'ashby', JOB, posting('ashby'), 'example-co', entry('ashby'))
+
+
+def _issue320_dom(spec, reader, *, siblings=(), attr='aria-hidden', value='true',
+                  drop_form_id=False, drop_style=False, extra=None, shadow=False,
+                  nested_link_attr=False, location_state='', completed_values=False,
+                  radio_group=False):
+    """Decorate existing offline nodes before either actual production reader runs.
+
+    The fixture, root proof, form controllers and receipt verification are unmodified.
+    Only input/checked state is reconstructed for a fresh readback.
+    """
+    import json
+
+    opener = '(() => {\n'
+    assert reader.startswith(opener)
+    injection = f"""
+  {{
+    const wrapper = document.querySelector('div.ashby-application-form-container')?.parentElement;
+    if (!wrapper) throw Error('missing synthetic Ashby wrapper');
+    if ({json.dumps(drop_form_id)}) wrapper.removeAttribute('id');
+    const targets = {{
+      callout: document.querySelector('div.ashby-application-blocking-disclosure'),
+      pane: document.querySelector('#autofill'),
+      container: document.querySelector('#application-fields'),
+      submit: document.querySelector('#structural-submit'),
+      inert: document.querySelector('div.synthetic-decoration'),
+      legal: document.querySelector('p.synthetic-legal')
+    }};
+    for (const key of {json.dumps(list(siblings))}) {{
+      const e = targets[key];
+      if (!e || e.parentElement !== wrapper) throw Error('non-direct synthetic sibling: '+key);
+      if ({json.dumps(drop_style)}) {{
+        e.removeAttribute('class');
+        e.removeAttribute('data-highlight');
+      }}
+      e.setAttribute({json.dumps(attr)}, {json.dumps(value)});
+      if (!({json.dumps(drop_style)})) e.setAttribute('data-aria-hidden', 'true');
+      for (const [name, value] of Object.entries({json.dumps(extra or {})}))
+        e.setAttribute(name, value);
+      if ({json.dumps(shadow)}) e.shadowRoot = {{}};
+    }}
+    if ({json.dumps(nested_link_attr)}) {{
+      const link = targets.legal?.querySelector('a[href]');
+      if (!link) throw Error('missing synthetic legal link');
+      link.setAttribute('aria-label', 'synthetic-link-label');
+    }}
+    if ({json.dumps(location_state)} === 'mounted') {{
+      const location = document.querySelector('input.ashby-application-form-input-autocomplete');
+      location.setAttribute('aria-expanded', 'true');
+      const list = node('div', {{role:'listbox', id:'synthetic-location-options'}}, document.body);
+      node('div', {{role:'option', text:'Synthetic option'}}, list);
+    }}
+    if ({json.dumps(location_state)} === 'filled') {{
+      const location = document.querySelector('input.ashby-application-form-input-autocomplete');
+      location.value = 'Synthetic location';
+    }}
+    if ({json.dumps(radio_group)}) {{
+      const radio = document.getElementById('main-choice-0');
+      const entry = radio?.closest('div.ashby-application-form-field-entry');
+      if (!entry) throw Error('missing synthetic radio group');
+      entry.setAttribute('role', 'radiogroup');
+    }}
+    if ({json.dumps(completed_values)}) {{
+      document.getElementById('_systemfield_name').value = 'Test User';
+      document.getElementById('_systemfield_email').value = 'test@example-co.test';
+      document.getElementById('additional').value = 'Synthetic additional detail';
+      document.getElementById('main-choice-0').checked = true;
+      document.getElementById('main-choice-1').checked = false;
+    }}
+  }}
+"""
+    return dom(spec, reader.replace(opener, opener + injection, 1))
+
+
+def _issue320_owned(snapshot, provenance):
+    return sorted((c['selector'], c['type'], c.get('question'), c.get('name'))
+                  for c in forms._formless_boundary(snapshot, provenance))
+
+
+@pytest.mark.parametrize('location_state', ['mounted', 'blur', 'filled'])
+def test_issue320_react_aria_decoration_preserves_real_reader_root_and_fourteen_owners(
+        location_state):
+    spec = _issue320_spec(inertSibling=True, siblingClass='synthetic-decoration',
+                          siblingAttrs={'data-highlight': 'synthetic'})
+    readers = (forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS)
+    before = [dom(spec, script) for script in readers]
+    after = [_issue320_dom(spec, script, siblings=_ISSUE320_DECORATED,
+                           location_state=location_state) for script in readers]
+    provenance = _issue320_provenance()
+    assert before[0]['entry'] == before[1]['entry']
+    assert after[0]['entry'] == after[1]['entry']
+    census = _issue320_owned(before[0], provenance)
+    assert len(census) == 14, census
+    radios = [row for row in census if row[1] == 'radio']
+    assert len(radios) == 4, radios
+    for original, decorated in zip(before, after):
+        root = decorated['entry']['formless']
+        prior = original['entry']['formless']
+        assert root['root'] == prior['root'] == '#form'
+        assert root['error'] == prior['error'] == ''
+        assert root['submit'] == prior['submit'] == '#structural-submit'
+        assert root['pane'] == prior['pane'] == '#autofill'
+        assert root['container'] == prior['container'] == '#application-fields'
+        assert {'#autofill-file', '#autofill-button', '#autofill-upload'} <= set(root['excluded'])
+        assert _issue320_owned(decorated, provenance) == _issue320_owned(original, provenance)
+        assert sorted((s, t, n) for s, t, _, n in _issue320_owned(decorated, provenance)) == [
+            (s, t, n) for s, t, _, n in census]
+        assert [e['selector'] for e in decorated['entry']['root_evidence']] == [
+            e['selector'] for e in original['entry']['root_evidence']]
+        assert not {name for name, _, _, _ in census} & set(root['excluded'])
+        assert not any(c['tag'] == 'a' and c['selector'] in {row[0] for row in census}
+                       for c in decorated['controls'])
+
+
+@pytest.mark.parametrize('path', ['inert', 'legal'])
+@pytest.mark.parametrize('kind', ['false', 'other-aria', 'interactive', 'handler',
+                                   'role', 'tabindex', 'shadow', 'unstyled'])
+def test_issue320_bad_decorated_siblings_still_fail_closed(path, kind):
+    if kind == 'unstyled' and path != 'legal':
+        pytest.skip('link-only styling evidence is the separate requirement')
+    flags = dict(inertSibling=True, siblingClass='synthetic-decoration',
+                 siblingAttrs={'data-highlight': 'synthetic'}) if path == 'inert' else {}
+    if kind == 'interactive':
+        if path == 'inert':
+            flags['inertDescendant'] = 'button'
+        else:
+            flags['liveLinkExtra'] = 'button'
+    spec = _issue320_spec(**flags)
+    attrs = {'false': ('aria-hidden', 'false'), 'other-aria': ('aria-label', 'synthetic')}
+    attr, value = attrs.get(kind, ('aria-hidden', 'true'))
+    extra = {'handler': {'onclick': 'syntheticAction()'},
+             'role': {'role': 'note'}, 'tabindex': {'tabindex': '-1'}}.get(kind)
+    for script in (forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS):
+        snap = _issue320_dom(spec, script, siblings=(path,), attr=attr, value=value,
+                             extra=extra, shadow=kind == 'shadow',
+                             drop_style=kind == 'unstyled')
+        root = snap['entry']['formless']
+        assert root['root'] == '' and root['error'] == _UNSAFE
+        assert snap['entry']['root'] is None
+        tree = snap['entry']['upload_tree']
+        assert tree is None or tree['complete'] is False
+
+
+@pytest.mark.parametrize('script', [forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS])
+def test_issue320_allowed_link_parent_never_whitelists_nested_link_attributes(script):
+    spec = _issue320_spec()
+    accepted = _issue320_dom(spec, script, siblings=('legal',))
+    rejected = _issue320_dom(spec, script, siblings=('legal',), nested_link_attr=True)
+    assert accepted['entry']['formless']['root'] == '#form'
+    assert rejected['entry']['formless']['root'] == ''
+    assert rejected['entry']['formless']['error'] == _UNSAFE
+
+
+@pytest.mark.parametrize('path', ['inert', 'legal'])
+@pytest.mark.parametrize('failed_shape', [False, True], ids=['non-form', 'failed-form-shape'])
+def test_issue320_unproven_wrappers_keep_unsafe_error_and_no_new_upload_tree(
+        path, failed_shape):
+    if failed_shape:
+        # Candidate div#form: the moved pane independently falsifies paneSafe.
+        flags = dict(liveForm='uploader', movePane=True)
+        if path == 'inert':
+            flags.update(inertSibling=True, siblingClass='synthetic-decoration',
+                         siblingAttrs={'data-highlight': 'synthetic'})
+        spec, strip_id = dict(root=False, formless=True, url=entry('ashby'), **flags), False
+    elif path == 'inert':
+        # Ordinary non-#form container: only legacy data-* styling may pass.
+        spec = dict(root=False, formless=True, url=entry('ashby'),
+                    inertSibling=True, siblingClass='synthetic-decoration',
+                    siblingAttrs={'data-highlight': 'synthetic'})
+        strip_id = False
+    else:
+        # Reuse the existing styled legal link; erase only the synthetic #form id.
+        spec = dict(root=False, formless=True, url=entry('ashby'),
+                    liveForm='uploader')
+        strip_id = True
+    for script in (forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS):
+        plain = _issue320_dom(spec, script, drop_form_id=strip_id)
+        decorated = _issue320_dom(spec, script, siblings=(path,),
+                                   drop_form_id=strip_id)
+        old, new = plain['entry']['formless'], decorated['entry']['formless']
+        assert old['root'] == new['root'] == ''
+        assert old['error'] == 'application root sibling identity mismatch'
+        assert plain['entry']['upload_tree']['complete'] is True
+        assert plain['entry']['upload_tree']['scope'] == 'container'
+        assert new['error'] == _UNSAFE
+        assert decorated['entry']['root'] is None
+        tree = decorated['entry']['upload_tree']
+        assert tree is None or tree['complete'] is False
+        assert tree is None or tree.get('scope') != 'container'
+        with pytest.raises(forms.Gate, match='final Ashby application container'):
+            forms._formless_boundary(decorated, _issue320_provenance())
+
+
+@pytest.mark.asyncio
+async def test_issue320_four_real_readback_receipts_survive_decoration_and_checked_replay(
+        monkeypatch):
+    # Run real execute -> performed effect -> write intent -> private readback.
+    # These receipts cannot be created by copying a model claim into a snapshot.
+    row, raw, _, provenance = root_world(monkeypatch, **_ISSUE320_LIVE)
+    # The fixture's id-bearing main radios have no native fieldset question.
+    # Give their existing field entry a semantic group in the DOM, so the
+    # production ownership and readback checks (not a fabricated receipt)
+    # validate one shared question for the actual choice.
+    spec = _issue320_spec()
+    raw.current, raw.fixed = (
+        _issue320_dom(spec, reader, radio_group=True)
+        for reader in (forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS))
+    assert raw.current['entry'] == raw.fixed['entry']
+    session = forms._EntrySession(raw, lambda url: url == entry('ashby'),
+                                  provenance, resume_path='Resume.pdf')
+    facts = {'Name': 'Test User', 'Email': 'test@example-co.test',
+             'Additional information': 'Synthetic additional detail'}
+    actions = [dict(action='fill', selector='#_systemfield_name', fact='Name'),
+               dict(action='fill', selector='#_systemfield_email', fact='Email'),
+               dict(action='fill', selector='#additional', fact='Additional information'),
+               dict(action='choose', selector='#main-choice-0',
+                    value='Synthetic main option 0')]
+
+    def checked_effect():
+        for snapshot in (raw.current, raw.fixed):
+            for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
+                if c['selector'] in {'#main-choice-0', '#main-choice-1'}:
+                    c['checked'] = c['selector'] == '#main-choice-0'
+
+    raw.before_click = checked_effect
+    intents, filled = [], {}
+    for action in actions:
+        before = deepcopy(raw.current)
+        receiver = forms.control(before, action, 'decision-action')
+        evidence = {}
+        result = await forms.execute(
+            session, before, action, facts=facts, filled=filled,
+            resume_path='Resume.pdf', company=COMPANY, jd_text='', resume_tex='',
+            github='', pk=PK, job_url=posting('ashby'), provenance=provenance,
+            write_evidence=evidence)
+        intent = forms._write_intent(before, receiver, result, filled, evidence,
+                                     provenance=provenance)
+        assert evidence.get('performed') is True and intent is not None
+        intents.append(intent)
+        receipts = forms._completed_write_receipts(raw.current, intents,
+                                                    provenance=provenance)
+        assert len(receipts) == len(intents), receipts
+        assert all(receipt['verified'] is True for receipt in receipts)
+
+    raw.current, raw.fixed = (
+        _issue320_dom(spec, script, siblings=('callout', 'pane', 'container',
+                                             'submit', 'legal'),
+                      completed_values=True, radio_group=True)
+        for script in (forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS))
+    assert raw.current['entry'] == raw.fixed['entry']
+    assert raw.current['entry']['formless']['root'] == '#form'
+    receipts = forms._completed_write_receipts(raw.current, intents,
+                                                provenance=provenance)
+    assert len(receipts) == 4 and all(r['verified'] is True for r in receipts)
+    assert [r['action'] for r in receipts] == ['fill', 'fill', 'fill', 'choose']
+    assert len(_issue320_owned(raw.current, provenance)) == 14
+    current_radio = forms.control(raw.current, actions[-1], 'decision-action')
+    assert current_radio['checked'] is True
+    assert len(forms._choice_members(raw.current, current_radio,
+                                      provenance=provenance)) == 2
+    clicks_before = [c for c in raw.calls if c[0] == 'click']
+    assert clicks_before == [('click', '#main-choice-0')]
+    replay_evidence = {}
+    replay = await forms.execute(
+        session, raw.current, actions[-1], facts=facts, filled=filled,
+        resume_path='Resume.pdf', company=COMPANY, jd_text='', resume_tex='',
+        github='', pk=PK, job_url=posting('ashby'), provenance=provenance,
+        write_evidence=replay_evidence)
+    assert replay['action'] == 'choose'
+    assert replay_evidence.get('performed') is False
+    assert [c for c in raw.calls if c[0] == 'click'] == clicks_before
+    assert forms._completed_write_receipts(raw.current, intents,
+                                            provenance=provenance) == receipts
+    assert not any(c[0] in {'submit', 'upload'} for c in raw.calls)

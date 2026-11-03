@@ -3422,12 +3422,6 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 question_key, suffix_backed = (
                     _fact_key_lookup(facts, question, group, page)
                     if isinstance(question, str) and question.strip() else (None, False))
-                if suffix_backed and (
-                        question_key not in _safe_fact_keys(facts, page)
-                        or _SENSITIVE.search(question) or _SANCTIONS_RX.search(question)
-                        or _AGREE.search(question) or _FACT_ASSERTION.search(question)):
-                    # The stripped fallback never outranks the metadata filters.
-                    raise _owner_question_gate(page, target, pk)
                 asserted_norm = (normalize_label(asserted_key)
                                  if isinstance(asserted_key, str) else '')
                 question_norm = (normalize_label(question_key)
@@ -3442,6 +3436,13 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                     and asserted_norm != question_norm
                     and {asserted_norm, question_norm}
                     == {full_norm, normalize_label(stripped)})
+                if (suffix_backed or joined_keys) and (
+                        question_key not in _safe_fact_keys(facts, page)
+                        or _SENSITIVE.search(question) or _SANCTIONS_RX.search(question)
+                        or _AGREE.search(question) or _FACT_ASSERTION.search(question)):
+                    # Neither a stripped fallback nor a full/stripped join
+                    # can bypass the existing protected-question exclusions.
+                    raise _owner_question_gate(page, target, pk)
                 if (not group or asserted_key is None or question_key is None
                         or not (asserted_norm and
                                 (asserted_norm == question_norm or joined_keys))

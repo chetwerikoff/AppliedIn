@@ -1576,6 +1576,39 @@ async def test_equal_full_and_stripped_keys_accept_only_observed_witness():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('protected', [
+    'I agree to terms',
+    'I have a professional licence',
+])
+async def test_full_stripped_join_refuses_protected_question_aliases(protected):
+    """An exact full key cannot launder protected stripped-key assertions."""
+    form = page(*choice_group(key=protected, labels=('Yes', 'No')))
+    full = form['controls'][0]['question']
+    facts = {protected: 'Yes', full: 'Yes'}
+    # The full observed key resolves exactly, not via the old suffix fallback.
+    assert forms._fact_key_lookup(facts, full, form['controls'], form) == (full, False)
+    assert forms._group_stripped_question(full, form['controls'], form) == (
+        forms.normalize_label(protected))
+    assert forms._approved_choice_metadata(
+        form, facts, forms._safe_fact_keys(facts, form)) == []
+
+    session = MemorySession(form)
+    filled, evidence = {}, {}
+    with pytest.raises(forms.Gate) as caught:
+        await forms.execute(
+            session, form,
+            {'action': 'choose', 'selector': '#o1', 'fact': protected,
+             'value': 'No'},
+            facts=facts, filled=filled, resume_path='', company='example-co',
+            jd_text='', resume_tex='', github='', pk=PK, job_url=URL,
+            write_evidence=evidence)
+    assert caught.value.reason == 'owner_question'
+    assert caught.value.form_question['selector'] == '#o1'
+    assert session.calls == [] and filled == {} and evidence == {}
+    assert all(not c['checked'] for c in (await session.page())['controls'])
+
+
+@pytest.mark.asyncio
 async def test_new_equivalence_join_refuses_conflicting_full_aliases():
     form = page(*choice_group())
     full = form['controls'][0]['question']

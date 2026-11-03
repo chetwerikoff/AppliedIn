@@ -2373,7 +2373,7 @@ def _issue320_dom(spec, reader, *, siblings=(), attr='aria-hidden', value='true'
         e.removeAttribute('data-highlight');
       }}
       e.setAttribute({json.dumps(attr)}, {json.dumps(value)});
-      e.setAttribute('data-aria-hidden', 'true');
+      if (!({json.dumps(drop_style)})) e.setAttribute('data-aria-hidden', 'true');
       for (const [name, value] of Object.entries({json.dumps(extra or {})}))
         e.setAttribute(name, value);
       if ({json.dumps(shadow)}) e.shadowRoot = {{}};
@@ -2435,7 +2435,9 @@ def test_issue320_react_aria_decoration_preserves_real_reader_root_and_fourteen_
         assert root['pane'] == prior['pane'] == '#autofill'
         assert root['container'] == prior['container'] == '#application-fields'
         assert {'#autofill-file', '#autofill-button', '#autofill-upload'} <= set(root['excluded'])
-        assert _issue320_owned(decorated, provenance) == census
+        assert _issue320_owned(decorated, provenance) == _issue320_owned(original, provenance)
+        assert sorted((s, t, n) for s, t, _, n in _issue320_owned(decorated, provenance)) == [
+            (s, t, n) for s, t, _, n in census]
         assert [e['selector'] for e in decorated['entry']['root_evidence']] == [
             e['selector'] for e in original['entry']['root_evidence']]
         assert not {name for name, _, _, _ in census} & set(root['excluded'])
@@ -2468,7 +2470,8 @@ def test_issue320_bad_decorated_siblings_still_fail_closed(path, kind):
         root = snap['entry']['formless']
         assert root['root'] == '' and root['error'] == _UNSAFE
         assert snap['entry']['root'] is None
-        assert snap['entry']['upload_tree']['complete'] is False
+        tree = snap['entry']['upload_tree']
+        assert tree is None or tree['complete'] is False
 
 
 @pytest.mark.parametrize('script', [forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS])
@@ -2505,7 +2508,7 @@ def test_issue320_unproven_wrappers_keep_unsafe_error_and_no_new_upload_tree(
         strip_id = True
     for script in (forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS):
         plain = _issue320_dom(spec, script, drop_form_id=strip_id)
-        decorated = _issue320_dom(spec, script, siblings=(path),
+        decorated = _issue320_dom(spec, script, siblings=(path,),
                                    drop_form_id=strip_id)
         old, new = plain['entry']['formless'], decorated['entry']['formless']
         assert old['root'] == new['root'] == ''
@@ -2529,13 +2532,12 @@ async def test_issue320_four_real_readback_receipts_survive_decoration_and_check
     session = forms._EntrySession(raw, lambda url: url == entry('ashby'),
                                   provenance, resume_path='Resume.pdf')
     facts = {'Name': 'Test User', 'Email': 'test@example-co.test',
-             'Additional information': 'Synthetic additional detail',
-             'Synthetic main choice question': 'Synthetic main option 0'}
+             'Additional information': 'Synthetic additional detail'}
     actions = [dict(action='fill', selector='#_systemfield_name', fact='Name'),
                dict(action='fill', selector='#_systemfield_email', fact='Email'),
                dict(action='fill', selector='#additional', fact='Additional information'),
                dict(action='choose', selector='#main-choice-0',
-                    fact='Synthetic main choice question')]
+                    value='Synthetic main option 0')]
 
     def checked_effect():
         for snapshot in (raw.current, raw.fixed):

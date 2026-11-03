@@ -1254,23 +1254,25 @@ def test_group_two_equal_groups_are_not_a_unique_receiver():
 
 def test_fact_key_precedence_and_collisions():
     members = choice_group()
+    form = page(*members)
     question = members[0]['question']
     # Exact and complete-question normalized lookups stay first.
-    assert forms._fact_key({question: 'a', SKEY: 'b'}, question, members) == question
+    assert forms._fact_key({question: 'a', SKEY: 'b'}, question, members, form) == question
     full_norm = question.upper()
-    assert forms._fact_key({full_norm: 'a', SKEY: 'b'}, question, members) == full_norm
+    assert forms._fact_key({full_norm: 'a', SKEY: 'b'}, question, members, form) == full_norm
     # Conflicting full-question collision is ambiguous, never a stripped retry.
     collision = {question.upper() + ' *': 'a', question.upper(): 'b', SKEY: 'c'}
-    assert forms._fact_key(collision, question, members) is None
+    assert forms._fact_key(collision, question, members, form) is None
     # Stripped retry needs the receiving group; model-style lookups never get it.
     assert forms._fact_key({SKEY: 'a'}, question) is None
-    assert forms._fact_key({SKEY: 'a'}, question, members) == SKEY
-    assert forms._fact_key({SKEY: 'a'}, question, members[:1]) is None
-    assert forms._fact_key({SKEY: 'a'}, question, []) is None
+    assert forms._fact_key({SKEY: 'a'}, question, members) is None  # no page witness
+    assert forms._fact_key({SKEY: 'a'}, question, members, form) == SKEY
+    assert forms._fact_key({SKEY: 'a'}, question, members[:1], form) is None
+    assert forms._fact_key({SKEY: 'a'}, question, [], form) is None
     # Equal values choose the sorted first; differing values are ambiguous.
-    assert forms._fact_key({SKEY.upper(): ' a ', SKEY: 'a'}, question, members) \
+    assert forms._fact_key({SKEY.upper(): ' a ', SKEY: 'a'}, question, members, form) \
         == min(SKEY, SKEY.upper())
-    assert forms._fact_key({SKEY.upper(): 'b', SKEY: 'a'}, question, members) is None
+    assert forms._fact_key({SKEY.upper(): 'b', SKEY: 'a'}, question, members, form) is None
 
 
 @pytest.mark.asyncio
@@ -1325,3 +1327,62 @@ def test_protected_keys_stay_withheld_even_when_stripped_question_matches(bad_ke
     assert keys == []
     assert forms._approved_choice_metadata(form, facts, keys) == []
 
+
+
+SHORT_KEY = 'Synthetic preference Alpha Beta'
+
+
+@pytest.mark.asyncio
+async def test_suffix_spanning_two_radio_groups_authorizes_nothing():
+    """2+2 split inventory: g2's own labels must not strip a g1+g2 suffix."""
+    question = 'Synthetic preference Alpha Beta Gamma Delta'
+    controls = [
+        field('#a', kind='radio', label='Alpha', question=question, name='g1'),
+        field('#b', kind='radio', label='Beta', question=question, name='g1'),
+        field('#c', kind='radio', label='Gamma', question=question, name='g2'),
+        field('#d', kind='radio', label='Delta', question=question, name='g2'),
+    ]
+    form = page(*controls)
+    facts = {SHORT_KEY: 'Delta'}
+    assert forms._approved_choice_metadata(form, facts, [SHORT_KEY]) == []
+    session = MemorySession(form)
+    with pytest.raises(forms.Gate) as caught:
+        await act(session, form, {'action': 'choose', 'selector': '#d',
+                                  'fact': SHORT_KEY}, facts)
+    assert caught.value.reason == 'owner_question' and session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_suffix_same_question_radio_and_checkbox_groups_are_not_unique():
+    form = page(*choice_group('radio'), *choice_group('checkbox', prefix='c', name='c1'))
+    facts = {SKEY: 'Option Beta'}
+    assert forms._approved_choice_metadata(form, facts, [SKEY]) == []
+    for selector in ('#o1', '#c1'):
+        session = MemorySession(form)
+        with pytest.raises(forms.Gate) as caught:
+            await act(session, form, {'action': 'choose', 'selector': selector,
+                                      'fact': SKEY}, facts)
+        assert caught.value.reason == 'owner_question' and session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_suffix_duplicate_identical_groups_cannot_be_chosen():
+    form = page(*choice_group(), *choice_group(prefix='q', name='g2'))
+    session = MemorySession(form)
+    with pytest.raises(forms.Gate) as caught:
+        await act(session, form, {'action': 'choose', 'selector': '#o1',
+                                  'fact': SKEY}, {SKEY: 'Option Beta'})
+    assert caught.value.reason == 'owner_question' and session.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bad_key', [
+    'I agree to the terms, accept all', 'Sanctions screening, export controls',
+    'Account password, saved login'])
+async def test_suffix_backed_choose_keeps_protected_key_exclusions(bad_key):
+    form = page(*choice_group(key=bad_key))
+    session = MemorySession(form)
+    with pytest.raises(forms.Gate):
+        await act(session, form, {'action': 'choose', 'selector': '#o1',
+                                  'fact': bad_key}, {bad_key: 'Option Beta'})
+    assert session.calls == []

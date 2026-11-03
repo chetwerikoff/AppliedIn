@@ -2661,13 +2661,24 @@ _COLLISION_TYPES = frozenset({
 _COLLISION_TAGS = frozenset({'input', 'textarea', 'select', 'div', 'button', 'a'})
 
 
-def _group_stripped_question(question, members) -> str:
+def _group_stripped_question(question, members, page=None) -> str:
     """Normalized question minus the page-ordered option labels of one group.
 
-    Lexical witness only: the receiving group's own labels must account for the
-    whole suffix. A singleton or non-matching group yields an empty string."""
+    Lexical witness only. The receiving group must be the sole radio/checkbox
+    group of the page with this exact question, and its own labels must account
+    for the whole suffix; a split, duplicated or mixed-type inventory yields an
+    empty string. A singleton or non-matching group also yields an empty string."""
     if (not isinstance(question, str) or not isinstance(members, list)
-            or len(members) < 2):
+            or len(members) < 2 or not isinstance(page, dict)):
+        return ''
+    controls = page.get('controls')
+    if not isinstance(controls, list):
+        return ''
+    same_question = [c for c in controls if isinstance(c, dict)
+                     and c.get('type') in {'radio', 'checkbox'}
+                     and c.get('question') == question]
+    if (len(same_question) != len(members)
+            or any(not any(c is m for m in members) for c in same_question)):
         return ''
     suffix = ' ' + ' '.join(
         normalize_label(m.get('label')) if isinstance(m.get('label'), str) else ''
@@ -2679,7 +2690,8 @@ def _group_stripped_question(question, members) -> str:
 
 
 def _fact_key_lookup(facts: dict, observed_label: str,
-                     members: list | None = None) -> tuple[str | None, bool]:
+                     members: list | None = None,
+                     page: dict | None = None) -> tuple[str | None, bool]:
     """Return (key, suffix_backed). The stripped retry needs a receiver group."""
     if observed_label in facts:
         return observed_label, False
@@ -2688,7 +2700,7 @@ def _fact_key_lookup(facts: dict, observed_label: str,
     suffix_backed = False
     if not candidates:
         # Only a genuine full-question miss may retry the group-witnessed form.
-        stripped = _group_stripped_question(observed_label, members)
+        stripped = _group_stripped_question(observed_label, members, page)
         if not stripped:
             return None, False
         candidates = [k for k in facts if isinstance(k, str)
@@ -2706,9 +2718,9 @@ def _fact_key_lookup(facts: dict, observed_label: str,
 
 
 def _fact_key(facts: dict, observed_label: str,
-              members: list | None = None) -> str | None:
+              members: list | None = None, page: dict | None = None) -> str | None:
     """Resolve approved fact DATA, never an approval grant or control identity."""
-    return _fact_key_lookup(facts, observed_label, members)[0]
+    return _fact_key_lookup(facts, observed_label, members, page)[0]
 
 
 def _owner_action_answer(action: dict, facts: dict) -> str:
@@ -2861,7 +2873,7 @@ def _approved_choice_metadata(page: dict, facts: dict,
         if (_SENSITIVE.search(question) or _SANCTIONS_RX.search(question)
                 or _AGREE.search(question) or _FACT_ASSERTION.search(question)):
             continue
-        fact_key, suffix_backed = _fact_key_lookup(facts, question, members)
+        fact_key, suffix_backed = _fact_key_lookup(facts, question, members, page)
         if fact_key not in safe_keys:
             continue
         if suffix_backed and facts[fact_key] is None:
@@ -3407,8 +3419,15 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 if not isinstance(question, str) or not question.strip():
                     question = target.get('label') if target.get('type') == 'checkbox' else ''
                 asserted_key = _fact_key(facts, action['fact'])
-                question_key = (_fact_key(facts, question, group)
-                                if isinstance(question, str) and question.strip() else None)
+                question_key, suffix_backed = (
+                    _fact_key_lookup(facts, question, group, page)
+                    if isinstance(question, str) and question.strip() else (None, False))
+                if suffix_backed and (
+                        question_key not in _safe_fact_keys(facts, page)
+                        or _SENSITIVE.search(question) or _SANCTIONS_RX.search(question)
+                        or _AGREE.search(question) or _FACT_ASSERTION.search(question)):
+                    # The stripped fallback never outranks the metadata filters.
+                    raise _owner_question_gate(page, target, pk)
                 # A model can assert a valid but unrelated fact. Match both
                 # answers to the current observed question before any click.
                 if (not group or asserted_key is None or question_key is None

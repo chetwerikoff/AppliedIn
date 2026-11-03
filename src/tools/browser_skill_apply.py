@@ -2759,10 +2759,38 @@ def _matches_choice(member: dict, answer: str) -> bool:
                 and answer.casefold().strip() in _PRIVACY_AFFIRMATIVE))
 
 
-def _safe_fact_keys(facts: dict) -> list[str]:
-    """Keep labels only; do not echo answer-shaped or sensitive owner keys."""
+def _observed_enabled_labels(page) -> frozenset:
+    """Nonempty normalized question/label text of the current enabled controls.
+
+    Non-string fields never reach normalize_label; unknown enabled state is a nonmatch."""
+    controls = page.get('controls') if isinstance(page, dict) else None
+    found = set()
+    for c in controls if isinstance(controls, list) else ():
+        if not isinstance(c, dict) or c.get('disabled') is not False:
+            continue
+        for name in ('question', 'label'):
+            text = c.get(name)
+            if isinstance(text, str) and (normalized := normalize_label(text)):
+                found.add(normalized)
+    return frozenset(found)
+
+
+def _safe_fact_keys(facts: dict, page: dict | None = None) -> list[str]:
+    """Keep labels only; do not echo answer-shaped or sensitive owner keys.
+
+    A key beyond the short charset-safe form is offered only when its normalized
+    text equals that of a currently observed enabled control; every other
+    exclusion below applies to it unchanged."""
+    observed = _observed_enabled_labels(page)
+
+    def shape_ok(k: str) -> bool:
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9 ()*?/'._:-]{0,79}", k):
+            return True
+        normalized = normalize_label(k)
+        return bool(normalized) and normalized in observed
+
     return sorted(k for k in facts if isinstance(k, str)
-                  and re.fullmatch(r"[A-Za-z][A-Za-z0-9 ()*?/'._:-]{0,79}", k)
+                  and shape_ok(k)
                   and not _SENSITIVE.search(k) and not _SANCTIONS_RX.search(k)
                   and not _AGREE.search(k)
                   and not re.search(r'password|credential|token|secret', k, re.I))
@@ -2971,6 +2999,109 @@ _DECISION_VERBS = frozenset({
 })
 
 
+_QUESTION_CLASSES = (
+    ('login', re.compile(r'log[\s-]?in|sign[\s-]?in|password|account|sso\b|authenticat|'
+                         r'credential|2fa|verification code', re.I)),
+    ('captcha', re.compile(r'captcha|robot|human verification|verify (?:you|that you)', re.I)),
+    ('missing_fact', re.compile(r'missing|no (?:fact|answer|stored)|not (?:provided|supplied|'
+                                r'available|in the (?:facts|approved))|unknown (?:fact|answer)|'
+                                r'(?:fact|answer)s? (?:is|are) (?:needed|required)|'
+                                r'need(?:s|ed)? (?:an? )?(?:fact|answer)', re.I)),
+    ('incomplete', re.compile(r'incomplete|unsupported|iframe|shadow|not (?:ready|loaded)|'
+                              r'still loading|cannot (?:complete|finish)|unable to (?:complete|'
+                              r'finish)|partial', re.I)),
+)
+
+
+def _question_class(question) -> str:
+    """One closed class for a model gate/finish reason; never the text itself."""
+    if isinstance(question, str):
+        for name, pattern in _QUESTION_CLASSES:
+            if pattern.search(question):
+                return name
+    return 'other'
+
+
+_REASON_CHARS = re.compile(r"[A-Za-z ,;:!?'()-]+(?:\.(?= |$)[A-Za-z ,;:!?'()-]*)*")
+# Any digit, dotted/slashed token (host name, file name), credential word or very
+# long token is identifier-like: fall back instead of trying to redact it.
+_REASON_UNSAFE = re.compile(
+    r'password|passcode|credential|token|secret|api[\s_-]?key|bearer|\botp\b|'
+    r'\d|https?|www|[A-Za-z0-9]{25,}', re.I)
+_REASON_MAX = 160
+_GENERIC_GATE = 'The observed form needs human inspection.'
+
+
+def _leaf_strings(value, depth: int = 0):
+    if isinstance(value, str):
+        yield value
+    elif depth < 4 and isinstance(value, dict):
+        for item in value.values():
+            yield from _leaf_strings(item, depth + 1)
+    elif depth < 4 and isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _leaf_strings(item, depth + 1)
+
+
+def _form_gate_message(action: dict, page: dict, facts: dict,
+                       resume_path: str = '') -> str:
+    """Generic text plus, when provably safe, a bounded derivative of the model reason.
+
+    The reason is untrusted model output. Anything that could carry a selector, URL,
+    identifier, attachment name, page text, owner fact value or credential falls back
+    to the generic message; the text is never logged."""
+    reason = action.get('question')
+    if not isinstance(reason, str):
+        return _GENERIC_GATE
+    text = re.sub(r'\s+', ' ', reason).strip()
+    if (not text or not _REASON_CHARS.fullmatch(text) or _REASON_UNSAFE.search(text)
+            or _SENSITIVE.search(text) or _SANCTIONS_RX.search(text)):
+        return _GENERIC_GATE
+    lowered = re.sub(r'\s+', ' ', text.casefold())
+    owned = [v for v in (facts.values() if isinstance(facts, dict) else ())
+             if isinstance(v, (str, int, float)) and len(str(v).strip()) >= 3]
+    phrases, attachments = [], []
+    if isinstance(resume_path, str) and resume_path:
+        attachments.append(resume_path)
+    if isinstance(page, dict):
+        controls = page.get('controls')
+        controls = controls if isinstance(controls, list) else []
+        for c in (c for c in controls if isinstance(c, dict)):
+            # Prefilled values and attached file names are owner/page data.
+            if isinstance(c.get('value'), str):
+                owned.append(c['value'])
+            attachments += list(_leaf_strings(c.get('files')))
+            phrases += [c.get('question'), c.get('label')]
+        attachments += list(_leaf_strings(page.get('attached_file_displays')))
+        phrases += [page.get('title'), page.get('description')]
+        if isinstance(page.get('text'), str):
+            phrases += re.split(r'[\n\r.!?;:]+', page['text'])
+    for name in attachments:
+        owned += [Path(name).name, Path(name).stem]
+    if any(len(v.strip()) >= 3 and v.strip().casefold() in lowered
+           for v in map(str, owned)):
+        return _GENERIC_GATE
+    # A reason that reproduces (or is a fragment of) a multiword page phrase copies
+    # page content; single field names alone are ordinary words and stay allowed.
+    for phrase in phrases:
+        if not isinstance(phrase, str):
+            continue
+        phrase = re.sub(r'[^\w ]+', ' ', re.sub(r'\s+', ' ', phrase.casefold())).strip()
+        phrase = re.sub(r' +', ' ', phrase)
+        plain = re.sub(r'[^\w ]+', ' ', lowered)
+        plain = re.sub(r' +', ' ', plain).strip()
+        if phrase.count(' ') >= 1 and (phrase in plain or (
+                plain.count(' ') >= 1 and plain in phrase)):
+            return _GENERIC_GATE
+    if any(lowered[i:i + 24] in ' '.join(
+            re.sub(r'\s+', ' ', p.casefold()) for p in phrases if isinstance(p, str))
+            for i in range(max(0, len(lowered) - 23))):
+        return _GENERIC_GATE
+    if len(text) > _REASON_MAX:
+        text = text[:_REASON_MAX].rsplit(' ', 1)[0].rstrip(' .,;:-') + '...'
+    return f'{_GENERIC_GATE} Model reason: {text}'
+
+
 async def _application_decision_with_log(decision, prompt, page, history, *,
                                          model: str, facts: dict, turn: int):
     """One scalar diagnostic per application-site call, including failures."""
@@ -2982,6 +3113,13 @@ async def _application_decision_with_log(decision, prompt, page, history, *,
         if isinstance(result, dict):
             verb = result.get('action')
             diagnostic['verb'] = verb if isinstance(verb, str) and verb in _DECISION_VERBS else 'unknown'
+            if diagnostic['verb'] in {'gate', 'finish'}:
+                question = result.get('question')
+                diagnostic['question_present'] = (isinstance(question, str)
+                                                  and bool(question.strip()))
+                diagnostic['question_length'] = (len(question)
+                                                 if isinstance(question, str) else 0)
+                diagnostic['question_class'] = _question_class(question)
             selector = result.get('selector')
             diagnostic['selector_present'] = (isinstance(selector, str)
                                               and bool(selector.strip()))
@@ -4608,7 +4746,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     model_page = _guard_model_page(model_page, pk, company,
                                                    fixture_context=ctx)
                     # Read private current controls only here, before projection.
-                    safe_keys = _safe_fact_keys(facts)
+                    safe_keys = _safe_fact_keys(facts, page)
                     completed = _completed_write_receipts(page, write_intents,
                                                           provenance=provenance)
                     attached = _attachment_completed_now(
@@ -4646,7 +4784,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             raise Gate('An observed application question needs an owner answer.',
                                        form_question=_ordinary_owner_question(page, field, pk),
                                        reason='owner_question')
-                        raise Gate('The observed form needs human inspection.',
+                        raise Gate(_GENERIC_GATE if action.get('selector')
+                                   else _form_gate_message(action, page, facts, resume_path),
                                    reason='agent_review_unavailable')
                     if verb == 'navigate':
                         href = action.get('url')

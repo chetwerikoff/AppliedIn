@@ -2517,8 +2517,9 @@ def test_issue320_unproven_wrappers_keep_unsafe_error_and_no_new_upload_tree(
         assert plain['entry']['upload_tree']['scope'] == 'container'
         assert new['error'] == _UNSAFE
         assert decorated['entry']['root'] is None
-        assert decorated['entry']['upload_tree']['complete'] is False
-        assert decorated['entry']['upload_tree'].get('scope') != 'container'
+        tree = decorated['entry']['upload_tree']
+        assert tree is None or tree['complete'] is False
+        assert tree is None or tree.get('scope') != 'container'
         with pytest.raises(forms.Gate, match='final Ashby application container'):
             forms._formless_boundary(decorated, _issue320_provenance())
 

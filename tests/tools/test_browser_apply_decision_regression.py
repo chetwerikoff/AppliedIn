@@ -1648,6 +1648,8 @@ async def test_two_decision_apply_receipts_bind_the_actual_choice_member(
     document.write_bytes(b'%PDF-1.4\nsynthetic only\n')
     authority = fixture._SyntheticRun(str(document))
     monkeypatch.setattr(fixture, '_daemon_origin', lambda: True)
+    # This fixture extends the stock closed synthetic fact map with Eligibility.
+    monkeypatch.setattr(fixture._SyntheticRun, 'matches', lambda self_, **kw: True)
     monkeypatch.setattr(fixture._SyntheticRun, 'facade', lambda self, raw: raw)
     current = page(*eligibility())
     current['url'] = fixture.URL
@@ -1713,3 +1715,22 @@ async def test_two_decision_apply_receipts_bind_the_actual_choice_member(
         [('click', '#no')] if readback != 'already-checked' else [])
     assert 'No' not in repr(views[1][1]['completed_writes'])
     assert 'No' not in repr(views[1][2])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('split', ['radio-name', 'form-owner'])
+async def test_exact_full_key_cannot_turn_split_sibling_into_group_authority(split):
+    members = choice_group()
+    full = members[0]['question']
+    if split == 'radio-name':
+        members[1]['name'] = 'another-name'
+    else:
+        members[1]['form_selector'] = '#other-form'
+    form = page(*members)
+    session = MemorySession(form)
+    with pytest.raises(forms.Gate) as caught:
+        await act(session, form,
+                  {'action': 'choose', 'selector': '#o1', 'fact': full,
+                   'value': 'Option Beta'}, {full: 'Option Beta'})
+    assert caught.value.reason == 'owner_question'
+    assert session.calls == []

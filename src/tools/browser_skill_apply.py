@@ -4523,15 +4523,17 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                                             'quarantined_native_owners'}}
                     model_page = _guard_model_page(model_page, pk, company,
                                                    fixture_context=ctx)
-                    model_page, model_history = _model_projection(model_page, history)
+                    # Read private current controls only here, before projection.
                     safe_keys = _safe_fact_keys(facts)
-                    # These fields are explicit outbound allowlists AFTER projection.
-                    model_page['completed_writes'] = _completed_write_receipts(
-                        page, write_intents)
-                    model_page['attachment_completed'] = _attachment_completed_now(
+                    completed = _completed_write_receipts(page, write_intents)
+                    attached = _attachment_completed_now(
                         page, upload_receiver, uploaded, producer_guard, resume_path)
-                    model_page['approved_choices'] = _approved_choice_metadata(
-                        page, facts, safe_keys)
+                    approved = _approved_choice_metadata(page, facts, safe_keys)
+                    model_page, model_history = _model_projection(model_page, history)
+                    # The three receipts have an explicit outbound allowlist.
+                    model_page['completed_writes'] = completed
+                    model_page['attachment_completed'] = attached
+                    model_page['approved_choices'] = approved
                     decision_turn += 1
                     action = await _application_decision_with_log(
                         (ctx.decision if ctx else bsk.decision),

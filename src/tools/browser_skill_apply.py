@@ -2695,19 +2695,37 @@ def _owner_question_gate(page: dict, target: dict, pk: str) -> Gate:
                 reason='owner_question')
 
 
-def _choice_members(page: dict, target: dict) -> list[dict]:
-    """Only options with one current question, form and radio group are linked."""
+def _formless_owned_controls(page: dict, provenance) -> list[dict]:
+    """Reuse the validated Ashby root evidence; never invent a native form."""
+    if not _formless_root(page):
+        return []
+    try:
+        members = _formless_boundary(page, provenance)
+    except Gate:
+        return []
+    evidence = (page.get('entry') or {}).get('root_evidence')
+    if not isinstance(evidence, list):
+        return []
+    owned = {e.get('selector') for e in evidence if isinstance(e, dict)
+             and e.get('inside') is True and e.get('in_container') is True}
+    return [c for c in members if c.get('selector') in owned
+            and c.get('in_form') is False and not c.get('form_selector')]
+
+
+def _choice_members(page: dict, target: dict, *, provenance=None) -> list[dict]:
+    """Only options with one current question and proven common owner are linked."""
     kind = target.get('type')
     question, form = target.get('question'), target.get('form_selector')
-    # A labelled standalone checkbox identifies its own question when PAGE
-    # has no separate group text; radio option labels never substitute for it.
     label_question = (kind == 'checkbox' and
                       (not isinstance(question, str) or not question.strip()))
     if label_question:
         question = target.get('label')
+    native_owner = target.get('in_form') is True and isinstance(form, str) and bool(form)
+    root_members = [] if native_owner else _formless_owned_controls(page, provenance)
     if (kind not in {'radio', 'checkbox'} or not isinstance(question, str)
-            or not question.strip() or not isinstance(form, str) or not form
-            or target.get('in_form') is not True
+            or not question.strip()
+            or not (native_owner or any(
+                c.get('selector') == target.get('selector') for c in root_members))
             or (kind == 'radio' and not target.get('name'))):
         return []
     controls = page.get('controls', [])
@@ -2717,8 +2735,8 @@ def _choice_members(page: dict, target: dict) -> list[dict]:
                and c.get('type') == kind
                and ((c.get('label') == question and not c.get('question'))
                     if label_question else c.get('question') == question)
-               and c.get('form_selector') == form
-               and c.get('in_form') is True
+               and ((c.get('form_selector') == form and c.get('in_form') is True)
+                    if native_owner else any(c is owned for owned in root_members))
                and (kind != 'radio' or c.get('name') == target.get('name'))]
     selectors = [c.get('selector') for c in members]
     if (not members or any(c.get('disabled') for c in members)
@@ -2751,14 +2769,14 @@ def _safe_fact_keys(facts: dict) -> list[str]:
 
 
 def _approved_choice_metadata(page: dict, facts: dict,
-                              safe_keys: list[str]) -> list[dict]:
+                              safe_keys: list[str], *, provenance=None) -> list[dict]:
     """Information about unique owner-backed questions, never chosen options."""
     eligible = {}
     visited = set()
     for control_item in page.get('controls', []):
         if not isinstance(control_item, dict) or control_item.get('type') not in {'radio', 'checkbox'}:
             continue
-        members = _choice_members(page, control_item)
+        members = _choice_members(page, control_item, provenance=provenance)
         if len(members) < 2:
             continue  # A lone Yes option would disclose its answer by existence.
         group = (control_item.get('form_selector'), control_item.get('question'),
@@ -2797,21 +2815,37 @@ def _receipt_identity(receiver: dict) -> tuple:
     return tuple(repr(receiver.get(k)) for k in _RECEIPT_BINDING)
 
 
-def _current_receipt_receiver(page: dict, original: dict) -> dict | None:
+# A native choice's submitted machine value and option ID must remain stable.
+# Text/select/combobox values intentionally change on a successful write.
+_CHOICE_RECEIPT_BINDING = _RECEIPT_BINDING + (
+    'value', 'id', 'native_type', 'field_entry', 'entry_label',
+)
+
+
+def _choice_receipt_identity(receiver: dict) -> tuple:
+    return tuple(repr(receiver.get(k)) for k in _CHOICE_RECEIPT_BINDING)
+
+
+def _current_receipt_receiver(page: dict, original: dict, *,
+                              provenance=None) -> dict | None:
     controls = page.get('controls', [])
-    if not isinstance(controls, list) or not original.get('form_selector'):
+    if not isinstance(controls, list):
         return None
     matching = [c for c in controls if isinstance(c, dict)
                 and c.get('selector') == original.get('selector')]
     if (len(matching) != 1 or matching[0].get('disabled')
-            or matching[0].get('in_form') is not True
             or _receipt_identity(matching[0]) != _receipt_identity(original)):
         return None
-    return matching[0]
+    current = matching[0]
+    if original.get('in_form') is True and original.get('form_selector'):
+        return current if current.get('in_form') is True else None
+    return (current if any(c is current for c in
+                           _formless_owned_controls(page, provenance)) else None)
 
 
 def _write_intent(before: dict, target: dict, result: dict,
-                  filled: dict, evidence: dict | None = None) -> dict | None:
+                  filled: dict, evidence: dict | None = None, *,
+                  provenance=None) -> dict | None:
     """Record an executed effect, not a claimed or ledger-only completion."""
     if (not isinstance(evidence, dict) or evidence.get('performed') is not True
             or result.get('action') not in {'fill', 'select', 'choose', 'combobox'}):
@@ -2819,20 +2853,35 @@ def _write_intent(before: dict, target: dict, result: dict,
     selector = target.get('selector')
     if not isinstance(selector, str) or selector not in filled:
         return None
+    root_binding = None
+    if target.get('in_form') is not True or not target.get('form_selector'):
+        if not any(c.get('selector') == selector for c in
+                   _formless_owned_controls(before, provenance)):
+            return None
+        root = _formless_root(before)
+        root_binding = (root.get('root'), root.get('submit'), root.get('pane'))
     kind = result['action']
-    members = _choice_members(before, target) if kind == 'choose' else []
+    members = (_choice_members(before, target, provenance=provenance)
+               if kind == 'choose' else [])
     return {'action': kind, 'original': deepcopy(target),
             'answer': str(filled[selector]),
             'option': deepcopy(evidence.get('selected_option')),
-            'group': frozenset(_receipt_identity(m) for m in members)}
+            'group': frozenset(_choice_receipt_identity(m) for m in members),
+            'formless_root': root_binding}
 
 
-def _verified_write(page: dict, intent: dict) -> dict | None:
+def _verified_write(page: dict, intent: dict, *, provenance=None) -> dict | None:
     """Private current readback is necessary for every model-visible receipt."""
     kind, original, answer = (intent['action'], intent['original'], intent['answer'])
-    current = _current_receipt_receiver(page, original)
+    current = _current_receipt_receiver(page, original, provenance=provenance)
     if current is None or not answer:
         return None
+    root_binding = intent.get('formless_root')
+    if root_binding is not None:
+        root = _formless_root(page)
+        if (not root or (root.get('root'), root.get('submit'), root.get('pane'))
+                != root_binding):
+            return None
     if kind == 'fill':
         if (not _native_answer(current) or current.get('type') == 'select'
                 or not isinstance(current.get('value'), str)
@@ -2852,9 +2901,9 @@ def _verified_write(page: dict, intent: dict) -> dict | None:
                 or selected[0].get('label') != expected[0].get('label')):
             return None
     elif kind == 'choose':
-        members = _choice_members(page, current)
+        members = _choice_members(page, current, provenance=provenance)
         if (not intent['group'] or not members
-                or frozenset(_receipt_identity(m) for m in members) != intent['group']
+                or frozenset(_choice_receipt_identity(m) for m in members) != intent['group']
                 or len([m for m in members if _matches_choice(m, answer)]) != 1
                 or len([m for m in members if m.get('checked') is True]) != 1
                 or current.get('checked') is not True
@@ -2889,21 +2938,24 @@ def _verified_write(page: dict, intent: dict) -> dict | None:
     return {'action': kind, 'selector': current['selector'], 'verified': True}
 
 
-def _completed_write_receipts(page: dict, intents: list[dict]) -> list[dict]:
+def _completed_write_receipts(page: dict, intents: list[dict], *,
+                              provenance=None) -> list[dict]:
     # Exact outbound allowlist after private readback; no selected-option IDs.
-    verified = [_verified_write(page, intent) for intent in intents]
+    verified = [_verified_write(page, intent, provenance=provenance)
+                for intent in intents]
     return [{k: receipt[k] for k in ('action', 'selector', 'verified')
              if k in receipt}
             for receipt in verified[-8:] if receipt is not None]
 
 
 def _attachment_completed_now(page: dict, original: dict | None,
-                              uploaded: bool, producer_guard, resume_path: str) -> bool:
+                              uploaded: bool, producer_guard, resume_path: str, *,
+                              provenance=None) -> bool:
     if (not uploaded or not original or not resume_path
             or (producer_guard is not None
                 and producer_guard.upload_completed is not True)):
         return False
-    current = _current_receipt_receiver(page, original)
+    current = _current_receipt_receiver(page, original, provenance=provenance)
     if current is None or current.get('type') != 'file':
         return False
     controls = page.get('controls', [])
@@ -3166,11 +3218,18 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             # Unknown options remain unselected for final readback; no write Gate.
         else:
             if 'fact' in action:
-                group = _choice_members(page, target)
-                if (target.get('type') == 'checkbox'
-                        and not target.get('question')
-                        and (_fact_key(facts, target.get('label') or '')
-                             != _fact_key(facts, action['fact']))):
+                group = _choice_members(page, target, provenance=provenance)
+                question = target.get('question')
+                if not isinstance(question, str) or not question.strip():
+                    question = target.get('label') if target.get('type') == 'checkbox' else ''
+                asserted_key = _fact_key(facts, action['fact'])
+                question_key = (_fact_key(facts, question)
+                                if isinstance(question, str) and question.strip() else None)
+                # A model can assert a valid but unrelated fact. Match both
+                # answers to the current observed question before any click.
+                if (not group or asserted_key is None or question_key is None
+                        or normalize_label(asserted_key) != normalize_label(question_key)
+                        or str(facts[asserted_key]).strip() != str(facts[question_key]).strip()):
                     raise _owner_question_gate(page, target, pk)
                 matches = [m for m in group if _matches_choice(m, value)]
                 proposed = action.get('value')
@@ -4550,10 +4609,13 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                                    fixture_context=ctx)
                     # Read private current controls only here, before projection.
                     safe_keys = _safe_fact_keys(facts)
-                    completed = _completed_write_receipts(page, write_intents)
+                    completed = _completed_write_receipts(page, write_intents,
+                                                          provenance=provenance)
                     attached = _attachment_completed_now(
-                        page, upload_receiver, uploaded, producer_guard, resume_path)
-                    approved = _approved_choice_metadata(page, facts, safe_keys)
+                        page, upload_receiver, uploaded, producer_guard, resume_path,
+                        provenance=provenance)
+                    approved = _approved_choice_metadata(page, facts, safe_keys,
+                                                         provenance=provenance)
                     model_page, model_history = _model_projection(model_page, history)
                     # The three receipts have an explicit outbound allowlist.
                     model_page['completed_writes'] = completed
@@ -4659,7 +4721,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     if original_receiver is not None:
                         intent = _write_intent(
                             original_page, original_receiver, result, filled,
-                            write_evidence)
+                            write_evidence, provenance=provenance)
                         if intent is not None:
                             write_intents.append(intent)
                     if (result.get('action') == 'upload' and result.get('uploaded') is True

@@ -109,12 +109,13 @@ class MemorySession:
         return {}
 
 
-async def act(session, form, action, facts=None):
+async def act(session, form, action, facts=None, *, provenance=None):
     filled, evidence = {}, {}
     result = await forms.execute(
         session, form, action, facts=facts or {}, filled=filled,
         resume_path='', company='example-co', jd_text='', resume_tex='',
-        github='', pk=PK, job_url=URL, write_evidence=evidence,
+        github='', pk=PK, job_url=URL, provenance=provenance,
+        write_evidence=evidence,
     )
     # Public execute() receipts must never include private write/option data.
     assert not {'_write_performed', '_selected_option'} & result.keys()
@@ -566,3 +567,180 @@ async def test_two_actual_apply_decisions_receive_only_verified_advisory_progres
     assert 'Test User' not in views[1][0]
     assert all('value' not in receipt for receipt in second['completed_writes'])
     assert len([r for r in caplog.records if r.msg == 'application decision %s']) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('unrelated', ['Relocation', 'Availability'])
+async def test_choice_fact_must_name_its_current_question_not_another_valid_fact(
+        unrelated):
+    """Two real keys do not let a model rebind Eligibility to another question."""
+    form = page(*eligibility())
+    facts = {'Eligibility': 'No', unrelated: 'Yes'}
+    session = MemorySession(form)
+    with pytest.raises(forms.Gate) as caught:
+        await act(session, form, {'action': 'choose', 'selector': '#yes',
+                                  'fact': unrelated, 'value': 'Yes'}, facts)
+    assert caught.value.reason == 'owner_question'
+    assert caught.value.form_question['selector'] == '#yes'
+    assert session.calls == []
+
+    session = MemorySession(form)
+    result, filled, evidence = await act(
+        session, form, {'action': 'choose', 'selector': '#no',
+                        'fact': 'Eligibility *'}, facts)
+    assert result['action'] == 'choose' and evidence['performed'] is True
+    assert filled == {'#no': 'No'}
+    assert [args for args, _ in session.calls] == [('click', '#no')]
+
+
+@pytest.mark.asyncio
+async def test_choice_receipt_requires_unchanged_machine_values_and_option_identity():
+    """A checked caption is not proof of an unchanged submitted radio value."""
+    form = page(*eligibility())
+    session = MemorySession(form)
+    result, filled, evidence = await act(
+        session, form, {'action': 'choose', 'selector': '#no',
+                        'fact': 'Eligibility'}, {'Eligibility': 'No'})
+    original = next(c for c in form['controls'] if c['selector'] == '#no')
+    intent = forms._write_intent(form, original, result, filled, evidence)
+    assert forms._completed_write_receipts(await session.page(), [intent]) == [
+        {'action': 'choose', 'verified': True}]
+    for selector, change in (
+        ('#no', {'value': 'yes'}),
+        ('#yes', {'value': 'changed-machine'}),
+        ('#no', {'id': 'changed-option-id'}),
+        ('#yes', {'field_entry': 'another-group'}),
+    ):
+        changed = await session.page()
+        member = next(c for c in changed['controls'] if c['selector'] == selector)
+        member.update(change)
+        assert member['label'] in {'Yes', 'No'}
+        assert next(c for c in changed['controls']
+                    if c['selector'] == '#no')['checked'] is True
+        assert forms._completed_write_receipts(changed, [intent]) == []
+
+
+def synthetic_ashby_formless(*receivers):
+    """Synthetic entry.root_evidence with the existing Ashby root/submit proof."""
+    job = '00000000-0000-0000-0000-000000000001'
+    posting = f'https://jobs.ashbyhq.com/example-co/{job}'
+    proof = forms.ApplicationEntryProvenance(
+        PK, 'example-co', 'ashby', job, posting, 'example-co',
+        posting + '/application')
+    submit = field('#submit', tag='button', kind='button',
+                   label='Submit application', question='', submit=True)
+    controls = deepcopy([*receivers, submit])
+    for c in controls:
+        c.update(in_form=False, form_selector='', form_action='')
+    current = page(*controls)
+    current['url'] = proof.url
+    current['entry'] = {
+        'root': None,
+        'formless': {'root': '#synthetic-root', 'submit': '#submit', 'pane': '#pane',
+                     'error': '', 'truncated': False, 'excluded': []},
+        'root_evidence': [
+            dict(c, inside=True, in_container=True, associated=True, visible=True)
+            for c in controls],
+    }
+    return current, proof
+
+
+@pytest.mark.asyncio
+async def test_validated_ashby_formless_choice_and_progress_receipts():
+    """No native form is needed when the current Ashby root proves membership."""
+    form, proof = synthetic_ashby_formless(
+        field('#name'), *eligibility(),
+        field('#resume', kind='file', label='Resume', question='Resume',
+              files=['Synthetic-Resume.pdf']))
+    assert forms._formless_boundary(form, proof)
+    session = MemorySession(form)
+
+    name = next(c for c in form['controls'] if c['selector'] == '#name')
+    result, filled, evidence = await act(
+        session, form, {'action': 'fill', 'selector': '#name', 'fact': 'Name'},
+        {'Name': 'Test User'}, provenance=proof)
+    fill_intent = forms._write_intent(
+        form, name, result, filled, evidence, provenance=proof)
+    assert fill_intent is not None
+
+    before_choice = await session.page()
+    no = next(c for c in before_choice['controls'] if c['selector'] == '#no')
+    result, filled, evidence = await act(
+        session, before_choice,
+        {'action': 'choose', 'selector': '#no', 'fact': 'Eligibility *'},
+        {'Eligibility': 'No', 'Relocation': 'Yes'}, provenance=proof)
+    choice_intent = forms._write_intent(
+        before_choice, no, result, filled, evidence, provenance=proof)
+    assert choice_intent is not None
+    assert [args for args, _ in session.calls] == [
+        ('fill', '#name', '--value', 'Test User'), ('click', '#no')]
+    current = await session.page()
+    assert forms._completed_write_receipts(
+        current, [fill_intent, choice_intent], provenance=proof) == [
+        {'action': 'fill', 'selector': '#name', 'verified': True},
+        {'action': 'choose', 'verified': True},
+    ]
+    assert forms._approved_choice_metadata(
+        current, {'Eligibility': 'No'}, ['Eligibility'], provenance=proof) == [
+        {'fact_key': 'Eligibility', 'answer_present': True}]
+    resume = next(c for c in form['controls'] if c['selector'] == '#resume')
+    assert forms._attachment_completed_now(
+        current, resume, True, None, '/tmp/Synthetic-Resume.pdf',
+        provenance=proof) is True
+
+    # A changed root cannot inherit old receipts, even if selectors and
+    # all private readbacks happen to remain equal.
+    changed = deepcopy(current)
+    changed['entry']['formless']['root'] = '#different-root'
+    assert forms._completed_write_receipts(
+        changed, [fill_intent, choice_intent], provenance=proof) == []
+    # The root census may still be valid but a file no longer present is
+    # never an attachment completion.
+    current['controls'][-2]['files'] = []
+    assert not forms._attachment_completed_now(
+        current, resume, True, None, '/tmp/Synthetic-Resume.pdf',
+        provenance=proof)
+
+
+@pytest.mark.asyncio
+async def test_unproved_formless_membership_asks_owner_and_omits_receipts():
+    form, proof = synthetic_ashby_formless(
+        field('#name'), *eligibility(),
+        field('#resume', kind='file', label='Resume', question='Resume',
+              files=['Synthetic-Resume.pdf']))
+    session = MemorySession(form)
+    unproved = deepcopy(form)
+    unproved['entry']['root_evidence'] = [
+        e for e in unproved['entry']['root_evidence']
+        if e['selector'] != '#no']
+    with pytest.raises(forms.Gate) as caught:
+        await act(session, unproved, {
+            'action': 'choose', 'selector': '#no', 'fact': 'Eligibility'},
+            {'Eligibility': 'No'}, provenance=proof)
+    assert caught.value.reason == 'owner_question'
+    assert caught.value.form_question['selector'] == '#no'
+    assert session.calls == []
+
+    result, filled, evidence = await act(
+        session, form, {'action': 'fill', 'selector': '#name', 'fact': 'Name'},
+        {'Name': 'Test User'}, provenance=proof)
+    name = next(c for c in form['controls'] if c['selector'] == '#name')
+    intent = forms._write_intent(
+        form, name, result, filled, evidence, provenance=proof)
+    assert intent is not None
+    unreadable = await session.page()
+    unreadable['entry']['formless']['error'] = 'ambiguous application roots'
+    assert forms._completed_write_receipts(
+        unreadable, [intent], provenance=proof) == []
+    resume = next(c for c in form['controls'] if c['selector'] == '#resume')
+    assert not forms._attachment_completed_now(
+        unreadable, resume, True, None, '/tmp/Synthetic-Resume.pdf',
+        provenance=proof)
+    assert forms._approved_choice_metadata(
+        unreadable, {'Eligibility': 'No'}, ['Eligibility'],
+        provenance=proof) == []
+    unproved_before = deepcopy(form)
+    unproved_before['entry']['root_evidence'] = []
+    assert forms._write_intent(
+        unproved_before, name, result, filled, evidence,
+        provenance=proof) is None

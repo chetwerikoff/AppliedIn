@@ -21,6 +21,13 @@ REAL_BSK_SESSION = bsk.Session
 
 URL = 'http://127.0.0.1/fixture/example-co/job/1'
 PK = 'example-co#1'
+# Exact application-task fact-key literal (Issue #316 ARCH item 1).
+FACT_KEYS_LITERAL = (
+    '\nAvailable fact keys (each is a stored, owner-approved answer; values are '
+    'deliberately withheld from you and filled by the server when you return '
+    'action fill/choose/combobox with fact set to the exact key; essay keys too, '
+    'with essay true. A listed key is never a missing fact; gate only for a '
+    'required control with no matching key): ')
 
 
 def field(label='Email', selector='#email', *, required=True, **extra):
@@ -584,7 +591,7 @@ async def test_model_prerequisite_gate_question_origin_is_forwarded(monkeypatch)
 
     assert decide.await_count == 1
     prompt, model_page, model_history = decide.await_args.args
-    assert 'Available fact keys: []' in prompt
+    assert FACT_KEYS_LITERAL + '[]' in prompt
     assert model_page['controls'][0]['label'] == 'Email'
     assert model_history == []
     assert report['status'] == 'gate'
@@ -2074,7 +2081,7 @@ async def test_production_wrapper_reuses_marked_first_and_last_names_with_aliase
     assert result['reason'] == 'agent_review_unavailable'
     assert len(dispatched) == 1
     assert len(prompts) == 1
-    assert 'Available fact keys:' in prompts[0]
+    assert FACT_KEYS_LITERAL in prompts[0]
     for key in ('First Name', 'Last Name', 'First name', 'Last name'):
         assert repr(key) in prompts[0]
     assert row["human_approved_answers"] == original_grants
@@ -2316,7 +2323,7 @@ async def test_scoped_facts_reach_runtime_and_decision_keys_on_regional_hosts(
     assert report['status'] == 'gate' and decide.await_count == 1
     prompt, model_page, history = decide.await_args.args
     advertised = "['Contact detail']" if expect else '[]'
-    assert f'Available fact keys: {advertised}' in prompt
+    assert FACT_KEYS_LITERAL + advertised in prompt
     assert model_page['controls'][0]['label'] == 'Contact detail'
     assert history == []
     assert not any(secret in str((prompt, model_page, history))

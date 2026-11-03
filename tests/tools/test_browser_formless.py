@@ -2342,7 +2342,8 @@ def _issue320_provenance():
 
 def _issue320_dom(spec, reader, *, siblings=(), attr='aria-hidden', value='true',
                   drop_form_id=False, drop_style=False, extra=None, shadow=False,
-                  nested_link_attr=False, location_state='', completed_values=False):
+                  nested_link_attr=False, location_state='', completed_values=False,
+                  radio_group=False):
     """Decorate existing offline nodes before either actual production reader runs.
 
     The fixture, root proof, form controllers and receipt verification are unmodified.
@@ -2392,6 +2393,12 @@ def _issue320_dom(spec, reader, *, siblings=(), attr='aria-hidden', value='true'
     if ({json.dumps(location_state)} === 'filled') {{
       const location = document.querySelector('input.ashby-application-form-input-autocomplete');
       location.value = 'Synthetic location';
+    }}
+    if ({json.dumps(radio_group)}) {{
+      const radio = document.getElementById('main-choice-0');
+      const entry = radio?.closest('div.ashby-application-form-field-entry');
+      if (!entry) throw Error('missing synthetic radio group');
+      entry.setAttribute('role', 'radiogroup');
     }}
     if ({json.dumps(completed_values)}) {{
       document.getElementById('_systemfield_name').value = 'Test User';
@@ -2530,6 +2537,15 @@ async def test_issue320_four_real_readback_receipts_survive_decoration_and_check
     # Run real execute -> performed effect -> write intent -> private readback.
     # These receipts cannot be created by copying a model claim into a snapshot.
     row, raw, _, provenance = root_world(monkeypatch, **_ISSUE320_LIVE)
+    # The fixture's id-bearing main radios have no native fieldset question.
+    # Give their existing field entry a semantic group in the DOM, so the
+    # production ownership and readback checks (not a fabricated receipt)
+    # validate one shared question for the actual choice.
+    spec = _issue320_spec()
+    raw.current, raw.fixed = (
+        _issue320_dom(spec, reader, radio_group=True)
+        for reader in (forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS))
+    assert raw.current['entry'] == raw.fixed['entry']
     session = forms._EntrySession(raw, lambda url: url == entry('ashby'),
                                   provenance, resume_path='Resume.pdf')
     facts = {'Name': 'Test User', 'Email': 'test@example-co.test',
@@ -2566,11 +2582,10 @@ async def test_issue320_four_real_readback_receipts_survive_decoration_and_check
         assert len(receipts) == len(intents), receipts
         assert all(receipt['verified'] is True for receipt in receipts)
 
-    spec = _issue320_spec()
     raw.current, raw.fixed = (
         _issue320_dom(spec, script, siblings=('callout', 'pane', 'container',
                                              'submit', 'legal'),
-                      completed_values=True)
+                      completed_values=True, radio_group=True)
         for script in (forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS))
     assert raw.current['entry'] == raw.fixed['entry']
     assert raw.current['entry']['formless']['root'] == '#form'

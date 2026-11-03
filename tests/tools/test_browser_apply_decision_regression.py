@@ -1734,3 +1734,22 @@ async def test_exact_full_key_cannot_turn_split_sibling_into_group_authority(spl
                    'value': 'Option Beta'}, {full: 'Option Beta'})
     assert caught.value.reason == 'owner_question'
     assert session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_independent_exact_key_single_radio_preserves_existing_choice_path():
+    """A standalone radio has no split sibling and still uses its stored fact."""
+    form = page(field('#only', kind='radio', label='Yes',
+                      question='Synthetic standalone', name='standalone', value='yes'))
+    session = MemorySession(form)
+    result, filled, evidence = await act(
+        session, form, {'action': 'choose', 'selector': '#only',
+                        'fact': 'Synthetic standalone', 'value': 'No'},
+        {'Synthetic standalone': 'Yes'})
+    assert result['selector'] == '#only' and evidence['performed'] is True
+    assert filled == {'#only': 'Yes'}
+    assert [args for args, _ in session.calls] == [('click', '#only')]
+    intent = forms._write_intent(form, form['controls'][0],
+                                 result, filled, evidence)
+    assert forms._completed_write_receipts(await session.page(), [intent]) == [
+        {'action': 'choose', 'verified': True}]

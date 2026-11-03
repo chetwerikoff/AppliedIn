@@ -3428,22 +3428,66 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                         or _AGREE.search(question) or _FACT_ASSERTION.search(question)):
                     # The stripped fallback never outranks the metadata filters.
                     raise _owner_question_gate(page, target, pk)
-                # A model can assert a valid but unrelated fact. Match both
-                # answers to the current observed question before any click.
+                asserted_norm = (normalize_label(asserted_key)
+                                 if isinstance(asserted_key, str) else '')
+                question_norm = (normalize_label(question_key)
+                                 if isinstance(question_key, str) else '')
+                stripped = _group_stripped_question(question, group, page)
+                full_norm = normalize_label(question) if isinstance(question, str) else ''
+                # Only the observed full question and its group-witnessed label
+                # suffix may name the same stored question. Equal answers alone
+                # are not a join between arbitrary fact keys.
+                joined_keys = bool(
+                    stripped and asserted_norm and question_norm
+                    and asserted_norm != question_norm
+                    and {asserted_norm, question_norm}
+                    == {full_norm, normalize_label(stripped)})
                 if (not group or asserted_key is None or question_key is None
-                        or normalize_label(asserted_key) != normalize_label(question_key)
-                        or str(facts[asserted_key]).strip() != str(facts[question_key]).strip()):
+                        or not (asserted_norm and
+                                (asserted_norm == question_norm or joined_keys))
+                        or facts[asserted_key] is None or facts[question_key] is None
+                        or not str(facts[asserted_key]).strip()
+                        or not str(facts[question_key]).strip()
+                        or str(facts[asserted_key]).strip()
+                        != str(facts[question_key]).strip()):
                     raise _owner_question_gate(page, target, pk)
+                if joined_keys:
+                    # An exact full key normally wins over normalized aliases.
+                    # Only this new full/stripped join must also refuse a
+                    # conflicting full-key alias (without changing lookup).
+                    full_aliases = [facts[k] for k in facts if isinstance(k, str)
+                                    and normalize_label(k) == full_norm]
+                    if (not full_aliases
+                            or any(v is None or not str(v).strip() for v in full_aliases)
+                            or len({str(v).strip() for v in full_aliases}) != 1):
+                        raise _owner_question_gate(page, target, pk)
                 matches = [m for m in group if _matches_choice(m, value)]
                 proposed = action.get('value')
+                label_only_checkbox = (
+                    target.get('type') == 'checkbox'
+                    and (not isinstance(target.get('question'), str)
+                         or not target['question'].strip()))
                 if (len(matches) != 1
-                        or matches[0].get('selector') != target['selector']
-                        or (proposed is not None and
-                            (not isinstance(proposed, str)
-                             or not _matches_choice(target, proposed.strip())))):
+                        or (label_only_checkbox and proposed is not None
+                            and (not isinstance(proposed, str)
+                                 or not _matches_choice(target, proposed.strip())))):
+                    # Explicit contrary consent on a label-owned singleton
+                    # cannot be converted to an affirmative click.
                     raise _owner_question_gate(page, target, pk)
-                # Existing protected/sanctions answer checks remain code-owned.
-                guarded_value(target, value)
+                matched = matches[0]
+                controls = page.get('controls')
+                receivers = ([c for c in controls if isinstance(c, dict)
+                              and c.get('selector') == matched.get('selector')]
+                             if isinstance(controls, list) else [])
+                if (matched.get('disabled') is not False
+                        or len(receivers) != 1 or receivers[0] is not matched):
+                    # The selected effect receiver must be globally unique,
+                    # even when the model-targeted selector was unambiguous.
+                    raise _owner_question_gate(page, target, pk)
+                # Preserve existing code-owned protected/sanctions checks on
+                # the member actually receiving the browser effect.
+                guarded_value(matched, value)
+                target = matched
             if not target.get('checked'):
                 await _effect_call(session, 'click', target['selector'])
                 wrote = True
@@ -4923,11 +4967,28 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     uploaded = uploaded or bool(result.get('uploaded'))
                     history.append(result)
                     if original_receiver is not None:
-                        intent = _write_intent(
-                            original_page, original_receiver, result, filled,
-                            write_evidence, provenance=provenance)
-                        if intent is not None:
-                            write_intents.append(intent)
+                        receipt_receiver = original_receiver
+                        if verb == 'choose' and 'fact' in action:
+                            # execute() may choose a different member of the
+                            # target-owned group. Bind private readback to the
+                            # pre-action member it actually clicked, not the
+                            # unused model-selected receiver.
+                            members = _choice_members(
+                                original_page, original_receiver, provenance=provenance)
+                            selected = [m for m in members
+                                        if m.get('selector') == result.get('selector')]
+                            observed = [c for c in original_page.get('controls', [])
+                                        if isinstance(c, dict)
+                                        and c.get('selector') == result.get('selector')]
+                            receipt_receiver = (
+                                selected[0] if len(selected) == len(observed) == 1
+                                and observed[0] is selected[0] else None)
+                        if receipt_receiver is not None:
+                            intent = _write_intent(
+                                original_page, receipt_receiver, result, filled,
+                                write_evidence, provenance=provenance)
+                            if intent is not None:
+                                write_intents.append(intent)
                     if (result.get('action') == 'upload' and result.get('uploaded') is True
                             and isinstance(target, dict)):
                         upload_receiver = deepcopy(target)

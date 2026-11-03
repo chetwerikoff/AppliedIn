@@ -152,6 +152,20 @@ def _sync_refusal(problem: Unavailable) -> bool:
             and problem.effect_state == "none")
 
 
+_DOCUMENT_CHANGED = "document_changed"
+
+
+def _document_changed_read(problem: Unavailable) -> bool:
+    """True only for the exact no-effect refusal of a read on a changed document.
+
+    The caller also requires an apply session and a fixed passive reader. Unknown,
+    malformed, conflicting or extra identifiers keep the refusal final."""
+    return (problem.code == "permission_denied"
+            and problem.reason == _DOCUMENT_CHANGED
+            and problem.identifiers == {"permission_denied", _DOCUMENT_CHANGED}
+            and problem.effect_state == "none")
+
+
 def _sync_cdp_failed(problem: Unavailable) -> bool:
     """True for a bare `cdp_failed` raised by the `cooperate sync` verb itself.
 
@@ -498,7 +512,10 @@ class Session:
                 try:
                     result = await command(*args, *extra, "--session", self.id, **kwargs)
                 except Unavailable as exc:
-                    if not wants or attempt or not _sync_required(exc):
+                    if not wants or attempt or not (
+                            _sync_required(exc)
+                            or (self.kind == "apply" and self._fixed_application_read(args)
+                                and _document_changed_read(exc))):
                         raise
                     await self.sync_context()
                     continue

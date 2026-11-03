@@ -478,8 +478,10 @@ async def test_scalar_diagnostic_for_every_started_model_decision(caplog):
     assert all(isinstance(r.args, dict) for r in records)
     logs = [r.args for r in records]
     assert len(logs) == 10 and [r['turn'] for r in logs] == list(range(1, 11))
-    assert all(set(r) == {'turn', 'verb', 'selector_present',
-                           'fact_key_present_in_facts'} for r in logs)
+    base = {'turn', 'verb', 'selector_present', 'fact_key_present_in_facts'}
+    assert all(set(r) == base | ({'question_present', 'question_length', 'question_class'}
+                                 if r['verb'] in {'gate', 'finish'} else set())
+               for r in logs)
     assert [r['fact_key_present_in_facts'] for r in logs] == [
         True, False, False, False, False, False, False, False, False, False]
     assert [r['verb'] for r in logs] == [
@@ -744,3 +746,319 @@ async def test_unproved_formless_membership_asks_owner_and_omits_receipts():
     assert forms._write_intent(
         unproved_before, name, result, filled, evidence,
         provenance=proof) is None
+
+
+# ---- Issue #314: observed-question fact keys and form-level gate detail ----
+
+LONG_KEY = ('Please describe, in a few sentences, your experience integrating large '
+            'language models into production systems (tools, scale, outcomes)')
+assert len(LONG_KEY) > 80 and ',' in LONG_KEY
+
+
+def _long_control(**extra):
+    extra = {'label': 'Experience', 'question': LONG_KEY, **extra}
+    return field('#experience', tag='textarea', kind='textarea', **extra)
+
+
+def test_long_comma_key_is_offered_only_for_a_current_enabled_exact_match():
+    facts = {LONG_KEY: 'SYNTHETIC-ANSWER', 'Name': 'Test User'}
+    assert forms._safe_fact_keys(facts, page(_long_control())) == sorted([LONG_KEY, 'Name'])
+    # Normalized (case, edge decoration, separators) equality, question or label.
+    shifted = _long_control(question=LONG_KEY.upper().replace(',', ' ') + ' *')
+    assert LONG_KEY in forms._safe_fact_keys(facts, page(shifted))
+    by_label = _long_control(question='', label=LONG_KEY)
+    assert LONG_KEY in forms._safe_fact_keys(facts, page(by_label))
+    # Legacy short keys do not need a page.
+    assert forms._safe_fact_keys(facts) == ['Name']
+    assert forms._safe_fact_keys(facts, None) == ['Name']
+    assert forms._safe_fact_keys(facts, {'controls': 'not a list'}) == ['Name']
+    # Key only: no value reaches the offered list.
+    assert 'SYNTHETIC-ANSWER' not in repr(forms._safe_fact_keys(facts, page(_long_control())))
+
+
+@pytest.mark.parametrize('control', [
+    None,
+    _long_control(disabled=True),
+    _long_control(question='Something else entirely'),
+    _long_control(question=LONG_KEY + ' and more'),       # superstring is not a match
+    _long_control(question=LONG_KEY[:-12]),                # substring is not a match
+])
+def test_long_key_is_excluded_without_a_current_enabled_exact_match(control):
+    current = page(control) if control else page()
+    assert forms._safe_fact_keys({LONG_KEY: 'x', 'Name': 'y'}, current) == ['Name']
+
+
+def test_unknown_enabled_state_is_not_enabled():
+    control = _long_control()
+    del control['disabled']
+    assert forms._safe_fact_keys({LONG_KEY: 'x'}, page(control)) == []
+
+
+def test_separator_only_key_never_matches_an_empty_unlabeled_control():
+    key = '-,-,/' * 30
+    assert len(key) > 80 and forms.normalize_label(key) == ''
+    blank = field('#blank', question='', label='')
+    assert forms._safe_fact_keys({key: 'x'}, page(blank)) == []
+    assert forms._safe_fact_keys({' ': 'x', '': 'y'}, page(blank)) == []
+
+
+@pytest.mark.parametrize('bad', [123, None, ['x'], {'a': 1}, b'bytes', 1.5, True])
+def test_malformed_observed_question_or_label_is_a_nonmatch_and_never_normalized(
+        bad, monkeypatch):
+    seen = []
+    real = forms.normalize_label
+
+    def spy(value):
+        seen.append(value)
+        return real(value)
+    monkeypatch.setattr(forms, 'normalize_label', spy)
+    control = _long_control(question=bad, label=bad)
+    assert forms._safe_fact_keys({LONG_KEY: 'x', 'Name': 'y'}, page(control)) == ['Name']
+    assert all(isinstance(v, str) for v in seen)
+    # A well-formed sibling still works.
+    assert LONG_KEY in forms._safe_fact_keys({LONG_KEY: 'x'}, page(control, _long_control()))
+
+
+@pytest.mark.parametrize('suffix', [
+    'gender', 'disability status', 'sanctioned by an embargo', 'password',
+    'API token', 'secret phrase', 'client secret'])
+def test_current_match_never_overrides_sensitive_sanctions_or_credential_exclusions(suffix):
+    key = f'{LONG_KEY} {suffix}'
+    assert forms._safe_fact_keys({key: 'x'}, page(_long_control(question=key))) == []
+    agree = f'I agree {LONG_KEY}'
+    assert forms._safe_fact_keys({agree: 'x'}, page(_long_control(question=agree))) == []
+
+
+def test_only_the_length_and_charset_limits_are_relaxed():
+    for key in ('Name☃ of the “thing”', 'x' * 81):
+        assert forms._safe_fact_keys(
+            {key: 'v'}, page(_long_control(question='other'))) == []
+        assert forms._safe_fact_keys(
+            {key: 'v'}, page(_long_control(question=key))) == [key]
+
+
+def _form_gate(action, current=None, facts=None):
+    return forms._form_gate_message(action, current or page(field('#name', value='')),
+                                    facts or {'Name': 'Test User'})
+
+
+def test_form_gate_detail_keeps_a_safe_bounded_reason():
+    message = _form_gate({'action': 'gate', 'question': 'Login is required to continue.'})
+    assert message == f'{forms._GENERIC_GATE} Model reason: Login is required to continue.'
+    long_reason = 'The form is incomplete ' * 30
+    bounded = _form_gate({'action': 'finish', 'question': long_reason})
+    assert bounded.startswith(forms._GENERIC_GATE) and len(bounded) < 260
+    # Short field names from the page are ordinary words, not leaked content.
+    assert 'Name' in _form_gate({'question': 'Missing answer for Name'})
+
+
+@pytest.mark.parametrize('question', [
+    None, 7, ['x'], {'a': 1}, '', '   ',
+    'Open https://employer.test/apply?token=abc',
+    'Click #submit-application > button',
+    'Use input[name=email] please',
+    'Password is SyntheticSecretValue1',
+    'Reach me at someone@example.test',
+    'Test User needs a call',                      # owner fact value
+    'Prefilled SYNTHETIC-PREFILL here',            # control value
+    'Employee reference 1234567',
+    'api key sk1234abcd5678 is needed',
+    'A' * 40,
+    'Needs the gender answer',                     # sensitive text
+    'Synthetic application form that is copied verbatim',   # page text run
+])
+def test_form_gate_detail_falls_back_for_unsafe_or_missing_reason(question):
+    current = page(field('#name', value='SYNTHETIC-PREFILL'))
+    current['text'] = 'Synthetic application form that is copied verbatim'
+    assert _form_gate({'action': 'gate', 'question': question}, current) == forms._GENERIC_GATE
+
+
+@pytest.mark.parametrize('question,expected', [
+    ('Please log in first', 'login'), ('Password page', 'login'),
+    ('Solve the CAPTCHA', 'captcha'), ('Missing fact for salary', 'missing_fact'),
+    ('The form is incomplete', 'incomplete'), ('Weird unrelated words', 'other'),
+    (None, 'other'), (5, 'other'), ('', 'other'),
+])
+def test_question_class_is_one_closed_value(question, expected):
+    assert forms._question_class(question) == expected
+
+
+@pytest.mark.asyncio
+async def test_gate_finish_log_has_only_presence_length_and_closed_class(caplog):
+    canaries = ['SYNTHETIC-SECRET-CANARY', '#submit > button', 'https://x.test/a?t=1',
+                'Test User', 'Please log in first']
+    responses = [{'action': 'gate', 'question': c} for c in canaries]
+    responses += [{'action': 'finish', 'question': 'Solve the CAPTCHA'},
+                  {'action': 'gate'}, {'action': 'gate', 'question': ['bad']},
+                  {'action': 'fill', 'selector': '#name', 'question': 'ignored'}]
+
+    async def decision(_task, _page, _history, *, model):
+        return responses.pop(0)
+
+    with caplog.at_level('INFO', logger=forms._LOG.name):
+        for turn in range(1, 10):
+            await forms._application_decision_with_log(
+                decision, '', {}, [], model='m', facts={'Name': 'Test User'}, turn=turn)
+    logs = [r.args for r in caplog.records if r.msg == 'application decision %s']
+    assert len(logs) == 9
+    assert [r['question_class'] for r in logs[:5]] == [
+        'other', 'other', 'other', 'other', 'login']
+    assert logs[5]['question_class'] == 'captcha'
+    assert [(r['question_present'], r['question_length']) for r in logs[5:8]] == [
+        (True, len('Solve the CAPTCHA')), (False, 0), (False, 0)]
+    assert logs[0]['question_length'] == len(canaries[0])
+    assert 'question_class' not in logs[8]
+    for record in logs:
+        assert all(type(v) in (int, bool, str) for v in record.values())
+    text = '\n'.join(r.getMessage() for r in caplog.records
+                     if r.msg == 'application decision %s')
+    for canary in canaries[:4] + ['Solve the CAPTCHA', '#name']:
+        assert canary not in text
+
+
+class _AfterUploadHarness:
+    """Closed daemon fixture: one résumé receiver, one long-question textarea."""
+
+    def __init__(self, tmp_path, monkeypatch, decisions):
+        self.document = tmp_path / 'Synthetic-Resume.pdf'
+        self.document.write_bytes(b'%PDF-1.4\nsynthetic only\n')
+        self.authority = fixture._SyntheticRun(str(self.document))
+        # The stock facade permits one fixed fill; this offline test needs the one
+        # staged-resume upload and a long-question fill, never a Submit.
+        monkeypatch.setattr(fixture._SyntheticRun, 'matches', lambda self_, **kw: True)
+        monkeypatch.setattr(fixture._SyntheticRun, 'facade', lambda self_, raw: raw)
+        monkeypatch.setattr(fixture, '_daemon_origin', lambda: True)
+        resume = field('#resume', kind='file', label='Resume', question='Resume',
+                       files=[], required=False)
+        self.current = page(resume, _long_control(), field('#name'))
+        self.current['url'] = fixture.URL
+        for c in self.current['controls']:
+            c['form_action'] = fixture.URL
+        self.events, self.views, self.decisions = [], [], list(decisions)
+        harness = self
+
+        async def scripted(self_, task, model_page, history, *, model):
+            harness.events.append('decision')
+            harness.views.append((task, deepcopy(model_page)))
+            return harness.decisions.pop(0)
+
+        class RawSession:
+            def __init__(self, kind):
+                assert kind == 'apply'
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def navigate(self, url):
+                return deepcopy(harness.current)
+
+            async def page(self):
+                harness.events.append('page')
+                return deepcopy(harness.current)
+
+            async def call(self, *args, **kwargs):
+                harness.events.append(args[0])
+                harness.calls = getattr(harness, 'calls', []) + [args]
+                control = next(c for c in harness.current['controls']
+                               if c['selector'] == args[1])
+                if args[0] == 'upload':
+                    control['files'] = [Path(args[-1]).name]
+                elif args[0] == 'fill':
+                    control['value'], control['has_value'] = args[-1], bool(args[-1])
+                return {}
+
+        async def no_sleep(*_args, **_kwargs):
+            harness.events.append('sleep')
+
+        monkeypatch.setattr(fixture._SyntheticRun, 'decision', scripted)
+        monkeypatch.setattr(bsk, 'Session', RawSession)
+        monkeypatch.setattr(forms.asyncio, 'sleep', no_sleep)
+        self.calls = []
+
+    async def run(self, facts):
+        token = fixture._SESSION_ENTRY.set(self.authority)
+        try:
+            return await forms.apply(
+                fixture.URL, fixture.COMPANY, facts, 'synthetic-fixture',
+                pk=fixture.PK, resume_path=self.authority.resume_path,
+                fixture_context=self.authority)
+        finally:
+            fixture._SESSION_ENTRY.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_long_key_reaches_the_model_after_the_single_upload_without_extra_reads(
+        tmp_path, monkeypatch):
+    harness = _AfterUploadHarness(tmp_path, monkeypatch, [
+        {'action': 'fill', 'selector': '#experience', 'fact': LONG_KEY},
+        {'action': 'gate', 'question': 'Missing fact for the second question.'},
+    ])
+    result = await harness.run({**fixture._FACTS, LONG_KEY: 'SYNTHETIC-LONG-ANSWER'})
+    task = harness.views[0][0]
+    assert repr(LONG_KEY) in task and 'SYNTHETIC-LONG-ANSWER' not in task
+    assert 'SYNTHETIC-LONG-ANSWER' not in repr(harness.views[0][1])
+    assert [a[0] for a in harness.calls] == ['upload', 'fill']
+    assert harness.calls[1][-1] == 'SYNTHETIC-LONG-ANSWER'
+    assert 'sleep' not in harness.events
+    # Upload, then only execute()'s own readback and the loop's normal observation.
+    first_decision = harness.events.index('decision')
+    after_upload = harness.events[harness.events.index('upload') + 1:first_decision]
+    assert after_upload == ['page', 'page']
+    assert result['status'] == 'gate' and result['reason'] == 'agent_review_unavailable'
+    assert 'Model reason: Missing fact for the second question.' in result['question']
+    assert not result.get('form_question')
+    assert 'submit' not in harness.events and 'click' not in harness.events
+
+
+@pytest.mark.asyncio
+async def test_long_key_is_not_offered_when_the_matching_control_is_disabled(
+        tmp_path, monkeypatch):
+    harness = _AfterUploadHarness(tmp_path, monkeypatch, [{'action': 'gate'}])
+    harness.current['controls'][1]['disabled'] = True
+    result = await harness.run({**fixture._FACTS, LONG_KEY: 'SYNTHETIC-LONG-ANSWER'})
+    assert repr(LONG_KEY) not in harness.views[0][0]
+    assert result['reason'] == 'agent_review_unavailable'
+    assert forms._GENERIC_GATE in result['question']
+    assert 'Model reason' not in result['question']
+
+
+@pytest.mark.asyncio
+async def test_selector_less_vs_selector_bearing_gate_and_finish_paths(
+        tmp_path, monkeypatch):
+    cases = [
+        ({'action': 'gate', 'question': 'Please log in'}, 'agent_review_unavailable', True),
+        ({'action': 'finish', 'question': 'The form is incomplete'},
+         'agent_review_unavailable', True),
+        ({'action': 'gate', 'selector': '#experience', 'question': 'Please log in'},
+         'owner_question', None),
+        ({'action': 'finish', 'selector': '#experience', 'question': 'Please log in'},
+         'agent_review_unavailable', False),
+        ({'action': 'gate', 'selector': '#missing', 'question': 'Please log in'},
+         None, None),
+        ({'action': 'finish', 'selector': '#missing', 'question': 'Please log in'},
+         None, None),
+        ({'action': 'gate', 'selector': '#experience-disabled', 'question': 'x'},
+         None, None),
+    ]
+    for action, reason, with_reason in cases:
+        harness = _AfterUploadHarness(tmp_path, monkeypatch, [action])
+        harness.current['controls'].append(
+            _long_control(disabled=True, question='Disabled question', label='Disabled')
+            | {'selector': '#experience-disabled', 'form_action': fixture.URL})
+        result = await harness.run({**fixture._FACTS, LONG_KEY: 'SYNTHETIC-LONG-ANSWER'})
+        assert result['status'] == 'gate'
+        if reason is None:
+            # Absent/disabled selector keeps the existing ControlGate refusal.
+            assert result['reason'] != 'agent_review_unavailable', action
+            assert 'Model reason' not in result['question']
+            continue
+        assert result['reason'] == reason, action
+        if reason == 'owner_question':
+            assert result['form_question']['selector'] == '#experience'
+        else:
+            assert not result.get('form_question')
+            assert ('Model reason' in result['question']) is with_reason
+        assert [a[0] for a in harness.calls] == ['upload']

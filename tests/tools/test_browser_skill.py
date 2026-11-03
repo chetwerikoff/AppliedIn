@@ -3191,6 +3191,171 @@ async def test_unbound_model_gate_does_not_invent_owner_control_or_resumable_ans
     assert result['reason'] == 'agent_review_unavailable'
     assert result['review_route'] == 'luna'
     assert result['form_question'] is None
-    assert 'Synthetic unbound prose' not in result['question']
+    # Issue #314: a safe, bounded model reason is diagnosable in the row detail only.
+    assert 'Model reason: Synthetic unbound prose' in result['question']
 
 
+
+
+# ---- Issue #314: bounded one-retry for a no-effect `document_changed` read ----
+# The conftest fixture swaps in a context-free `_run`; these tests need the real
+# cooperation path, so they capture and restore it themselves.
+_REAL_SESSION_RUN = bsk.Session._run
+_REAL_SESSION_SYNC = bsk.Session.sync_context
+
+
+def _refusal(*, code='permission_denied', reason='document_changed', effect='none',
+             extra_reason=None, top_reason=None):
+    data = {'reason': reason, 'recovery': 'sync'}
+    if effect is not None:
+        data['effect_state'] = effect
+    payload = {'code': code, 'message': 'document changed', 'exit_code': 1, 'data': data}
+    if top_reason is not None:
+        payload['reason'] = top_reason
+    if extra_reason is not None:
+        payload['data']['code'] = extra_reason
+    try:
+        bsk._result(json.dumps(payload), 1)
+    except bsk.Unavailable as exc:
+        return exc
+    raise AssertionError('refusal must raise')
+
+
+class _CooperativeCli:
+    """Fake CLI: single-use latest context; scripted outcomes for the shared-tab actions."""
+
+    def __init__(self, outcomes):
+        self.outcomes, self.calls, self.issued, self.latest = list(outcomes), [], 0, None
+
+    async def __call__(self, *args, **kwargs):
+        self.calls.append(args)
+        if args[:2] == ('session', 'start'):
+            return {'session_id': 's1', 'browser_instance_id': 'dedicated'}
+        if args[:2] == ('session', 'stop'):
+            return {'ok': True}
+        if args[0] == 'cooperate':
+            self.issued += 1
+            self.latest = f'ctx-{self.issued}'
+            return {'context_id': self.latest, 'kind': 'sync'}
+        given = args[args.index('--context') + 1] if '--context' in args else None
+        outcome = self.outcomes.pop(0) if self.outcomes else {'ok': True, 'value': {}}
+        spent, self.latest = given == self.latest, None
+        if isinstance(outcome, bsk.Unavailable):
+            raise outcome
+        assert spent or args[0] == 'navigate', 'stale context reached the CLI'
+        return outcome
+
+    def actions(self, verb=None):
+        return [c for c in self.calls
+                if c[0] not in {'session', 'cooperate'} and (verb is None or c[0] == verb)]
+
+    def syncs(self):
+        return [c for c in self.calls if c[0] == 'cooperate']
+
+
+@pytest.fixture
+def cooperative(monkeypatch):
+    monkeypatch.setattr(bsk, 'available', lambda: (True, ''))
+    monkeypatch.setattr('tools.browser_profile.ensure_browser', lambda: (True, ''))
+    monkeypatch.setattr('tools.browser_runtime.configuration',
+                        lambda *a, **k: {'browser': 'dedicated'})
+    monkeypatch.setattr(bsk, '_SYNC_POLL', 0)
+    monkeypatch.setattr(bsk.Session, '_run', _REAL_SESSION_RUN)
+    monkeypatch.setattr(bsk.Session, 'sync_context', _REAL_SESSION_SYNC)
+    cli = _CooperativeCli([{'ok': True}])  # first outcome is the opening navigation
+    monkeypatch.setattr(bsk, 'command', cli)
+    return cli
+
+
+async def _opened(kind):
+    session = bsk.Session(kind)
+    await session.__aenter__()
+    await session._run(('navigate', 'http://x.test/'), {})
+    return session
+
+
+def _reads(cli):
+    return cli.actions('evaluate')
+
+
+@pytest.mark.asyncio
+async def test_apply_fixed_reader_syncs_and_retries_once_on_document_changed(cooperative):
+    session = await _opened('apply')
+    syncs_before = len(cooperative.syncs())
+    cooperative.outcomes = [_refusal(), {'ok': True, 'value': {'url': 'http://x.test/'}}]
+    result = await session.call('evaluate', bsk.PAGE)
+    assert result['value'] == {'url': 'http://x.test/'}
+    assert len(_reads(cooperative)) == 2
+    assert len(cooperative.syncs()) == syncs_before + 1
+    # Each attempt carried its own fresh single-use context.
+    contexts = [c[c.index('--context') + 1] for c in _reads(cooperative)]
+    assert len(set(contexts)) == 2
+    await session.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_a_second_document_changed_refusal_is_final(cooperative):
+    session = await _opened('apply')
+    cooperative.outcomes = [_refusal(), _refusal(), {'ok': True}]
+    with pytest.raises(bsk.Unavailable):
+        await session.call('evaluate', bsk.PAGE)
+    assert len(_reads(cooperative)) == 2
+    await session.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('problem', [
+    _refusal(effect='unknown'),
+    _refusal(effect=None),
+    _refusal(effect='applied'),
+    _refusal(code='cdp_failed'),
+    _refusal(reason='something_else'),
+    _refusal(reason='document_changed', top_reason='other_reason'),
+    _refusal(extra_reason='page_crashed'),
+    _refusal(reason='Document Changed!'),
+])
+async def test_other_document_changed_shapes_get_no_new_retry(cooperative, problem):
+    session = await _opened('apply')
+    cooperative.outcomes = [problem, {'ok': True}]
+    with pytest.raises(bsk.Unavailable):
+        await session.call('evaluate', bsk.PAGE)
+    assert len(_reads(cooperative)) == 1
+    await session.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_non_apply_session_and_non_fixed_scripts_get_no_new_retry(cooperative):
+    session = await _opened('jd')
+    cooperative.outcomes = [_refusal(), {'ok': True}]
+    with pytest.raises(bsk.Unavailable):
+        await session.call('evaluate', bsk.PAGE)
+    assert len(_reads(cooperative)) == 1
+    await session.__aexit__(None, None, None)
+
+    cooperative.calls.clear()
+    session = await _opened('apply')
+    for args in (('evaluate', 'document.title'),                  # model-style script
+                 ('evaluate', bsk.PAGE, '--extra'),
+                 ('click', '#submit-application'),                # mutating verb
+                 ('fill', '#name', '--value', 'Test User')):
+        cooperative.outcomes = [_refusal(), {'ok': True}]
+        before = len(cooperative.actions(args[0]))
+        with pytest.raises(bsk.Unavailable):
+            # `_run` is the raw seam; the public `call` already refuses these.
+            await session._run(args, {})
+        assert len(cooperative.actions(args[0])) == before + 1, args
+    await session.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_cooperation_sync_required_retry_is_unchanged(cooperative):
+    session = await _opened('apply')
+    sync_required = _refusal(reason='cooperation_sync_required')
+    cooperative.outcomes = [sync_required, {'ok': True, 'value': {}}]
+    await session.call('evaluate', bsk.PAGE)
+    assert len(_reads(cooperative)) == 2
+    cooperative.outcomes = [sync_required, sync_required, {'ok': True}]
+    with pytest.raises(bsk.Unavailable):
+        await session.call('evaluate', bsk.PAGE)
+    assert len(_reads(cooperative)) == 4
+    await session.__aexit__(None, None, None)

@@ -975,7 +975,8 @@ def _model_projection(page: dict, history: list) -> tuple[dict, list]:
     """Send selectors and answer-presence, never read-back values, to the model."""
     private = {'value', 'files', 'approved_value', 'selected_value',
                'hidden_value', 'selected_text', 'displayed_text',
-               'value_attributes', 'filename'}
+               'value_attributes', 'filename', 'selected_options',
+               'selected', 'checked', 'approved_answer'}
 
     def strip(item):
         if isinstance(item, dict):
@@ -990,9 +991,9 @@ def _model_projection(page: dict, history: list) -> tuple[dict, list]:
         for field in ('text', 'description', 'summary', 'job_description', 'snippet'):
             if field in visible:
                 visible[field] = ''
-    receipts = [{'action': item.get('action'), 'selector': item.get('selector'),
-                 'fact': item.get('fact'), 'uploaded': item.get('uploaded') is True}
-                for item in history[-8:] if isinstance(item, dict)]
+    receipts = [{'action': item['action']}
+                for item in history[-8:] if isinstance(item, dict)
+                and item.get('action') in _DECISION_VERBS]
     return visible, receipts
 
 
@@ -2677,6 +2678,256 @@ def _fact_key(facts: dict, observed_label: str) -> str | None:
     return None
 
 
+def _owner_action_answer(action: dict, facts: dict) -> str:
+    """An asserted key is binding; only an omitted key permits model values."""
+    if 'fact' not in action:
+        return str(action.get('value') or '').strip()
+    key = action['fact']
+    if not isinstance(key, str) or not key.strip():
+        return ''
+    matched = _fact_key(facts, key)
+    return str(facts[matched]).strip() if matched is not None and facts[matched] is not None else ''
+
+
+def _owner_question_gate(page: dict, target: dict, pk: str) -> Gate:
+    return Gate('The owner has not supplied an unambiguous answer for this question.',
+                form_question=_ordinary_owner_question(page, target, pk),
+                reason='owner_question')
+
+
+def _choice_members(page: dict, target: dict) -> list[dict]:
+    """Only options with one current question, form and radio group are linked."""
+    kind = target.get('type')
+    question, form = target.get('question'), target.get('form_selector')
+    if (kind not in {'radio', 'checkbox'} or not isinstance(question, str)
+            or not question.strip() or not isinstance(form, str) or not form
+            or target.get('in_form') is not True
+            or (kind == 'radio' and not target.get('name'))):
+        return []
+    controls = page.get('controls', [])
+    if not isinstance(controls, list):
+        return []
+    members = [c for c in controls if isinstance(c, dict)
+               and c.get('type') == kind and c.get('question') == question
+               and c.get('form_selector') == form
+               and c.get('in_form') is True
+               and (kind != 'radio' or c.get('name') == target.get('name'))]
+    selectors = [c.get('selector') for c in members]
+    if (not members or any(c.get('disabled') for c in members)
+            or any(not isinstance(s, str) or not s for s in selectors)
+            or len(set(selectors)) != len(selectors)):
+        return []
+    return members
+
+
+def _matches_choice(member: dict, answer: str) -> bool:
+    return (_same(member.get('label', ''), answer)
+            or _same(member.get('value', ''), answer))
+
+
+def _safe_fact_keys(facts: dict) -> list[str]:
+    """Keep labels only; do not echo answer-shaped or sensitive owner keys."""
+    return sorted(k for k in facts if isinstance(k, str)
+                  and re.fullmatch(r"[A-Za-z][A-Za-z0-9 ()*?/'._:-]{0,79}", k)
+                  and not _SENSITIVE.search(k) and not _SANCTIONS_RX.search(k)
+                  and not _AGREE.search(k)
+                  and not re.search(r'password|credential|token|secret', k, re.I))
+
+
+def _approved_choice_metadata(page: dict, facts: dict,
+                              safe_keys: list[str]) -> list[dict]:
+    """Information about unique owner-backed questions, never chosen options."""
+    eligible = {}
+    visited = set()
+    for control_item in page.get('controls', []):
+        if not isinstance(control_item, dict) or control_item.get('type') not in {'radio', 'checkbox'}:
+            continue
+        members = _choice_members(page, control_item)
+        if len(members) < 2:
+            continue  # A lone Yes option would disclose its answer by existence.
+        group = (control_item.get('form_selector'), control_item.get('question'),
+                 control_item.get('type'), control_item.get('name')
+                 if control_item.get('type') == 'radio' else None)
+        if group in visited:
+            continue
+        visited.add(group)
+        question = control_item['question']
+        if (_SENSITIVE.search(question) or _SANCTIONS_RX.search(question)
+                or _AGREE.search(question) or _FACT_ASSERTION.search(question)):
+            continue
+        fact_key = _fact_key(facts, question)
+        if fact_key not in safe_keys:
+            continue
+        answer = str(facts[fact_key]).strip()
+        if not answer:
+            continue
+        matching = [m for m in members if _matches_choice(m, answer)]
+        # Current label/value uniqueness, not a suggestion or a previous grant.
+        if len(matching) != 1:
+            continue
+        eligible.setdefault(fact_key, []).append(group)
+    # A key shared by different current questions is not an unambiguous join.
+    return [{'fact_key': k, 'answer_present': True}
+            for k in safe_keys if len(eligible.get(k, [])) == 1]
+
+
+_RECEIPT_BINDING = (
+    'selector', 'label', 'question', 'tag', 'type', 'in_form',
+    'form_selector', 'form_action', 'name',
+)
+
+
+def _receipt_identity(receiver: dict) -> tuple:
+    return tuple(repr(receiver.get(k)) for k in _RECEIPT_BINDING)
+
+
+def _current_receipt_receiver(page: dict, original: dict) -> dict | None:
+    controls = page.get('controls', [])
+    if not isinstance(controls, list) or not original.get('form_selector'):
+        return None
+    matching = [c for c in controls if isinstance(c, dict)
+                and c.get('selector') == original.get('selector')]
+    if (len(matching) != 1 or matching[0].get('disabled')
+            or matching[0].get('in_form') is not True
+            or _receipt_identity(matching[0]) != _receipt_identity(original)):
+        return None
+    return matching[0]
+
+
+def _write_intent(before: dict, target: dict, result: dict,
+                  filled: dict) -> dict | None:
+    """Record an executed effect, not a claimed or ledger-only completion."""
+    if (result.get('_write_performed') is not True
+            or result.get('action') not in {'fill', 'select', 'choose', 'combobox'}):
+        return None
+    selector = target.get('selector')
+    if not isinstance(selector, str) or selector not in filled:
+        return None
+    kind = result['action']
+    members = _choice_members(before, target) if kind == 'choose' else []
+    return {'action': kind, 'original': deepcopy(target),
+            'answer': str(filled[selector]),
+            'option': deepcopy(result.get('_selected_option')),
+            'group': frozenset(_receipt_identity(m) for m in members)}
+
+
+def _verified_write(page: dict, intent: dict) -> dict | None:
+    """Private current readback is necessary for every model-visible receipt."""
+    kind, original, answer = (intent['action'], intent['original'], intent['answer'])
+    current = _current_receipt_receiver(page, original)
+    if current is None or not answer:
+        return None
+    if kind == 'fill':
+        if (not _native_answer(current) or current.get('type') == 'select'
+                or not isinstance(current.get('value'), str)
+                or current['value'] != answer):
+            return None
+    elif kind == 'select':
+        selected = current.get('selected_options')
+        originals = original.get('options')
+        if (current.get('tag') != 'select' or not isinstance(originals, list)
+                or not isinstance(selected, list) or len(selected) != 1
+                or not isinstance(selected[0], dict)
+                or current.get('value') != answer):
+            return None
+        expected = [o for o in originals if isinstance(o, dict)
+                    and o.get('value') == answer]
+        if (len(expected) != 1 or selected[0].get('value') != answer
+                or selected[0].get('label') != expected[0].get('label')):
+            return None
+    elif kind == 'choose':
+        members = _choice_members(page, current)
+        if (not intent['group'] or not members
+                or frozenset(_receipt_identity(m) for m in members) != intent['group']
+                or len([m for m in members if _matches_choice(m, answer)]) != 1
+                or len([m for m in members if m.get('checked') is True]) != 1
+                or current.get('checked') is not True
+                or not _matches_choice(current, answer)):
+            return None
+        # Native radio/checkbox selectors are option IDs, not safe receipts.
+        return {'action': 'choose', 'verified': True}
+    elif kind == 'combobox':
+        option = intent.get('option')
+        combo, old = current.get('combobox'), original.get('combobox')
+        if (not isinstance(option, dict) or not isinstance(combo, dict)
+                or not isinstance(old, dict) or combo.get('linked') is not True
+                or old.get('linked') is not True
+                or combo.get('link_id') != old.get('link_id')
+                or combo.get('listbox_selector') != old.get('listbox_selector')
+                or not isinstance(combo.get('options'), list)):
+            return None
+        candidates = [o for o in combo['options'] if isinstance(o, dict)
+                      and o.get('selector') == option.get('selector')
+                      and o.get('label') == option.get('label')
+                      and o.get('value') == option.get('value')]
+        if (len(candidates) != 1
+                or not _same(combo.get('selected_text', ''), option.get('label', ''))
+                or not (_same(combo.get('selected_text', ''), answer)
+                        or _same(combo.get('selected_value', ''), answer))
+                or not (candidates[0].get('selected') is True
+                        or (bool(option.get('value'))
+                            and combo.get('selected_value') == option.get('value')))):
+            return None
+    else:
+        return None
+    return {'action': kind, 'selector': current['selector'], 'verified': True}
+
+
+def _completed_write_receipts(page: dict, intents: list[dict]) -> list[dict]:
+    # Exact outbound allowlist after private readback; no selected-option IDs.
+    verified = [_verified_write(page, intent) for intent in intents]
+    return [{k: receipt[k] for k in ('action', 'selector', 'verified')
+             if k in receipt}
+            for receipt in verified[-8:] if receipt is not None]
+
+
+def _attachment_completed_now(page: dict, original: dict | None,
+                              uploaded: bool, producer_guard, resume_path: str) -> bool:
+    if (not uploaded or not original or not resume_path
+            or (producer_guard is not None
+                and producer_guard.upload_completed is not True)):
+        return False
+    current = _current_receipt_receiver(page, original)
+    if current is None or current.get('type') != 'file':
+        return False
+    controls = page.get('controls', [])
+    filename = Path(resume_path).name
+    receivers = [c for c in controls if isinstance(c, dict)
+                 and c.get('type') == 'file' and c.get('files') == [filename]]
+    return len(receivers) == 1 and receivers[0] is current
+
+
+_DECISION_VERBS = frozenset({
+    'fill', 'select', 'choose', 'combobox', 'upload', 'click', 'focus', 'press',
+    'wait', 'gate', 'finish', 'submit', 'navigate',
+})
+
+
+async def _application_decision_with_log(decision, prompt, page, history, *,
+                                         model: str, facts: dict, turn: int):
+    """One scalar diagnostic per application-site call, including failures."""
+    diagnostic = {'turn': turn, 'verb': 'error',
+                  'selector_present': False,
+                  'fact_key_present_in_facts': False}
+    try:
+        result = await decision(prompt, page, history, model=model)
+        if isinstance(result, dict):
+            verb = result.get('action')
+            diagnostic['verb'] = verb if isinstance(verb, str) and verb in _DECISION_VERBS else 'unknown'
+            selector = result.get('selector')
+            diagnostic['selector_present'] = (isinstance(selector, str)
+                                              and bool(selector.strip()))
+            key = result.get('fact')
+            diagnostic['fact_key_present_in_facts'] = (isinstance(key, str)
+                                                       and bool(key.strip()) and key in facts)
+        else:
+            diagnostic['verb'] = 'unknown'
+        return result
+    finally:
+        # Do not log the prompt, action, exception, selector, fact key or value.
+        _LOG.info('application decision %s', diagnostic)
+
+
 def _native_answer(target: dict) -> bool:
     return ((target.get('tag') == 'input' and target.get('type') in _TEXT_TYPES)
             or (target.get('tag') == 'textarea' and target.get('type') == 'textarea')
@@ -2809,9 +3060,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     """Fill an accessible picker freely, then use its current visible options."""
     target = control(page, action, 'decision-action')
     selector = target['selector']
-    key = action.get('fact')
-    answer = (str(facts[key]).strip() if isinstance(key, str) and key in facts
-              else str(action.get('value') or '').strip())
+    answer = _owner_action_answer(action, facts)
     if not answer:
         raise Gate('The owner has not supplied an answer for this form question.',
                    form_question=_ordinary_owner_question(page, target, pk),
@@ -2831,11 +3080,14 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     candidates = [o for o in options if isinstance(o, dict)
                   and (_same(o.get('label', ''), answer)
                        or _same(o.get('value', ''), answer))]
+    chosen = None
     if len(candidates) == 1 and candidates[0].get('selector'):
         await _effect_call(session, 'click', candidates[0]['selector'])
+        chosen = deepcopy(candidates[0])
     # Missing/hydrating options remain an incomplete readback, not a write Gate.
     filled[selector] = answer
-    return {'action': 'combobox', 'selector': selector, 'label': target.get('label','')}
+    return {'action': 'combobox', 'selector': selector, 'label': target.get('label',''),
+            '_write_performed': chosen is not None, '_selected_option': chosen}
 
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
@@ -2872,28 +3124,43 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                                         filled=filled, pk=pk, job_url=job_url,
                                         ctx=fixture_context, provenance=provenance)
     if verb in {'fill', 'select', 'choose'} and target is not None:
-        key = action.get('fact')
-        value = (str(facts[key]).strip() if isinstance(key, str) and key in facts
-                 else str(action.get('value') or '').strip())
+        value = _owner_action_answer(action, facts)
         if not value:
             raise Gate('This application question needs an owner answer.',
                        form_question=_ordinary_owner_question(page, target, pk),
                        reason='owner_question')
+        wrote = False
         if verb == 'fill':
             await _effect_call(session, 'fill', target['selector'], '--value', value)
+            wrote = True
         elif verb == 'select':
             options = target.get('options') or []
             matches = [o for o in options if isinstance(o, dict)
                        and (_same(o.get('label', ''), value)
                             or _same(o.get('value', ''), value)
-                            or o.get('value') == action.get('value'))]
+                            or ('fact' not in action
+                                and o.get('value') == action.get('value')))]
             if len(matches) == 1:
                 value = str(matches[0]['value'])
                 await _effect_call(session, 'select', target['selector'], '--value', value)
+                wrote = True
             # Unknown options remain unselected for final readback; no write Gate.
         else:
+            if 'fact' in action:
+                group = _choice_members(page, target)
+                matches = [m for m in group if _matches_choice(m, value)]
+                proposed = action.get('value')
+                if (len(matches) != 1
+                        or matches[0].get('selector') != target['selector']
+                        or (proposed is not None and
+                            (not isinstance(proposed, str)
+                             or not _matches_choice(target, proposed.strip())))):
+                    raise _owner_question_gate(page, target, pk)
+                # Existing protected/sanctions answer checks remain code-owned.
+                guarded_value(target, value)
             if not target.get('checked'):
                 await _effect_call(session, 'click', target['selector'])
+                wrote = True
         filled[target['selector']] = value
     elif verb == 'upload' and target is not None:
         if not resume_path or not Path(resume_path).is_file():
@@ -2930,7 +3197,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     # A partial or stale readback is not submission permission; the next model
     # decision can continue filling, and the final guard always re-reads.
     return {'action': verb, 'label': target.get('label', '') if target else '',
-            'selector': target.get('selector', '') if target else ''}
+            'selector': target.get('selector', '') if target else '',
+            '_write_performed': wrote if verb in {'fill', 'select', 'choose'} else False}
 
 def _fields_report(history: list, filled: dict) -> list[dict]:
     """Report only browser-read-back values, not the immutable bank answer."""
@@ -4045,6 +4313,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
     trusted_origins = (url, direct_url)
     step = {'last_button': '', 'url': url}
     filled, history = {}, []
+    write_intents = []  # Private intended values; never sent to the decision model.
+    upload_receiver = None
+    decision_turn = 0
     uploaded = False
     session = None
     page = None
@@ -4201,6 +4472,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                  if c.get('type') == 'file' and not c.get('disabled')
                                  and re.search(r'resume|résumé|cv', label(c), re.I)]
                     if not uploaded and len(receivers) == 1:
+                        attempted_receiver = deepcopy(receivers[0])
                         # Preserve origin/destination proof for a form-owned
                         # file receiver. This is not an answer grant: an
                         # untrusted foreign form must not receive the row PDF.
@@ -4235,6 +4507,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             uploaded = bool(result.get('uploaded'))
                             history.append(result)
                         if uploaded:
+                            upload_receiver = attempted_receiver
                             continue
                     model_page = {**page, 'available_choices': [
                         {'selector': c.get('selector'), 'question': c.get('question'),
@@ -4251,9 +4524,22 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     model_page = _guard_model_page(model_page, pk, company,
                                                    fixture_context=ctx)
                     model_page, model_history = _model_projection(model_page, history)
-                    action = await (ctx.decision if ctx else bsk.decision)(
-                        task + '\nAvailable fact keys: ' + repr(sorted(facts)),
-                        model_page, model_history, model=model)
+                    safe_keys = _safe_fact_keys(facts)
+                    # These fields are explicit outbound allowlists AFTER projection.
+                    model_page['completed_writes'] = _completed_write_receipts(
+                        page, write_intents)
+                    model_page['attachment_completed'] = _attachment_completed_now(
+                        page, upload_receiver, uploaded, producer_guard, resume_path)
+                    model_page['approved_choices'] = _approved_choice_metadata(
+                        page, facts, safe_keys)
+                    decision_turn += 1
+                    action = await _application_decision_with_log(
+                        (ctx.decision if ctx else bsk.decision),
+                        task + '\nAvailable fact keys: ' + repr(safe_keys)
+                        + '\nDo not replay completed writes. Receipts are advisory; '
+                          'the server independently checks the final form and attachment.',
+                        model_page, model_history, model=model, facts=facts,
+                        turn=decision_turn)
                     verb = action.get('action')
                     if verb == 'wait':
                         await asyncio.sleep(0.25)
@@ -4328,6 +4614,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         return {'status': 'uncertain', 'detail': context['text'],
                                 'step': context['step']}
                     before = page
+                    original_receiver = (deepcopy(target) if isinstance(target, dict)
+                                         and verb in {'fill', 'select', 'choose', 'combobox'}
+                                         else None)
+                    original_page = (deepcopy(page) if original_receiver is not None else None)
                     result = await execute(
                         session, page, action, facts=facts, filled=filled,
                         resume_path=resume_path, company=company, jd_text=jd_text,
@@ -4337,6 +4627,14 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         fixture_context=ctx, provenance=provenance)
                     uploaded = uploaded or bool(result.get('uploaded'))
                     history.append(result)
+                    if original_receiver is not None:
+                        intent = _write_intent(
+                            original_page, original_receiver, result, filled)
+                        if intent is not None:
+                            write_intents.append(intent)
+                    if (result.get('action') == 'upload' and result.get('uploaded') is True
+                            and isinstance(target, dict)):
+                        upload_receiver = deepcopy(target)
                     after = await session.page()
                     step['url'] = after['url']
                     if submitted:

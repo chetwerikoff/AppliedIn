@@ -647,6 +647,15 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
             if problem:
                 return _guard_recovery_refused(
                     pk, row, guard_recovery, stores, *problem)
+            # Invalidate the old request, gate answers and PDF pointers BEFORE
+            # the fresh JD/guard is published: a conflict on this conditional
+            # write publishes nothing, and no later conflict can leave the fresh
+            # posting beside the old PDF or request. The refusal marker stays
+            # until preparation, so a later refusal still restores a closed row.
+            cleared, row = _reader_patch(pk, row, stores, _STALE_POSTING_AUTHORITY)
+            if not cleared:
+                return {"result": "conflict", "pk": pk,
+                        "reason": "jd_reader_state_changed"}
         committed_guard = _commit_posting_meta(pk, row, jd_meta, stores)
         if committed_guard is None:
             return {"result": "conflict", "pk": pk, "reason": "posting_guard_state_changed"}
@@ -660,7 +669,8 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
         committed, settled = _reader_patch(pk, row, stores, {
             "jd_read_attempts": 0,
             "jd_read_retry_at": None, "jd_read_error": "",
-            **(_STALE_POSTING_AUTHORITY if guard_recovery is not None else {}),
+            # The refusal itself is settled only once the new generation is bound.
+            **(_REFUSAL_MARKER_CLEARED if guard_recovery is not None else {}),
         })
     except Exception as exc:
         return _reader_storage_error(pk, stores, row, exc)
@@ -818,13 +828,16 @@ def _guard_recovery_refused(pk: str, row: dict, original: dict, stores: Any,
 
 
 # Cleared only after the current posting was re-read and shown to have a NEW
-# guard generation: the refusal, old request, gate answers and old artifacts
-# describe the refused posting. `reviewed_guard_generation` cannot be written by
-# the conditional writer; the new-generation check above covers it.
+# guard generation: the old request, gate answers and old artifacts describe the
+# refused posting. `reviewed_guard_generation` cannot be written by the
+# conditional writer; the new-generation check covers it.
 _STALE_POSTING_AUTHORITY = {
-    "fail_kind": "", "fail_reason": "", "skip_reason": "", "error": "",
     "gate_pending": None, "gate_call_id": None, "apply_requested_at": None,
     "resume_s3_key": "", "resume_tex_key": "",
+}
+# Cleared in the same write that finishes binding the new generation.
+_REFUSAL_MARKER_CLEARED = {
+    "fail_kind": "", "fail_reason": "", "skip_reason": "", "error": "",
 }
 
 
@@ -2476,9 +2489,16 @@ def _retry_row_gate(pk: str, row: dict, stores: Any,
     posting_retry = (status == "tailored" and not review_restart
                      and row.get("fail_kind") == _GUARD_REFUSAL)
     if posting_retry:
-        if row.get("submit_hold") or row.get("confirmation_id"):
+        # Never rely on gate_reason alone: any submission-attempt or review
+        # evidence on the row refuses, whatever the review/hold state claims.
+        if (row.get("possible_submission") or row.get("confirmation_id")
+                or row.get("submit_hold")
+                or row.get("submit_hold_state") not in (None, "", "clear", "cleared")):
             return ({"result": "failed", "pk": pk, "reason": "uncertain",
                      "detail": submit_hold.REASON}, False, False)
+        if row.get("review_state") or row.get("gate_generation"):
+            return ({"result": "gated", "pk": pk, "reason": "submit_review"},
+                    True, False)
         return _posting_retry_static_refusal(pk, row), False, True
     if (status not in ("skipped", "failed", "error", "job_gone", "capped")
             and not (review_restart and status == "needs_human")):

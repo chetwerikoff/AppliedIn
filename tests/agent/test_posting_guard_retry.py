@@ -258,6 +258,19 @@ def _pending_malformed(stores):
     stores.tracking.r.rpush("applyq:co:example-co", "not json")
 
 
+def _unattributable(entry):
+    def setup(stores):
+        stores.tracking.r.sadd("applyq:companies", "example-co")
+        stores.tracking.r.rpush("applyq:co:example-co", json.dumps(entry))
+    return setup
+
+
+def _review_evidence(**fields):
+    def setup(stores):
+        _replace_row(stores, **fields)
+    return setup
+
+
 @pytest.mark.parametrize("setup,result,reason", [
     (_hold, "failed", "uncertain"),
     (_possible_submission, "failed", "uncertain"),
@@ -268,6 +281,22 @@ def _pending_malformed(stores):
     (_pending, "refused", "apply_queue_pending"),
     (_pending_other_company_list, "refused", "apply_queue_pending"),
     (_pending_malformed, "refused", "apply_queue_unknown"),
+    (_unattributable({"company": "example-co", "requested": True}),
+     "refused", "apply_queue_unknown"),
+    (_unattributable({"pk": None}), "refused", "apply_queue_unknown"),
+    (_unattributable({"pk": ""}), "refused", "apply_queue_unknown"),
+    (_unattributable({"pk": 7}), "refused", "apply_queue_unknown"),
+    (_unattributable(["not", "an", "object"]), "refused", "apply_queue_unknown"),
+    # review / submission evidence refuses even though gate_reason stays "approval"
+    (_review_evidence(review_state="pending", gate_generation="g" * 32),
+     "gated", "submit_review"),
+    (_review_evidence(review_state="claimed"), "gated", "submit_review"),
+    (_review_evidence(review_state="unrecognised-state"), "gated", "submit_review"),
+    (_review_evidence(review_state="rejected", gate_generation="g" * 32),
+     "gated", "submit_review"),
+    (_review_evidence(gate_generation="g" * 32), "gated", "submit_review"),
+    (_review_evidence(submit_hold=True), "failed", "uncertain"),
+    (_review_evidence(submit_hold_state="held"), "failed", "uncertain"),
 ])
 def test_protected_or_unproven_state_refuses_without_any_effect(
         stores, monkeypatch, forbidden, setup, result, reason):
@@ -334,6 +363,42 @@ def test_unusable_current_source_restores_the_closed_refusal(
     assert after["resume_s3_key"] == before["resume_s3_key"]
     assert after["posting_guard"]["generation"] == before["posting_guard"]["generation"]
     assert forbidden == []
+    assert not stores.tracking.r.exists(f"lock:job:{PK}")
+
+
+@pytest.mark.parametrize("failing", ["invalidate", "publish"])
+def test_post_read_conflict_never_leaves_fresh_posting_beside_old_pdf_or_request(
+        stores, monkeypatch, agent_doubles, forbidden, failing):
+    _refused_row(stores, monkeypatch)
+    forbidden.armed = True
+    before = _row(stores)
+    _fake_reads(monkeypatch, [_source(CHANGED)])
+    if failing == "invalidate":
+        real = run._reader_patch
+
+        def conflicting(pk, row, stores_, changes):
+            if "apply_requested_at" in changes:
+                return False, row
+            return real(pk, row, stores_, changes)
+
+        monkeypatch.setattr(run, "_reader_patch", conflicting)
+    else:
+        monkeypatch.setattr(run, "_commit_posting_meta", lambda *a, **kw: None)
+
+    outcome = run.retry_job(PK, stores)
+
+    assert outcome["result"] == "conflict"
+    after = _row(stores)
+    # the fresh JD / guard were never published onto the old row
+    assert after["jd_text"] == before["jd_text"]
+    assert after["posting_guard"] == before["posting_guard"]
+    if failing == "invalidate":
+        assert after["apply_requested_at"] == before["apply_requested_at"]
+        assert after["resume_s3_key"] == before["resume_s3_key"]
+    else:
+        # old PDF and request were invalidated BEFORE any publication
+        assert not after.get("apply_requested_at") and not after["resume_s3_key"]
+    assert agent_doubles.agents == [] and forbidden == []
     assert not stores.tracking.r.exists(f"lock:job:{PK}")
 
 
@@ -460,3 +525,20 @@ def test_has_pending_is_exact_uncapped_and_read_only():
     assert snapshot == {k: r.lrange(k, 0, -1) for k in r.scan_iter(match="applyq:co:*")}
     r.rpush("applyq:co:example-co", "garbage")
     assert q.has_pending("example-co#absent") is None
+
+
+@pytest.mark.parametrize("entry", [
+    {"company": "example-co", "requested": True}, {"pk": None}, {"pk": ""},
+    {"pk": 5}, ["list"], "string", 7, None,
+])
+def test_has_pending_fails_closed_on_unattributable_entries(entry):
+    r = fakeredis.FakeRedis(decode_responses=True)
+    q = ApplyQueue(r)
+    r.sadd("applyq:companies", "example-co")
+    r.rpush("applyq:co:example-co", json.dumps(entry))
+    before = r.lrange("applyq:co:example-co", 0, -1)
+    assert q.has_pending(PK) is None
+    # a definite match still wins over an unattributable neighbour
+    r.rpush("applyq:co:example-co", json.dumps({"pk": PK}))
+    assert q.has_pending(PK) is True
+    assert r.lrange("applyq:co:example-co", 0, -1)[:1] == before

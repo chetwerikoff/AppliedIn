@@ -453,12 +453,14 @@ class ApplyQueue:
             for raw in (self.r.lrange(key, 0, -1) or []):
                 try:
                     item = json.loads(raw)
-                except ValueError:
+                except (ValueError, TypeError):
                     unknown = True
                     continue
-                if not isinstance(item, dict):
+                item_pk = item.get("pk") if isinstance(item, dict) else None
+                if not isinstance(item_pk, str) or not item_pk:
+                    # Cannot be attributed to any job: not an absence witness.
                     unknown = True
-                elif item.get("pk") == pk:
+                elif item_pk == pk:
                     return True
         return None if unknown else False
 

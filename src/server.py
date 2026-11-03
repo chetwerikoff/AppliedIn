@@ -517,6 +517,17 @@ def _require_submit_review_first_party(request: Request) -> None:
         deny()
 
 
+def _retry_refusal_text(refusal: dict) -> str:
+    result, reason = refusal.get("result"), refusal.get("reason")
+    if result == "already_done":
+        return f"Nothing to retry: the job is {refusal.get('status')}."
+    if result == "missing":
+        return "No such job."
+    if result == "already_running":
+        return "This job is already being worked on."
+    return f"Retry refused: {reason or result}."
+
+
 def _review_row_conflict(row: dict | None) -> bool:
     from tools.submit_review import guarded_row
     return guarded_row(row)
@@ -3016,7 +3027,7 @@ def create_app() -> FastAPI:
     @app.post("/actions/retry/{pk}")
     def retry(pk: str, background: BackgroundTasks):
         """Explicit fresh preparation for closed reviews; other Retry stays unchanged."""
-        from agent.run import retry_job
+        from agent.run import retry_job, retry_precheck
         stores = make_stores(settings)
         row = stores.tracking.get(pk) or {}
         if submit_hold.blocked(pk, row, tracking=stores.tracking):
@@ -3029,6 +3040,13 @@ def create_app() -> FastAPI:
                 return {"ok": False, "error": "Only an unsent, closed review with no live holder can start a fresh run."}
             background.add_task(retry_job, pk, explicit_review_restart=True)
             return {"ok": True, "status": "retrying", "fresh_preparation": True}
+        # The same read-only admission predicate the worker applies; the worker
+        # still rechecks any later race. "retrying" only for a scheduled retry.
+        refusal = retry_precheck(pk, stores)
+        if refusal is not None:
+            return {"ok": False, "status": refusal.get("result"),
+                    "reason": refusal.get("reason"),
+                    "error": refusal.get("detail") or _retry_refusal_text(refusal)}
         background.add_task(retry_job, pk)
         return {"ok": True, "status": "retrying"}
 

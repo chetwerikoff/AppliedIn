@@ -595,6 +595,7 @@ def _resolve_decision_option(page: dict, action: dict, facts: dict) -> dict:
     target, [option] = matches[0]
     if (target.get('disabled') or option.get('disabled')
             or option.get('visible') is False or option.get('unique') is False
+            or option.get('safe') is not True
             or any(option.get(k) for k in ('submit', 'navigates', 'commits_application'))
             or is_submission(target) or native_submit(target)):
         return action
@@ -4704,6 +4705,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
     upload_receiver = None
     decision_turn = 0
     absent_decision_retry = False
+    absent_retry_pending = False
     uploaded = False
     session = None
     page = None
@@ -4843,8 +4845,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             url, page.get('url'), provenance=provenance)
 
                 preparation_turn = 0
-                while preparation_turn < 100 or absent_decision_retry:
-                    if not absent_decision_retry:
+                while preparation_turn < 100 or absent_retry_pending:
+                    if not absent_retry_pending:
                         preparation_turn += 1
                     if submitted:
                         context = handoff('A potentially committing step ran but has no new '
@@ -4935,9 +4937,15 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         + '\nDo not replay completed writes. Receipts are advisory; '
                           'the server independently checks the final form and attachment.'
                         + ('\nYour previous selector is not on the current page; choose only from available_choices.'
-                           if absent_decision_retry else ''),
+                           if absent_retry_pending else ''),
                         model_page, model_history, model=model, facts=facts,
                         turn=decision_turn)
+                    absent_retry_pending = False
+                    if action.get('action') == 'upload' and uploaded:
+                        # The producer already uploaded once; this is a no-op,
+                        # even if the page removed the receiver. Preserve an
+                        # outstanding absent-decision budget across this skip.
+                        continue
                     model_action = action
                     action = _resolve_decision_option(page, action, facts)
                     try:
@@ -4949,6 +4957,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             # Restart at PAGE, rebuilding every model receipt from
                             # that observation; never replay the rejected action.
                             absent_decision_retry = True
+                            absent_retry_pending = True
                             continue
                         raise
                     absent_decision_retry = False
@@ -4957,12 +4966,6 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     verb = 'click' if action is not model_action else action.get('action')
                     if verb == 'wait':
                         await asyncio.sleep(0.25)
-                        continue
-                    if verb == 'upload' and uploaded:
-                        # A model may repeat a decision already completed by
-                        # the producer's proactive one-shot attachment. Do not
-                        # replay the browser upload or treat this as another
-                        # approval; the fresh final check still proves the PDF.
                         continue
                     if verb in {'gate', 'finish'}:
                         field = (control(page, action, 'decision-action')

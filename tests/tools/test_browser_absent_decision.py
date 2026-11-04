@@ -1,15 +1,25 @@
 """Issue #322: nested selectors and stale decisions, entirely offline/synthetic."""
+import json
 from copy import deepcopy
 
 import pytest
 
 from tools import browser_skill_apply as forms
 from tests.tools.test_browser_apply_decision_regression import (
-    MemorySession, _AfterUploadHarness, act, name_combo, page,
+    MemorySession, _AfterUploadHarness, act, name_combo as _name_combo, page,
 )
+from tests.tools.reader_node_harness import reader_output
+from tests.tools.test_browser_greenhouse_fixture import Tree
 
 
 OPTION = '#name-right-option'
+
+
+def name_combo():
+    target = _name_combo()
+    for option in target['combobox']['options']:
+        option['safe'] = True
+    return target
 
 
 @pytest.mark.asyncio
@@ -145,3 +155,69 @@ async def test_last_budgeted_decision_still_gets_one_retry(tmp_path, monkeypatch
     assert result['status'] == 'gate'
     assert result['step']['reason'] == 'absent: 0 matches'
     assert len(harness.views) == 100  # The proactive upload uses the first step.
+
+
+@pytest.mark.parametrize('danger', ['submit-ancestor', 'submit-descendant'])
+def test_reader_unsafe_option_with_false_commit_flags_still_gates(danger):
+    option = '<span id="unsafe-option" role="option">Test User</span>'
+    if danger == 'submit-ancestor':
+        option = '<button type="submit">' + option + '</button>'
+    else:
+        option = option.replace('Test User', '<button type="submit">Test User</button>')
+    tree = Tree()
+    tree.feed('<html><body><form id="application" action="https://example.test/apply">'
+              '<input id="picker" role="combobox" aria-label="Name" aria-controls="choices"'
+              ' aria-expanded="true"><div id="choices" role="listbox">' + option
+              + '</div></form></body></html>')
+    assert not tree.stack
+    from tools.browser_skill_dom import PAGE
+    observed = json.loads(reader_output(
+        'closed_widget_dom.cjs', dict(fixtureTree=tree.root, fixtureUrl='https://example.test/job'),
+        PAGE, '(() => ({}))()'))['page']
+    parent = next(c for c in observed['controls'] if c['selector'] == '#picker')
+    descriptor = parent['combobox']['options'][0]
+    assert descriptor['safe'] is False
+    assert all(descriptor[k] is False for k in ('submit', 'navigates', 'commits_application'))
+    action = {'action': 'click', 'selector': '#unsafe-option', 'fact': 'Name'}
+    assert forms._resolve_decision_option(observed, action, {'Name': 'Test User'}) is action
+    with pytest.raises(forms.ControlGate, match='absent: 0 matches'):
+        forms.control(observed, action, 'decision-action')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('after_miss', [False, True])
+async def test_completed_upload_skip_survives_removed_receiver_and_preserves_retry(
+        tmp_path, monkeypatch, after_miss):
+    missing = {'action': 'click', 'selector': '#missing'}
+    actions = ([missing] if after_miss else []) + [
+        {'action': 'upload', 'selector': '#resume'},
+        missing if after_miss else {'action': 'fill', 'selector': '#name', 'fact': 'Name'},
+    ]
+    if not after_miss:
+        actions.insert(1, {'action': 'upload', 'selector': '#resume'})
+        actions.append({'action': 'finish'})
+    harness = _AfterUploadHarness(tmp_path, monkeypatch, actions)
+    raw_page = forms.bsk.Session.page
+    reads_after_upload = 0
+
+    async def remove_receiver_after_upload_readback(self):
+        nonlocal reads_after_upload
+        if any(c[0] == 'upload' for c in harness.calls):
+            reads_after_upload += 1
+            # Preserve upload readback, then model the page removing its input.
+            if reads_after_upload > 1:
+                harness.current['controls'] = [c for c in harness.current['controls']
+                                               if c['selector'] != '#resume']
+        return await raw_page(self)
+
+    monkeypatch.setattr(forms.bsk.Session, 'page', remove_receiver_after_upload_readback)
+    result = await harness.run({'Name': 'Test User'})
+    assert len(harness.views) == (3 if after_miss else 4), result
+    assert len([c for c in harness.calls if c[0] == 'upload']) == 1
+    if after_miss:
+        assert result['step']['reason'] == 'absent: 0 matches'
+        assert sum('Your previous selector' in task for task, _ in harness.views) == 1
+    else:
+        assert all('Your previous selector' not in task for task, _ in harness.views)
+        assert [c for c in harness.calls if c[0] == 'fill'] == [
+            ('fill', '#name', '--value', 'Test User')]

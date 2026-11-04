@@ -21,8 +21,9 @@ from tests.tools.test_browser_apply_decision_regression import _AfterUploadHarne
     ('parent-type', 'non-combobox-parent'),
     ('parent-private-type', 'non-combobox-parent'),
     ('no-fact-empty-label', 'empty-answer'),
-    ('no-candidate', 'candidate-count-or-identity'),
-    ('duplicate-candidate', 'candidate-count-or-identity'),
+    ('no-candidate', 'option-not-matching-answer'),
+    ('duplicate-answer', 'answer-exact-ambiguous'),
+    ('caption-alias', 'caption-not-unique'),
     ('duplicate-parent', 'nested-count'), ('duplicate-option', 'nested-count'),
     ('absent-selector', 'nested-count'),
 ])
@@ -56,8 +57,14 @@ def test_refusals_preserve_action_and_log_one_value_free_reason(mode, reason, ca
         option['label'] = ''
     elif mode == 'no-candidate':
         facts['PRIVATE-FACT'] = 'PRIVATE-OTHER-ANSWER'
-    elif mode == 'duplicate-candidate':
-        target['combobox']['options'].append(dict(option, selector='#twin'))
+    elif mode == 'duplicate-answer':
+        target['combobox']['options'].append(
+            dict(option, selector='#twin', label='PRIVATE-OTHER-LABEL', value=option['label']))
+    elif mode == 'caption-alias':
+        facts['PRIVATE-FACT'] = 'PRIVATE-FACT-VALUE'
+        option['value'] = 'PRIVATE-FACT-VALUE'
+        target['combobox']['options'].append(
+            dict(option, selector='#twin', label='PRIVATE-OTHER-LABEL', value=option['label']))
     elif mode == 'duplicate-parent':
         controls.append(dict(deepcopy(target), selector='#other'))
     elif mode == 'duplicate-option':
@@ -81,7 +88,8 @@ def test_success_and_top_level_actions_do_not_log_refusal(caplog):
     action = {'action': 'click', 'selector': OPTION, 'fact': 'Name'}
     with caplog.at_level(logging.INFO, logger=forms._LOG.name):
         assert forms._resolve_decision_option(page(target), action, {'Name': 'Test User'}) == {
-            'action': 'combobox', 'selector': '#name-combo', 'value': 'Test User'}
+            'action': 'combobox', 'selector': '#name-combo', 'value': 'Test User',
+            'option_selector': OPTION}
         direct = dict(action, selector='#name-combo')
         assert forms._resolve_decision_option(page(target), direct, {}) is direct
     assert not caplog.records

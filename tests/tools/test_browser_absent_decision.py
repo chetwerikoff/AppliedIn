@@ -42,7 +42,7 @@ async def test_nested_option_uses_parent_combobox_execution(verb):
 @pytest.mark.parametrize('mode', [
     'parents', 'duplicate-option', 'disabled', 'option-disabled', 'invisible',
     'submit', 'navigates', 'commits_application', 'not-unique', 'contrary-fact',
-    'duplicate-label', 'unsupported-parent', 'parent-submit',
+    'unsupported-parent', 'parent-submit',
 ])
 def test_ineligible_or_ambiguous_nested_option_retains_control_gate(mode):
     target = name_combo()
@@ -65,8 +65,6 @@ def test_ineligible_or_ambiguous_nested_option_retains_control_gate(mode):
         option['unique'] = False
     elif mode == 'contrary-fact':
         facts['Name'] = 'Wrong'
-    elif mode == 'duplicate-label':
-        target['combobox']['options'].append(dict(option, selector='#twin'))
     elif mode == 'unsupported-parent':
         target['type'] = 'button'
     elif mode == 'parent-submit':

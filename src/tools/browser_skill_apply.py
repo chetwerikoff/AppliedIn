@@ -642,7 +642,7 @@ def _resolve_decision_option(page: dict, action: dict, facts: dict) -> dict:
     if not (_same(option.get('label', ''), answer)
             or _same(option.get('value', ''), answer)
             or (fact_answer and _option_matches_segments(option, answer))):
-        _log_option_refusal('candidate-count-or-identity', action, target)
+        _log_option_refusal('option-not-matching-answer', action, target)
         return action
     # Validate the fact first, then bind execution to this option's exact caption.
     caption = option.get('label')
@@ -652,15 +652,17 @@ def _resolve_decision_option(page: dict, action: dict, facts: dict) -> dict:
     options = (target.get('combobox') or {}).get('options')
     exact = [o for o in options or [] if isinstance(o, dict)
              and (_same(o.get('label', ''), answer) or _same(o.get('value', ''), answer))]
-    if len(exact) > 1:
-        _log_option_refusal('candidate-count-or-identity', action, target)
+    if len(exact) > 1 and any(not _same(o.get('label', ''), caption) for o in exact):
+        _log_option_refusal('answer-exact-ambiguous', action, target)
         return action
     candidates = [o for o in options or [] if isinstance(o, dict)
                   and (_same(o.get('label', ''), caption) or _same(o.get('value', ''), caption))]
-    if len(candidates) != 1 or candidates[0] is not option:
-        _log_option_refusal('candidate-count-or-identity', action, target)
+    if (not any(o is option for o in candidates)
+            or any(not _same(o.get('label', ''), caption) for o in candidates)):
+        _log_option_refusal('caption-not-unique', action, target)
         return action
-    resolved = {**action, 'action': 'combobox', 'selector': target['selector'], 'value': caption}
+    resolved = {**action, 'action': 'combobox', 'selector': target['selector'],
+                'value': caption, 'option_selector': selector}
     resolved.pop('fact', None)
     return resolved
 
@@ -3457,6 +3459,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                    reason='owner_question')
     options = (target.get('combobox') or {}).get('options') or []
     query = None
+    current = target
     if not options:
         await _effect_call(session, 'click', selector)
         fresh = await session.page()
@@ -3489,12 +3492,29 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         if candidates:
             match = 'segment'
     chosen = None
-    if (len(candidates) == 1 and candidates[0].get('selector')
-            and candidates[0].get('safe') is True
-            and not any(candidates[0].get(flag)
-                        for flag in ('submit', 'navigates', 'commits_application'))):
-        await _effect_call(session, 'click', candidates[0]['selector'])
-        chosen = deepcopy(candidates[0])
+    # A selector preserves an observed choice, but grants no authority over a
+    # changed option or parent. Stale bindings use the ordinary matching path.
+    eligible = [o for o in candidates if o.get('selector')
+                and o.get('safe') is True and not o.get('disabled')
+                and o.get('visible') is not False and o.get('unique') is not False
+                and not any(o.get(flag)
+                            for flag in ('submit', 'navigates', 'commits_application'))
+                and sum(other.get('selector') == o['selector']
+                        for other in options if isinstance(other, dict)) == 1]
+    bound = [o for o in eligible if o['selector'] == action.get('option_selector')
+             and _same(o.get('label', ''), answer)]
+    if len(bound) == 1:
+        chosen = bound[0]
+    elif (candidates and eligible
+          and all(_same(o.get('label', ''), candidates[0].get('label', ''))
+                  for o in candidates)):
+        chosen = eligible[0]
+    if (not current or current.get('disabled') or is_submission(current)
+            or native_submit(current)):
+        chosen = None
+    if chosen is not None:
+        await _effect_call(session, 'click', chosen['selector'])
+        chosen = deepcopy(chosen)
     elif query is not None and query != answer:
         # A receiverless combobox may accept free text at Submit; never leave
         # the shortened search query standing in for the approved full answer.

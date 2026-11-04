@@ -583,6 +583,13 @@ def _nested_option_matches(page: dict, selector) -> list[tuple[dict, list[dict]]
     return matches
 
 
+def _log_option_refusal(reason: str, action: dict, target: dict | None = None):
+    kind = (target or {}).get('type')
+    kind = kind if isinstance(kind, str) and kind in _MATERIAL_DIAGNOSTIC_TYPES else 'unknown'
+    _LOG.info('nested-option refusal reason=%s parent_type=%s fact_present=%s',
+              reason, kind, 'fact' in action)
+
+
 def _resolve_decision_option(page: dict, action: dict, facts: dict) -> dict:
     """Normalize only a unique observed picker option, never an arbitrary click."""
     selector = action.get('selector')
@@ -591,23 +598,43 @@ def _resolve_decision_option(page: dict, action: dict, facts: dict) -> dict:
         return action
     matches = _nested_option_matches(page, selector)
     if len(matches) != 1 or len(matches[0][1]) != 1:
+        _log_option_refusal('nested-count', action, matches[0][0] if len(matches) == 1 else None)
         return action
     target, [option] = matches[0]
-    if (target.get('disabled') or option.get('disabled')
-            or option.get('visible') is False or option.get('unique') is False
-            or option.get('safe') is not True
-            or any(option.get(k) for k in ('submit', 'navigates', 'commits_application'))
-            or is_submission(target) or native_submit(target)):
+    reason = None
+    if target.get('disabled') or option.get('disabled'):
+        reason = 'disabled'
+    elif option.get('visible') is False:
+        reason = 'visible-false'
+    elif option.get('unique') is False:
+        reason = 'unique-false'
+    elif option.get('safe') is not True:
+        reason = 'safe-not-true'
+    elif option.get('submit'):
+        reason = 'option-submit'
+    elif option.get('navigates'):
+        reason = 'option-navigates'
+    elif option.get('commits_application'):
+        reason = 'option-commits-application'
+    elif is_submission(target):
+        reason = 'parent-is-submission'
+    elif native_submit(target):
+        reason = 'parent-native-submit'
+    if reason is not None:
+        _log_option_refusal(reason, action, target)
         return action
     if target.get('type') != 'combobox':
+        _log_option_refusal('non-combobox-parent', action, target)
         return action
     answer = _owner_action_answer(action, facts) if 'fact' in action else option.get('label')
     if not isinstance(answer, str) or not answer.strip():
+        _log_option_refusal('empty-answer', action, target)
         return action
     options = (target.get('combobox') or {}).get('options')
     candidates = [o for o in options or [] if isinstance(o, dict)
                   and (_same(o.get('label', ''), answer) or _same(o.get('value', ''), answer))]
     if len(candidates) != 1 or candidates[0] is not option:
+        _log_option_refusal('candidate-count-or-identity', action, target)
         return action
     return {**action, 'action': 'combobox', 'selector': target['selector'], 'value': answer}
 
@@ -3364,6 +3391,29 @@ _PRIVACY_AFFIRMATIVE = frozenset({
     'agree', 'i agree', 'acknowledge', 'i acknowledge', 'confirm', 'i confirm'})
 
 
+def _log_combobox_outcome(after: dict | None, selector: str, evidence: dict):
+    # Use only the loop's existing readback. A click receipt is not a commit.
+    found = evidence.get('performed')
+    committed = opened = 'unknown'
+    matches = [c for c in (after or {}).get('controls', [])
+               if c.get('selector') == selector]
+    if len(matches) == 1 and isinstance(matches[0].get('combobox'), dict):
+        combo = matches[0]['combobox']
+        options = combo.get('options')
+        if isinstance(options, list) and options:
+            opened = 'yes'  # PAGE includes only currently visible options.
+        option = evidence.get('selected_option')
+        if isinstance(option, dict):
+            text, value = combo.get('selected_text'), combo.get('selected_value')
+            if isinstance(text, str) and isinstance(value, str):
+                committed = 'yes' if (
+                    bool(text) and _same(text, option.get('label', ''))
+                    or bool(value) and value == option.get('value')) else 'no'
+    _LOG.info('combobox outcome option_found=%s committed=%s listbox_still_open=%s',
+              'yes' if found is True else 'no' if found is False else 'unknown',
+              committed, opened)
+
+
 async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                             filled: dict, pk: str, job_url: str, ctx,
                             provenance, write_evidence: dict | None = None) -> dict:
@@ -5074,7 +5124,14 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     if (result.get('action') == 'upload' and result.get('uploaded') is True
                             and isinstance(target, dict)):
                         upload_receiver = deepcopy(target)
-                    after = await session.page()
+                    try:
+                        after = await session.page()
+                    except (Exception, asyncio.CancelledError):
+                        if verb == 'combobox':
+                            _log_combobox_outcome(None, action.get('selector'), write_evidence)
+                        raise
+                    if verb == 'combobox':
+                        _log_combobox_outcome(after, action.get('selector'), write_evidence)
                     step['url'] = after['url']
                     if submitted:
                         if phrase := await _fresh_confirmed_outcome(

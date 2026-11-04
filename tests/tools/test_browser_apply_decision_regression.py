@@ -52,7 +52,8 @@ def name_select(options=None):
 def name_combo():
     return field('#name-combo', kind='combobox', options=[], combobox={
         'linked': True, 'link_id': 'name-list', 'listbox_selector': '#name-list',
-        'options': deepcopy(OPTIONS), 'selected_text': '', 'displayed_text': '',
+        'options': [dict(option, safe=True) for option in OPTIONS],
+        'selected_text': '', 'displayed_text': '',
         'selected_value': '', 'hidden_selector': '#name-code', 'hidden_value': '',
     })
 

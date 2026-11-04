@@ -3411,9 +3411,11 @@ def _log_combobox_outcome(after: dict | None, selector: str, evidence: dict):
                 committed = 'yes' if (
                     bool(text) and _same(text, option.get('label', ''))
                     or bool(value) and value == option.get('value')) else 'no'
-    _LOG.info('combobox outcome option_found=%s committed=%s listbox_still_open=%s',
+    _LOG.info('combobox outcome option_found=%s committed=%s listbox_still_open=%s '
+              'match=%s options_seen=%s',
               'yes' if found is True else 'no' if found is False else 'unknown',
-              committed, opened)
+              committed, opened, evidence.get('match', 'none'),
+              evidence.get('options_seen', 0))
 
 
 async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
@@ -3434,22 +3436,47 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         current = next((c for c in fresh.get('controls', [])
                         if c.get('selector') == selector), None)
         if current and current.get('tag') == 'input':
-            await _effect_call(session, 'fill', selector, '--value', answer)
+            await _effect_call(session, 'fill', selector, '--value', answer.split(',')[0].strip())
             fresh = await session.page()
             current = next((c for c in fresh.get('controls', [])
                             if c.get('selector') == selector), None)
+            # Typeahead results can arrive after the fill's immediate readback.
+            for _ in range(3):
+                if ((current or {}).get('combobox') or {}).get('options'):
+                    break
+                await asyncio.sleep(0.5)
+                fresh = await session.page()
+                current = next((c for c in fresh.get('controls', [])
+                                if c.get('selector') == selector), None)
         options = ((current or {}).get('combobox') or {}).get('options') or []
     candidates = [o for o in options if isinstance(o, dict)
                   and (_same(o.get('label', ''), answer)
                        or _same(o.get('value', ''), answer))]
+    match = 'exact' if candidates else 'none'
+    if not candidates:
+        segments = [' '.join(s.casefold().split()) for s in answer.split(',')]
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            parts = [' '.join(s.casefold().split())
+                     for s in str(option.get('label') or '').split(',')]
+            if (segments[0] and parts[0] == segments[0]
+                    and all(segment and segment in parts for segment in segments[1:])):
+                candidates.append(option)
+        if candidates:
+            match = 'segment'
     chosen = None
-    if len(candidates) == 1 and candidates[0].get('selector'):
+    if (len(candidates) == 1 and candidates[0].get('selector')
+            and candidates[0].get('safe') is True
+            and not any(candidates[0].get(flag)
+                        for flag in ('submit', 'navigates', 'commits_application'))):
         await _effect_call(session, 'click', candidates[0]['selector'])
         chosen = deepcopy(candidates[0])
     # Missing/hydrating options remain an incomplete readback, not a write Gate.
     filled[selector] = answer
     if write_evidence is not None:
-        write_evidence.update(performed=chosen is not None, selected_option=chosen)
+        write_evidence.update(performed=chosen is not None, selected_option=chosen,
+                              match=match, options_seen=len(options))
     return {'action': 'combobox', 'selector': selector, 'label': target.get('label','')}
 
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,

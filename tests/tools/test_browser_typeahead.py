@@ -116,3 +116,47 @@ async def test_delayed_options_and_exhausted_budget(delayed, monkeypatch, caplog
     assert evidence['performed'] is (delayed <= 3)
     assert evidence['options_seen'] == (1 if delayed <= 3 else 0)
     assert evidence['match'] == ('segment' if delayed <= 3 else 'none')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('options', [
+    [],
+    [option('Testville, Testland'), option('Testville, Testland', '#other')],
+    [option('Testville, Testland', submit=True)],
+])
+async def test_unselected_query_restores_full_answer_before_final_readback(options, monkeypatch):
+    async def sleep(_seconds):
+        pass
+
+    monkeypatch.setattr(forms.asyncio, 'sleep', sleep)
+    initial = snapshot([])
+    initial['controls'][0]['combobox']['hidden_selector'] = ''
+    initial['controls'].append(dict(
+        selector='#resume', label='Resume', type='file', in_form=True,
+        form_selector='#application', disabled=False, files=['Resume.pdf']))
+
+    class FreeTextSession(TypeaheadSession):
+        async def call(self, *args):
+            await super().call(*args)
+            if args[0] == 'fill':
+                control = self.observations[0]['controls'][0]
+                control.update(value=args[3], has_value=bool(args[3]))
+                control['combobox']['options'] = options
+
+    session = FreeTextSession([initial])
+    filled, evidence = {}, {}
+    answer = 'Testville, Testland'
+    await forms._execute_combobox(
+        session, deepcopy(initial), {'selector': '#name-combo', 'fact': 'City'},
+        facts={'City': answer}, filled=filled, pk='example-co#1',
+        job_url='https://example.test/jobs/1', ctx=None, provenance=None,
+        write_evidence=evidence)
+    observed = await session.page()
+    assert observed['controls'][0]['value'] == answer
+    assert session.calls[-1] == ('fill', '#name-combo', '--value', answer)
+    assert evidence['performed'] is False
+    assert not any(call[0] == 'click' and call[1] != '#name-combo'
+                   for call in session.calls)
+    # A receiverless free-text combo can pass the existing final form check;
+    # prove the actual DOM answer it accepts is full, not the search prefix.
+    forms.check_form(observed, filled, True, 'Resume.pdf')

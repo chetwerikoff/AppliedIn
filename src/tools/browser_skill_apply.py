@@ -3430,13 +3430,15 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                    form_question=_ordinary_owner_question(page, target, pk),
                    reason='owner_question')
     options = (target.get('combobox') or {}).get('options') or []
+    query = None
     if not options:
         await _effect_call(session, 'click', selector)
         fresh = await session.page()
         current = next((c for c in fresh.get('controls', [])
                         if c.get('selector') == selector), None)
         if current and current.get('tag') == 'input':
-            await _effect_call(session, 'fill', selector, '--value', answer.split(',')[0].strip())
+            query = answer.split(',')[0].strip()
+            await _effect_call(session, 'fill', selector, '--value', query)
             fresh = await session.page()
             current = next((c for c in fresh.get('controls', [])
                             if c.get('selector') == selector), None)
@@ -3472,6 +3474,10 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                         for flag in ('submit', 'navigates', 'commits_application'))):
         await _effect_call(session, 'click', candidates[0]['selector'])
         chosen = deepcopy(candidates[0])
+    elif query is not None and query != answer:
+        # A receiverless combobox may accept free text at Submit; never leave
+        # the shortened search query standing in for the approved full answer.
+        await _effect_call(session, 'fill', selector, '--value', answer)
     # Missing/hydrating options remain an incomplete readback, not a write Gate.
     filled[selector] = answer
     if write_evidence is not None:

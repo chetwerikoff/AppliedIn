@@ -3452,15 +3452,25 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     """Fill an accessible picker freely, then use its current visible options."""
     target = control(page, action, 'decision-action')
     selector = target['selector']
+    current = target
+    if action.get('option_selector'):
+        # The listbox can re-render while the model chooses from its snapshot.
+        # Reuse the existing receiver identity, excluding the changing options.
+        fresh = await session.page()
+        current = control(fresh, action, 'decision-action')
+        if (fresh.get('url') != page.get('url')
+                or _receipt_identity(current) != _receipt_identity(target)
+                or is_submission(current) or native_submit(current)):
+            current = None
+        page = fresh
     answer = _owner_action_answer(action, facts)
     if not answer:
         raise Gate('The owner has not supplied an answer for this form question.',
                    form_question=_ordinary_owner_question(page, target, pk),
                    reason='owner_question')
-    options = (target.get('combobox') or {}).get('options') or []
+    options = ((current or {}).get('combobox') or {}).get('options') or []
     query = None
-    current = target
-    if not options:
+    if not options and current is not None:
         await _effect_call(session, 'click', selector)
         fresh = await session.page()
         current = next((c for c in fresh.get('controls', [])

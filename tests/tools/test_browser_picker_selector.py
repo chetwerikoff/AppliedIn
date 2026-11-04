@@ -58,7 +58,9 @@ async def test_stale_bound_selector_uses_existing_fallback(mode):
         if mode == 'duplicate-selector':
             current['controls'][0]['combobox']['options'].insert(0, dict(stale))
     session = TypeaheadSession([current])
-    _, _, evidence = await act(session, current, action, {'City': 'Testville'})
+    # Execution still receives the model's old populated snapshot.
+    _, _, evidence = await act(session, form, action, {'City': 'Testville'})
+    assert session.reads == 1
     assert session.calls == [('click', '#fallback')]
     assert evidence['selected_option']['selector'] == '#fallback'
 
@@ -74,9 +76,10 @@ async def test_current_bound_option_cannot_bypass_option_safety(flag, value):
     action = forms._resolve_decision_option(
         form, {'action': 'click', 'selector': '#chosen', 'fact': 'City'},
         {'City': 'Testville'})
+    before = deepcopy(form)
     chosen[flag] = value
     session = TypeaheadSession([form])
-    _, _, evidence = await act(session, form, action, {'City': 'Testville'})
+    _, _, evidence = await act(session, before, action, {'City': 'Testville'})
     assert session.calls == []
     assert evidence['performed'] is False
 
@@ -87,6 +90,7 @@ async def test_current_bound_option_cannot_bypass_parent_safety(mode):
     form = snapshot([option('Testville', '#chosen')])
     action = forms._resolve_decision_option(
         form, {'action': 'click', 'selector': '#chosen'}, {})
+    before = deepcopy(form)
     target = form['controls'][0]
     if mode == 'disabled':
         target['disabled'] = True
@@ -98,9 +102,9 @@ async def test_current_bound_option_cannot_bypass_parent_safety(mode):
     session = TypeaheadSession([form])
     if mode == 'disabled':
         with pytest.raises(forms.ControlGate):
-            await act(session, form, action, {})
+            await act(session, before, action, {})
     else:
-        _, _, evidence = await act(session, form, action, {})
+        _, _, evidence = await act(session, before, action, {})
         assert evidence['performed'] is False
     assert session.calls == []
 
@@ -115,3 +119,31 @@ async def test_differing_captions_without_choice_remain_ambiguous():
                               {'City': 'Testville'})
     assert session.calls == []
     assert evidence['performed'] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['absent', 'duplicate', 'disabled', 'identity', 'url'])
+async def test_bound_option_revalidates_current_parent_before_any_effect(mode):
+    form = snapshot([option('Testville', '#chosen')])
+    action = forms._resolve_decision_option(
+        form, {'action': 'click', 'selector': '#chosen'}, {})
+    current = deepcopy(form)
+    parent = current['controls'][0]
+    if mode == 'absent':
+        current['controls'] = []
+    elif mode == 'duplicate':
+        current['controls'].append(deepcopy(parent))
+    elif mode == 'disabled':
+        parent['disabled'] = True
+    elif mode == 'identity':
+        parent['question'] = 'Different synthetic question'
+    else:
+        current['url'] = 'https://example.test/other-form'
+    session = TypeaheadSession([current])
+    if mode in {'absent', 'duplicate', 'disabled'}:
+        with pytest.raises(forms.ControlGate):
+            await act(session, form, action, {})
+    else:
+        _, _, evidence = await act(session, form, action, {})
+        assert evidence['performed'] is False
+    assert session.calls == []

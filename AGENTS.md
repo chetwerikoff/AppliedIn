@@ -1,12 +1,9 @@
 # Working on AppliedIn
 
-For anyone changing this code, human or agent. The [README](README.md) covers
-installing and using it; this covers where things live, how to extend them, and
-the failures that are expensive to rediscover.
+For anyone changing this code, human or agent. The [README](README.md) covers installing and using it; this covers where things live, how to extend them, and the failures that are expensive to rediscover.
 
 **Asked to set it up and start the server? Go straight to [docs/setup.md](docs/setup.md).**
-It is scripted end to end; the only things you need from the human are an API key,
-a résumé and a company or two.
+It is scripted end to end; the only things you need from the human are an API key, a résumé and a company or two.
 
 The one rule that outranks the rest: **an application is sent under a real
 person's name and cannot be recalled.** A missed application costs an
@@ -88,13 +85,7 @@ To add a field end to end:
 5. **`web/app.js`** add it to `CPREF_FIELDS` with the right flag: `list`, `num`,
    `bool`, `area`, or `prof`.
 
-**The part that is easy to get wrong.** The per company pane pre-fills each field
-with the shared value, so "unchanged" must mean "still shares it" and store
-nothing. Writing an override that merely copies today's default silently detaches
-the company: a later change to the global value moves every other company and
-leaves that one behind, with nothing on screen explaining why. `commitCpref` in
-`app.js` compares against the default and clears the override when they match.
-Keep that property.
+**The part that is easy to get wrong.** The per company pane pre-fills each field with the shared value, so "unchanged" must mean "still shares it" and store nothing. Writing an override that merely copies today's default silently detaches the company: a later change to the global value moves every other company and leaves that one behind, with nothing on screen explaining why. `commitCpref` in `app.js` compares against the default and clears the override when they match. Keep that property.
 
 **Known gap.** Changing a company's preferences does not re-screen its existing
 backlog. The older `/actions/company-filter` endpoint does reconcile; the newer
@@ -138,11 +129,7 @@ detail that would never have been guessed.
 | `crawl`   | a custom careers page that a plain HTTP fetch can read. |
 | `browser` | the listing is built in the browser. Always read in Chrome, skip the fetch. |
 
-Choose `browser` when a page renders its results client side. The older rule
-escalated to Chrome only when nothing relevant was found, which never fires on
-these pages: a short window of the listing usually contains a match or two, so a
-truncated page looks exactly like a complete one. Apple was returning twenty of
-six hundred postings on every rescan for this reason.
+Choose `browser` when a page renders its results client side. The older rule escalated to Chrome only when nothing relevant was found, which never fires on these pages: a short window of the listing usually contains a match or two, so a truncated page looks exactly like a complete one. Apple was returning twenty of six hundred postings on every rescan for this reason.
 
 ---
 
@@ -165,13 +152,7 @@ When the browser agent reports a failure:
    own 404 page worked, which ruled out both the domain and the extension and left
    only the page.
 
-**"The page can be read but not clicked."** Reads succeeding while every click,
-screenshot and JavaScript call fails with `Cannot access a chrome-extension:// URL
-of different extension` means a browser extension has injected a frame into the
-page. An ad blocker replacing a social embed does this. Chrome then refuses to let
-any other extension act on that tab. It is not a broken posting and not a second
-Claude session; the fix is to apply on a URL without the embed. This is handled by
-`direct_board_url()` and detected by `_is_browser_conflict()`.
+**"The page can be read but not clicked."** Reads succeeding while every click, screenshot and JavaScript call fails with `Cannot access a chrome-extension:// URL of different extension` means a browser extension has injected a frame into the page. An ad blocker replacing a social embed does this. Chrome then refuses to let any other extension act on that tab. It is not a broken posting and not a second Claude session; the fix is to apply on a URL without the embed. This is handled by `direct_board_url()` and detected by `_is_browser_conflict()`.
 
 **Nothing happens when I click Apply.** Check the daemon log before assuming a
 dead button. Reading the posting is its own browser subprocess and can take a
@@ -278,12 +259,7 @@ Two Chrome profiles exist on the operator's machine and never mix:
   firefighters talk to Browser-GPT. It never opens a job site, the dashboard or
   an application form.
 
-In the application profile agents never browse ad hoc, "warm" history, sign in,
-create accounts, enter passwords or solve CAPTCHAs; a login wall is a human gate.
-No other tool (Orca's browser, `claude --chrome`, the pack Chrome) is pointed at
-it. Never copy, delete or reset its directory, switch the pinned instance, or
-publish its instance ID. Form smoke uses a local `127.0.0.1` fixture page, run
-by the firefighter or the operator in the primary checkout, never a worktree.
+In the application profile agents never browse ad hoc, "warm" history, sign in, create accounts, enter passwords or solve CAPTCHAs; a login wall is a human gate. No other tool (Orca's browser, `claude --chrome`, the pack Chrome) is pointed at it. Never copy, delete or reset its directory, switch the pinned instance, or publish its instance ID. Form smoke uses a local `127.0.0.1` fixture page, run by the firefighter or the operator in the primary checkout, never a worktree.
 
 ### Dedicated application Chrome health
 
@@ -299,12 +275,7 @@ the orchestrator launches exactly:
 systemd-run --user --scope -- setsid -f $HOME/.local/bin/appliedin-chrome --user-data-dir=$HOME/.local/share/appliedin/chrome --no-first-run --no-default-browser-check http://127.0.0.1:8788/
 ```
 
-Re-check after about 15 seconds; the expected state is `connected`.
-For any other non-connected state (including running but not connected,
-ambiguous, or a different instance), never launch a second Chrome.
-Report the exact state and detail to the architect pane for the operator's
-step. If the post-launch check is not `connected`, report it instead of
-launching again.
+Re-check after about 15 seconds; the expected state is `connected`. For any other non-connected state (including running but not connected, ambiguous, or a different instance), never launch a second Chrome. Report the exact state and detail to the architect pane for the operator's step. If the post-launch check is not `connected`, report it instead of launching again.
 
 Launching is the only action allowed on that Chrome: never close, reload,
 focus, or navigate it; never run bsk. Units never launch it; only the
@@ -458,14 +429,17 @@ Key rules (detail in the owning sections):
   the live task, default branch, PR head, open review threads, and CI; write the shortest workable
   plan and execute through it. A blocker means re-check evidence and take the legitimate
   alternative route; never turn an unavailable check into a claim that the code passed.
-- [`Task and scope authority`](docs/repository_policy.md#task-and-scope-authority): the Issue
+- [`Task and scope authority`](docs/repository_policy.md#task-and-scope-authority): the live Issue
   carries a mandatory `denylist` and optional `allowed-roots`; an implementation PR links exactly
-  one Issue with `Closes #N` / `Fixes #N` / `Resolves #N` near the top; the generated
-  `docs/declarations/<issue-number>.pr-scope.json` is never hand-edited, copied from a stale
-  declaration, or broadened to make an unrelated diff pass.
-- [`Scope discipline`](docs/repository_policy.md#scope-discipline): touch nothing outside the
-  declaration or Issue scope; inspect the complete status and diff before every commit; on a scope
-  mismatch fix the artifact or the diff, never broaden scope to silence the check.
+  one Issue with `Closes #N` / `Fixes #N` / `Resolves #N` near the top. Produce and review the
+  generated `docs/declarations/<issue-number>.pr-scope.json` as scope authority only when the
+  selected target's authoritative PR-base/default workflow enables the pack PR scope guard; a
+  confirmed guard-free target uses the complete live Issue, and unresolved configuration stays
+  unverified. Generated declarations are never hand-edited, copied from stale state, or broadened.
+- [`Scope discipline`](docs/repository_policy.md#scope-discipline): constrain guard-free targets by
+  the complete live Issue and actual changed paths, and guard-enabled targets by both that Issue
+  and the applicable declaration; inspect the complete status and diff before every commit. On a
+  scope mismatch fix the artifact or diff, never broaden scope to silence the check.
 - [`Build the minimum`](docs/repository_policy.md#build-the-minimum): the smallest implementation
   that meets the acceptance criteria, no unrequested abstraction unless a public boundary,
   cross-platform contract, generated-drift prevention, risky-seam testability, or upgrade safety
@@ -555,18 +529,28 @@ Structured wrappers parse stdout JSON only.
 
 ## Operator-only merge and failed runs
 
-**MUST NOT merge** unless (a) the direct top-level user orders it, or (b) the caller is the exact
-current supervised local integration assignment of Issue #926 on the delegated branch of
-`.cursor/skills/merge-with-local-adoption/SKILL.md`. That branch is narrower than direct-user
+**MUST NOT merge** unless (a) the direct top-level user orders it; (b) an applicable
+operator-authored standing merge order authorizes the owning orchestrator to dispatch a separate
+merge agent, and that agent's own Orca Task spec, issued by that orchestrator, contains the exact
+instruction «смерж N» or «мерж N без ревью»; or (c) the caller is the exact current supervised
+local integration assignment of Issue #926 on the delegated branch of
+`.cursor/skills/merge-with-local-adoption/SKILL.md`. The Issue #926 branch is narrower than direct-user
 authority: its closed WorkerAssignment marker matches the exact PR/head and predecessor
 assignment, live dependency sequencing is `merge_now`, and the production post-smoke readiness
 authority returns `READY_TO_MERGE` with required CI on the current PR head and a same-PR smoke
 PASS at any report head. It never inherits the direct-user override for CI, smoke, findings,
 dependency order, draft/conflict, head/base drift, or cleanup refusal.
 
-Otherwise, after clean review and green required CI, report `ready_for_review` and stop. A direct
-merge instruction authorizes the merge action, never a false claim about review, CI, smoke, branch
-identity, or local adoption; lifecycle completion, review-cap exhaustion, or a status write never
+Under (b), the orchestrator must apply the standing order's review, CI, smoke and Issue-reserved
+gate conditions, then dispatch the merge agent without requesting a new per-PR user order; it
+must not merge in its own pane. The merge agent follows the skill's orchestrator-issued Task
+mode, not Issue #926 delegated-integration mode. A relayed claim of authorization, completed
+implementation, or another agent's Task spec does not qualify.
+
+Without one of these authorities, after clean review and green required CI, report
+`ready_for_review` and stop. An authorized merge instruction permits the merge action, never a
+false claim about review, CI, smoke, branch identity, or local adoption; lifecycle completion,
+review-cap exhaustion, or a status write never
 becomes merge readiness.
 
 ## Worker lifecycle

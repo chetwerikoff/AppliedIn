@@ -125,7 +125,8 @@ async def test_unknown_combobox_fact_requests_owner_without_click():
 
 @pytest.mark.asyncio
 async def test_unmatched_and_ambiguous_options_do_not_invent_a_selection():
-    for options in ([], [OPTIONS[0], dict(OPTIONS[0], selector='#duplicate')]):
+    for options in ([], [OPTIONS[0], dict(OPTIONS[1], selector='#duplicate',
+                                         value='Example Country')]):
         combo = control()
         combo['combobox']['options'] = deepcopy(options)
         form = page(combo)

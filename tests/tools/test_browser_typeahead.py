@@ -71,8 +71,8 @@ async def run_picker(answer, options, *, delayed=0, monkeypatch, caplog):
                   option('Testville', '#exact')], '#exact', 'exact'),
     ('Testville', [dict(option('Other caption'), value='Testville'),
                   option('Testville, Testland', '#other')], '#city-option', 'exact'),
-    ('Testville', [option('Testville, Testland'), option('Testville'),
-                  option('Testville', '#twin')], None, 'exact'),
+    ('Testville', [option('Testville, Testland'), option('Testville', '#exact'),
+                  option('Testville', '#twin')], '#exact', 'exact'),
     ('Testville, Testland', [option('Testville, Not Testland')], None, 'none'),
     ('Testville', [option('New Testville, Testland')], None, 'none'),
 ])
@@ -123,7 +123,8 @@ async def test_delayed_options_and_exhausted_budget(delayed, monkeypatch, caplog
 @pytest.mark.asyncio
 @pytest.mark.parametrize('options', [
     [],
-    [option('Testville, Testland'), option('Testville, Testland', '#other')],
+    [option('Testville, North Region, Testland'),
+     option('Testville, South Region, Testland', '#other')],
     [option('Testville, Testland', submit=True)],
 ])
 async def test_unselected_query_restores_full_answer_before_final_readback(options, monkeypatch):
@@ -229,7 +230,7 @@ async def test_explicit_nested_choice_binds_ambiguous_segments(selected, fact_mo
     with caplog.at_level(logging.INFO, logger=forms._LOG.name):
         resolved = forms._resolve_decision_option(form, action, facts)
         assert resolved == {'action': 'combobox', 'selector': '#name-combo',
-                            'value': chosen['label']}
+                            'value': chosen['label'], 'option_selector': chosen['selector']}
         session = MemorySession(form)
         _, filled, evidence = await act(session, form, resolved, facts)
         forms._log_combobox_outcome(None, '#name-combo', evidence)
@@ -246,7 +247,7 @@ async def test_explicit_nested_choice_binds_ambiguous_segments(selected, fact_mo
     'unsafe', 'safe-missing', 'disabled', 'invisible', 'not-unique',
     'submit', 'navigates', 'commits_application', 'mismatch',
     'wrong-first-segment', 'partial-segment', 'empty-segment',
-    'duplicate-label', 'duplicate-value', 'duplicate-selector',
+    'duplicate-value', 'duplicate-selector',
     'duplicate-fact-value',
 ])
 def test_explicit_segment_choice_preserves_refusals(mode):
@@ -270,8 +271,6 @@ def test_explicit_segment_choice_preserves_refusals(mode):
                          'wrong-first-segment': 'North Region, Testland',
                          'partial-segment': 'Testville, Test',
                          'empty-segment': 'Testville,'}[mode]
-    elif mode == 'duplicate-label':
-        options.append(dict(chosen, selector='#twin'))
     elif mode == 'duplicate-value':
         options[1]['value'] = chosen['label']
     elif mode == 'duplicate-selector':

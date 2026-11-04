@@ -54,7 +54,9 @@ async def run_picker(answer, options, *, delayed=0, monkeypatch, caplog):
             job_url='https://example.test/jobs/1', ctx=None, provenance=None,
             write_evidence=evidence)
         forms._log_combobox_outcome(None, '#name-combo', evidence)
-    assert filled == {'#name-combo': answer.strip()}
+    expected = (evidence['selected_option']['label']
+                if evidence['performed'] and evidence['match'] == 'segment' else answer.strip())
+    assert filled == {'#name-combo': expected}
     return session, evidence, sleeps
 
 
@@ -160,3 +162,34 @@ async def test_unselected_query_restores_full_answer_before_final_readback(optio
     # A receiverless free-text combo can pass the existing final form check;
     # prove the actual DOM answer it accepts is full, not the search prefix.
     forms.check_form(observed, filled, True, 'Resume.pdf')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['segment', 'exact-label', 'exact-value', 'no-click'])
+async def test_segment_caption_reaches_existing_verified_receipt(mode):
+    from tests.tools.test_browser_apply_decision_regression import MemorySession
+
+    answer = 'Testville, Testland'
+    caption = answer if mode == 'exact-label' else 'Testville, Test Region, Testland'
+    candidate = option(caption)
+    candidate['value'] = answer if mode == 'exact-value' else 'city-42'
+    if mode == 'no-click':
+        candidate['safe'] = False
+    initial = snapshot([candidate])
+    original = deepcopy(initial['controls'][0])
+    session = MemorySession(initial)
+    filled, evidence = {}, {}
+    result = await forms._execute_combobox(
+        session, initial, {'selector': '#name-combo', 'fact': 'City'},
+        facts={'City': answer}, filled=filled, pk='example-co#1',
+        job_url='https://example.test/jobs/1', ctx=None, provenance=None,
+        write_evidence=evidence)
+    expected = caption if mode == 'segment' else answer
+    assert filled == {'#name-combo': expected}
+    intent = forms._write_intent(initial, original, result, filled, evidence)
+    if mode == 'no-click':
+        assert intent is None
+    else:
+        assert intent is not None
+        assert forms._completed_write_receipts(await session.page(), [intent]) == [
+            {'action': 'combobox', 'selector': '#name-combo', 'verified': True}]

@@ -3479,7 +3479,8 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         # the shortened search query standing in for the approved full answer.
         await _effect_call(session, 'fill', selector, '--value', answer)
     # Missing/hydrating options remain an incomplete readback, not a write Gate.
-    filled[selector] = answer
+    # The existing receipt verifier compares the actual selected caption.
+    filled[selector] = chosen['label'] if chosen is not None and match == 'segment' else answer
     if write_evidence is not None:
         write_evidence.update(performed=chosen is not None, selected_option=chosen,
                               match=match, options_seen=len(options))

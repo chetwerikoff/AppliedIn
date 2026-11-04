@@ -13,53 +13,180 @@ visible in, or destructive to, the thing the owner is using.
 
 from __future__ import annotations
 
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import parse_qsl, urlsplit
+
+import fakeredis
+import fakeredis.aioredis
 import pytest
+import redis
+import redis.asyncio
+
+
+# Install these guards while conftest is imported, before test collection.
+# They never delegate to redis-py: a higher-scope fixture or collection-time
+# import can fail visibly, but cannot acquire a real client via these routes.
+# Import fakeredis first so its own classes retain their real redis-py base.
+_ACTIVE_FAKE_SERVER: fakeredis.FakeServer | None = None
+_REDIS_POSITIONALS = ("host", "port", "db")
+_REDIS_OPTIONS = frozenset({
+    "host", "port", "db", "decode_responses", "encoding", "encoding_errors",
+})
+_FAKE_CLIENT_OPTIONS = ("db", "decode_responses", "encoding", "encoding_errors")
+
+
+def _require_fake_server() -> fakeredis.FakeServer:
+    if _ACTIVE_FAKE_SERVER is None:
+        raise RuntimeError("Redis constructors are disabled outside per-test fakeredis isolation")
+    return _ACTIVE_FAKE_SERVER
+
+
+def _client_options(args: tuple, kwargs: dict) -> dict:
+    """Allow only options whose fake semantics we explicitly support."""
+    if len(args) > len(_REDIS_POSITIONALS):
+        raise TypeError("Unsupported test Redis positional constructor options")
+    options = dict(zip(_REDIS_POSITIONALS, args))
+    if options.keys() & kwargs.keys():
+        raise TypeError("Duplicate test Redis constructor option")
+    options.update(kwargs)
+    unsupported = set(options) - _REDIS_OPTIONS
+    if unsupported:
+        raise TypeError(f"Unsupported test Redis constructor options: {sorted(unsupported)}")
+
+    if "db" in options:
+        db = options["db"]
+        if isinstance(db, bool):
+            raise TypeError("Redis db must be a non-negative integer")
+        try:
+            options["db"] = int(db)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("Redis db must be a non-negative integer") from exc
+        if options["db"] < 0:
+            raise ValueError("Redis db must not be negative")
+    if "decode_responses" in options and type(options["decode_responses"]) is not bool:
+        raise TypeError("decode_responses must be a boolean")
+    for key in ("encoding", "encoding_errors", "host"):
+        if key in options and not isinstance(options[key], str):
+            raise TypeError(f"Redis {key} must be a string")
+    if "port" in options:
+        if isinstance(options["port"], bool):
+            raise TypeError("Redis port must be an integer")
+        try:
+            port = int(options["port"])
+        except (TypeError, ValueError) as exc:
+            raise TypeError("Redis port must be an integer") from exc
+        if not 0 < port <= 65535:
+            raise ValueError("Redis port is out of range")
+    # host/port are intentionally transport-only and cannot select a socket.
+    return {key: options[key] for key in _FAKE_CLIENT_OPTIONS if key in options}
+
+
+def _url_options(url: str, kwargs: dict) -> dict:
+    if not isinstance(url, str):
+        raise TypeError("Redis URL must be a string")
+    parsed = urlsplit(url)
+    if parsed.scheme != "redis" or not parsed.hostname or parsed.fragment:
+        raise ValueError("Only plain redis:// URLs are supported by test isolation")
+    if parsed.username is not None or parsed.password is not None:
+        raise TypeError("Authenticated Redis URLs are unsupported in offline tests")
+    # Validate even though no connection can be opened.
+    _ = parsed.port
+    options = dict(kwargs)
+    if parsed.path not in ("", "/"):
+        if not parsed.path.startswith("/") or not parsed.path[1:].isdecimal():
+            raise ValueError("Unsupported Redis URL database path")
+        options["db"] = int(parsed.path[1:])
+    seen = set()
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if key in seen or key not in {"db", "decode_responses", "encoding", "encoding_errors"}:
+            raise TypeError(f"Unsupported Redis URL option: {key}")
+        seen.add(key)
+        if key == "decode_responses":
+            if value.lower() not in {"true", "false", "1", "0"}:
+                raise ValueError("Unsupported decode_responses URL value")
+            options[key] = value.lower() in {"true", "1"}
+        else:
+            options[key] = value
+    return _client_options((), options)
+
+
+class _GuardedRedis:
+    """Test-only replacement for redis.Redis and redis.Redis.from_url."""
+
+    def __new__(cls, *args, **kwargs):
+        server = _require_fake_server()
+        return fakeredis.FakeRedis(server=server, **_client_options(args, kwargs))
+
+    @classmethod
+    def from_url(cls, url, **kwargs):
+        server = _require_fake_server()
+        return fakeredis.FakeRedis(server=server, **_url_options(url, kwargs))
+
+
+def _guarded_async_from_url(url, **kwargs):
+    server = _require_fake_server()
+    return fakeredis.aioredis.FakeRedis(server=server, **_url_options(url, kwargs))
+
+
+redis.Redis = _GuardedRedis
+redis.asyncio.from_url = _guarded_async_from_url
+
+# Capture the ORIGINAL cached callables, not module attributes that tests may
+# monkeypatch. Cache eviction must happen under active fake interception.
+from core import events as _events, flags as _flags  # noqa: E402
+
+_ORIGINAL_REDIS_CACHES = (_flags._redis, _events._redis)
 
 
 @pytest.fixture(autouse=True)
-def _isolate_owner_config(monkeypatch, tmp_path):
-    """Tests must describe the SHIPPED defaults, not this machine's .env.
+def _isolate_redis():
+    server = fakeredis.FakeServer()
+    with pytest.MonkeyPatch.context() as private:
+        # This independent patch is not affected by a test's monkeypatch.undo().
+        # The early constructors remain guarded before/after this active window.
+        private.setattr(sys.modules[__name__], "_ACTIVE_FAKE_SERVER", server)
+        for factory in _ORIGINAL_REDIS_CACHES:
+            factory.cache_clear()
+        try:
+            yield server
+        finally:
+            # Owner/state finalizers explicitly depend on this fixture, so they
+            # finish before either cache is cleared or fake activation ends.
+            for factory in _ORIGINAL_REDIS_CACHES:
+                factory.cache_clear()
 
-    Settings reads APPLIEDIN_* from the environment, so a developer who has
-    pointed a stage at a different model, or raised their daily cap, silently
-    changes what the suite asserts — four tests were failing for exactly that
-    reason, describing config nobody else would ever see.
-    """
-    import os
 
-    for key in [k for k in os.environ if k.startswith("APPLIEDIN_")]:
-        monkeypatch.delenv(key, raising=False)
-    # get_settings() is cached, so a stale instance would outlive the cleanup.
-    try:
-        from core.config import get_settings
-
-        get_settings.cache_clear()
-    except Exception:  # noqa: BLE001
-        pass
-    # A private browser profile must never cause offline tests to drive Chrome.
+@pytest.fixture(autouse=True)
+def _isolate_owner_config(_isolate_redis, tmp_path):
+    """Clear owner-specific settings without sharing a reversible patch stack."""
+    from core.config import get_settings
     from tools import browser_runtime
-    monkeypatch.setattr(browser_runtime, "_config_path",
-                        lambda settings: tmp_path / "browser.local.yaml")
-    yield
-    try:
-        from core.config import get_settings
 
-        get_settings.cache_clear()
-    except Exception:  # noqa: BLE001
-        pass
+    original_settings_cache = get_settings.cache_clear
+    with pytest.MonkeyPatch.context() as private:
+        for key in [key for key in os.environ if key.startswith("APPLIEDIN_")]:
+            private.delenv(key, raising=False)
+        private.setattr(browser_runtime, "_config_path",
+                        lambda settings: tmp_path / "browser.local.yaml")
+        original_settings_cache()
+        try:
+            yield
+        finally:
+            original_settings_cache()
 
 
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_protocol(item, nextitem):
-    """Leave ``APPLIEDIN_LOCAL_DIR`` as the run found it once a test is fully torn down.
+    """Undo a shared per-test env override only after all fixtures finish.
 
-    A test may set that variable through the shared ``monkeypatch`` after
-    ``_isolate_local_dir`` has set it; the shared fixture is torn down after this
-    one and would restore the isolation value it saw, leaving a stale temporary
-    path in ``os.environ`` for the next test to inherit.
+    A shared monkeypatch can be undone mid-test and can otherwise restore a
+    stale APPLIEDIN_LOCAL_DIR at teardown. Preserve the pre-test environment.
     """
-    import os
-
     before = os.environ.get("APPLIEDIN_LOCAL_DIR")
     try:
         return (yield)
@@ -72,69 +199,231 @@ def pytest_runtest_protocol(item, nextitem):
 
 @pytest.fixture(autouse=True)
 def _isolate_local_dir(_isolate_owner_config, tmp_path):
-    """Point ``Settings.local_dir`` at a per-test temporary directory.
+    """Keep any filesystem store under tmp_path, even after monkeypatch.undo()."""
+    from core.config import get_settings
 
-    ``local_dir`` defaults to ``.local`` relative to the current directory, so any
-    offline test that reaches ``core.stores.make_stores()`` used to create
-    ``.local/facts.md``, ``secrets.json`` and ``artifacts/`` in the checkout.
-    In a disposable task worktree those empty copies were later refused as owner
-    data. The directory is not created here; only code that writes it does.
-
-    The patch uses its own ``MonkeyPatch`` rather than the shared ``monkeypatch``
-    fixture: a test that calls ``monkeypatch.undo()`` mid-test must not lose the
-    isolation for the rest of that test. A test that sets ``APPLIEDIN_LOCAL_DIR``
-    itself, or builds ``Settings(local_dir=...)``, still wins.
-    """
-
-    def _clear_settings_cache():
-        try:
-            from core.config import get_settings
-
-            get_settings.cache_clear()
-        except Exception:  # noqa: BLE001 — a test may have replaced get_settings
-            pass
-
+    original_settings_cache = get_settings.cache_clear
     with pytest.MonkeyPatch.context() as private:
         private.setenv("APPLIEDIN_LOCAL_DIR", str(tmp_path / "local"))
-        _clear_settings_cache()
-        yield
-    _clear_settings_cache()
+        original_settings_cache()
+        try:
+            yield
+        finally:
+            original_settings_cache()
 
 
 @pytest.fixture(autouse=True)
-def _isolate_owner_state(tmp_path, monkeypatch):
-    # 1) Activity feed — emit() publishes to Redis and appends to the history the
-    #    dashboard renders. Point it at an in-memory server instead.
-    try:
-        import fakeredis
-        from core import events
+def _isolate_owner_state(_isolate_local_dir, tmp_path):
+    """Keep steering, memory and the seen ledger off owner paths."""
+    from core import memory, steering
+    from tools import seen
 
-        fake = fakeredis.FakeRedis(decode_responses=True)
-        monkeypatch.setattr(events, "_redis", lambda: fake)
-    except Exception:  # noqa: BLE001 — never block a run on the isolation itself
-        pass
+    with pytest.MonkeyPatch.context() as private:
+        private.setattr(steering, "get_settings",
+                        lambda: SimpleNamespace(local_dir=tmp_path))
+        private.setattr(memory, "_path", lambda: tmp_path / "memory.md")
+        private.setattr(seen, "_path", lambda: tmp_path / "seen.json")
+        yield
 
-    from types import SimpleNamespace
 
-    from core import steering
+# The proof is deliberately NOT a test_* function: conftest is not collected.
+# It runs only as an opt-in fixture on the two existing, harmless test nodes.
+_PROOF_FIRST = (
+    "tests/test_local_dir_isolation.py::test_local_dir_is_a_per_test_temp_directory"
+)
+_PROOF_SECOND = (
+    "tests/test_local_dir_isolation.py::test_isolation_survives_a_mid_test_monkeypatch_undo"
+)
+_PROOF_PREVIOUS_SERVER = None
 
-    monkeypatch.setattr(steering, "get_settings", lambda: SimpleNamespace(local_dir=tmp_path))
 
-    # 2) Memory diary — a durable markdown log of real outcomes.
-    try:
-        from core import memory
+def pytest_addoption(parser):
+    parser.addoption(
+        "--redis-isolation-proof", action="store_true", default=False,
+        help="Run the two-node, offline Redis isolation and safe reset proof",
+    )
 
-        monkeypatch.setattr(memory, "_path", lambda: tmp_path / "memory.md")
-    except Exception:  # noqa: BLE001
-        pass
 
-    # 3) Seen-URL ledger — discovery marks every enqueued URL here, and a fixture
-    #    URL written into it silently filters real jobs on later runs.
-    try:
-        from tools import seen
+def pytest_collection_modifyitems(config, items):
+    if not config.getoption("redis_isolation_proof"):
+        return
+    workers = config.getoption("numprocesses", default=0)
+    if workers not in (None, 0, "0"):
+        raise pytest.UsageError("Redis isolation proof requires -n 0 (one process)")
+    nodes = [item.nodeid for item in items]
+    if nodes != [_PROOF_FIRST, _PROOF_SECOND]:
+        raise pytest.UsageError(
+            "Redis isolation proof requires exactly the two ordered existing nodes: "
+            f"{_PROOF_FIRST} {_PROOF_SECOND}"
+        )
 
-        monkeypatch.setattr(seen, "_path", lambda: tmp_path / "seen.json")
-    except Exception:  # noqa: BLE001
-        pass
 
-    yield
+def _prove_factories_flags_events_stores(server, tmp_path):
+    """Execute readbacks; a constructor spy or swallowed event error cannot pass."""
+    from core import events, flags
+    from core.config import get_settings
+    from core.models import Status
+    from core.storage.local import RedisQueue, RedisTracking
+    from core.stores import make_stores
+
+    settings = get_settings()
+    assert settings.mode == "local"
+    local = Path(settings.local_dir)
+    assert local.resolve().is_relative_to(tmp_path.resolve())
+    assert local != Path(".local")
+    assert not local.is_symlink()
+
+    raw = redis.Redis.from_url(settings.redis_url)
+    direct = redis.Redis("localhost", 6379, 0, decode_responses=True)
+    assert isinstance(raw, fakeredis.FakeRedis)
+    assert isinstance(direct, fakeredis.FakeRedis)
+    key = "redis-isolation:shared"
+    assert raw.set(key, b"test-data")
+    assert raw.get(key) == b"test-data"
+    assert direct.get(key) == "test-data"
+    assert redis.Redis.from_url(settings.redis_url, decode_responses=True).get(key) == "test-data"
+    assert redis.Redis.from_url(settings.redis_url + "?decode_responses=true").get(key) == "test-data"
+
+    async def check_async():
+        client = redis.asyncio.from_url(settings.redis_url, decode_responses=True)
+        try:
+            assert await client.get(key) == "test-data"
+            assert await client.set("redis-isolation:async", "from-async")
+            assert await client.get("redis-isolation:async") == "from-async"
+        finally:
+            await client.aclose()
+
+    asyncio.run(check_async())
+    assert raw.get("redis-isolation:async") == b"from-async"
+    assert direct.get("redis-isolation:async") == "from-async"
+
+    with pytest.raises(TypeError, match="Unsupported"):
+        redis.Redis(socket_timeout=1)
+    with pytest.raises(TypeError, match="Unsupported"):
+        redis.Redis.from_url(settings.redis_url + "?socket_timeout=1")
+    with pytest.raises(TypeError, match="Unsupported"):
+        redis.asyncio.from_url(settings.redis_url, socket_timeout=1)
+
+    flags.set_flag("redis_isolation_proof", "ok")
+    assert flags.get_flag("redis_isolation_proof") == "ok"
+    assert direct.hget("appliedin:flags", "redis_isolation_proof") == "ok"
+    events.emit("redis_isolation_proof", pk="test-redis-probe", detail="synthetic")
+    history = events.recent(1)
+    assert len(history) == 1
+    assert history[0]["kind"] == "redis_isolation_proof"
+    assert history[0]["pk"] == "test-redis-probe"
+    assert json.loads(direct.lindex(events.HISTORY, 0))["kind"] == "redis_isolation_proof"
+
+    stores = make_stores(settings)
+    assert isinstance(stores.tracking, RedisTracking)
+    assert isinstance(stores.queue, RedisQueue)
+    assert stores.tracking.r is stores.queue.r
+    assert isinstance(stores.tracking.r, fakeredis.FakeRedis)
+    stores.tracking.set_status("test-redis-probe", Status.FOUND,
+                              title="Test User @ example-co")
+    assert stores.tracking.get("test-redis-probe")["title"] == "Test User @ example-co"
+    assert json.loads(direct.get("app:test-redis-probe"))["status"] == Status.FOUND.value
+    stores.queue.enqueue(settings.tailor_queue_url, {"pk": "test-redis-probe"})
+    assert json.loads(direct.lindex(f"queue:{settings.tailor_queue_url}", 0)) == {
+        "pk": "test-redis-probe"
+    }
+
+    # The reset may remove artifacts, but NEVER a symlink or an owner path.
+    artifacts = local / "artifacts"
+    assert artifacts.is_dir() and not artifacts.is_symlink()
+    assert artifacts.resolve().is_relative_to(tmp_path.resolve())
+    _prove_safe_successful_reset(settings, stores, direct, tmp_path, artifacts)
+    return server
+
+
+def _prove_safe_successful_reset(settings, stores, fake_client, tmp_path, artifacts):
+    from core import flags
+    from core.apply_queue import ApplyQueue
+    from server import create_app
+    from tools import browser_runtime, browser_skill, seen, submit_hold
+
+    queued = ApplyQueue(stores.tracking.r)
+    rows = stores.tracking.all()
+    assert not submit_hold.any_held(tracking=stores.tracking)
+    assert not queued.in_flight()
+    assert all(r.get("status") != "submitting" and
+               not submit_hold.blocked(r["pk"], r, tracking=stores.tracking)
+               for r in rows)
+
+    # Call the actual registered production handler, without ASGI lifespan or
+    # a listening server. All process/browser and seen effects are stub-safe.
+    app = create_app()
+    endpoints = [
+        route.endpoint for route in app.routes
+        if getattr(route, "path", "") == "/actions/reset"
+        and "POST" in getattr(route, "methods", set())
+    ]
+    assert len(endpoints) == 1
+    key = "redis-isolation:reset-sentinel"
+    assert fake_client.set(key, "before")
+    assert fake_client.get(key) == "before"
+
+    cleared = []
+    def safe_seen_clear():
+        path = seen._path()
+        assert not path.is_symlink()
+        assert path.resolve().is_relative_to(tmp_path.resolve())
+        cleared.append(path)
+        path.unlink(missing_ok=True)
+
+    with pytest.MonkeyPatch.context() as private:
+        private.setattr(browser_runtime, "kill_live_sessions", lambda kind="": 0)
+        private.setattr(browser_skill, "applies_running", lambda: 0)
+        private.setattr(seen, "clear", safe_seen_clear)
+        result = endpoints[0]()
+
+    assert result == {"ok": True, "status": "reset", "sessions_stopped": 0}
+    assert len(cleared) == 1
+    assert fake_client.get(key) is None
+    assert fake_client.get("app:test-redis-probe") is None
+    assert fake_client.llen(f"queue:{settings.tailor_queue_url}") == 0
+    assert not fake_client.exists("redis-isolation:shared")
+    assert not fake_client.exists("redis-isolation:async")
+    assert not artifacts.exists()
+    epoch = flags.reset_epoch()
+    assert epoch.isdecimal() and int(epoch) > 0
+    assert fake_client.hget("appliedin:flags", "reset_epoch") == epoch
+    assert fake_client.hkeys("appliedin:flags") == ["reset_epoch"]
+
+
+@pytest.fixture(autouse=True)
+def _redis_isolation_proof(request, _isolate_owner_state, _isolate_redis, tmp_path):
+    global _PROOF_PREVIOUS_SERVER
+
+    if not request.config.getoption("redis_isolation_proof"):
+        yield
+        return
+
+    if request.node.nodeid == _PROOF_FIRST:
+        assert _PROOF_PREVIOUS_SERVER is None
+        _PROOF_PREVIOUS_SERVER = _prove_factories_flags_events_stores(
+            _isolate_redis, tmp_path
+        )
+        yield
+        # The first test leaves the post-reset epoch marker in its own server.
+        from core import flags
+        assert flags.reset_epoch().isdecimal()
+    elif request.node.nodeid == _PROOF_SECOND:
+        assert _PROOF_PREVIOUS_SERVER is not None
+        assert _isolate_redis is not _PROOF_PREVIOUS_SERVER
+        old = fakeredis.FakeRedis(server=_PROOF_PREVIOUS_SERVER, decode_responses=True)
+        assert old.hget("appliedin:flags", "reset_epoch") is not None
+        current = redis.Redis.from_url("redis://localhost:6379/0", decode_responses=True)
+        assert current.dbsize() == 0
+        from core import flags
+        assert flags.get_flag("reset_epoch") == ""
+        yield
+        # The selected test calls the SHARED monkeypatch.undo() mid-test.
+        # Redis and owner paths must still be private afterward.
+        from core.config import get_settings
+        assert Path(get_settings().local_dir).resolve().is_relative_to(tmp_path.resolve())
+        assert redis.Redis().dbsize() == 0
+        assert flags.get_flag("reset_epoch") == ""
+        _PROOF_PREVIOUS_SERVER = None
+    else:
+        raise AssertionError("Redis isolation proof reached an unselected test")

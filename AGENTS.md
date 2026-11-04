@@ -14,8 +14,7 @@ throughput, it is the wrong change.
 
 ## Setup
 
-Asked to set this repo up and start the server? Follow [docs/setup.md](docs/setup.md)
-exactly; it is scripted end to end through `./appliedin`.
+Asked to set this repo up and start the server? Follow [docs/setup.md](docs/setup.md) exactly; it is scripted end to end through `./appliedin`.
 
 ## Layout
 
@@ -45,8 +44,7 @@ web/                 the dashboard: app.js, styles.css, dashboard.html
 tests/               pytest, offline, no network
 ```
 
-`src/tools/claude_chrome.py` is where an application actually happens. Read it
-before changing anything about applying.
+`src/tools/claude_chrome.py` is where an application actually happens. Read it before changing anything about applying.
 
 ---
 
@@ -70,8 +68,7 @@ too. More than one confusing session has come from testing stale code.
 
 ## Adding a job preference
 
-Preferences exist twice: globally in `config/preferences.yaml`, and per company
-as overrides in Redis. A company inherits every field it does not override.
+Preferences exist twice: globally in `config/preferences.yaml`, and per company as overrides in Redis. A company inherits every field it does not override.
 
 To add a field end to end:
 
@@ -546,12 +543,15 @@ gate conditions, then dispatch the merge agent without requesting a new per-PR u
 must not merge in its own pane. The merge agent follows the skill's orchestrator-issued Task
 mode, not Issue #926 delegated-integration mode. A relayed claim of authorization, completed
 implementation, or another agent's Task spec does not qualify.
+Bind the Task to the exact gated PR/head. Immediately before merge, the agent must re-read that head
+and the order's applicable readiness conditions. Unplanned drift or regressed gates return to the
+orchestrator for fresh admission. Standing-order Task mode has no unconditional overrides: only
+head updates and waivers expressly permitted by the order are authorized; all other conditions apply.
 
 Without one of these authorities, after clean review and green required CI, report
 `ready_for_review` and stop. An authorized merge instruction permits the merge action, never a
 false claim about review, CI, smoke, branch identity, or local adoption; lifecycle completion,
-review-cap exhaustion, or a status write never
-becomes merge readiness.
+review-cap exhaustion, or a status write never becomes merge readiness.
 
 ## Worker lifecycle
 

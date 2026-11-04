@@ -193,3 +193,104 @@ async def test_segment_caption_reaches_existing_verified_receipt(mode):
         assert intent is not None
         assert forms._completed_write_receipts(await session.page(), [intent]) == [
             {'action': 'combobox', 'selector': '#name-combo', 'verified': True}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('selected', [0, 1])
+@pytest.mark.parametrize('fact_mode', [
+    'resolved', 'missing-key', 'null-key', 'empty-key', 'unknown-key',
+    'null-value', 'empty-value', 'whitespace-value', 'omitted',
+    'exact-label', 'exact-value',
+])
+async def test_explicit_nested_choice_binds_ambiguous_segments(selected, fact_mode, caplog):
+    from tests.tools.test_browser_apply_decision_regression import MemorySession, act
+
+    options = [option('Testville, North Region, Testland', '#north', unique=True),
+               option('Testville, South Region, Testland', '#south', unique=True)]
+    chosen = options[selected]
+    action = {'action': 'click', 'selector': chosen['selector'], 'fact': 'City',
+              'value': 'Untrusted model answer'}
+    facts = {'City': 'Testville, Testland'}
+    if fact_mode == 'missing-key':
+        facts.clear()
+    elif fact_mode in {'null-key', 'empty-key', 'unknown-key'}:
+        action['fact'] = {'null-key': None, 'empty-key': '', 'unknown-key': 'Unknown'}[fact_mode]
+    elif fact_mode in {'null-value', 'empty-value', 'whitespace-value'}:
+        facts['City'] = {'null-value': None, 'empty-value': '',
+                         'whitespace-value': '   '}[fact_mode]
+    elif fact_mode == 'omitted':
+        action.pop('fact')
+    elif fact_mode == 'exact-label':
+        facts['City'] = chosen['label']
+    elif fact_mode == 'exact-value':
+        chosen['value'] = facts['City']
+    form = snapshot(options)
+    before = deepcopy((form, action, facts))
+    with caplog.at_level(logging.INFO, logger=forms._LOG.name):
+        resolved = forms._resolve_decision_option(form, action, facts)
+        assert resolved == {'action': 'combobox', 'selector': '#name-combo',
+                            'value': chosen['label']}
+        session = MemorySession(form)
+        _, filled, evidence = await act(session, form, resolved, facts)
+        forms._log_combobox_outcome(None, '#name-combo', evidence)
+    assert session.calls == [(('click', chosen['selector']), {})]
+    assert filled == {'#name-combo': chosen['label']}
+    assert evidence['selected_option']['selector'] == chosen['selector']
+    assert evidence['match'] == 'exact'
+    assert (form, action, facts) == before
+    assert 'segment_candidates=0' in caplog.text
+    assert 'Testville' not in caplog.text and 'Testland' not in caplog.text
+
+
+@pytest.mark.parametrize('mode', [
+    'unsafe', 'safe-missing', 'disabled', 'invisible', 'not-unique',
+    'submit', 'navigates', 'commits_application', 'mismatch',
+    'wrong-first-segment', 'partial-segment', 'empty-segment',
+    'duplicate-label', 'duplicate-value', 'duplicate-selector',
+    'duplicate-fact-value',
+])
+def test_explicit_segment_choice_preserves_refusals(mode):
+    chosen = option('Testville, North Region, Testland', '#north', unique=True)
+    options = [chosen, option('Testville, South Region, Testland', '#south', unique=True)]
+    facts = {'City': 'Testville, Testland'}
+    if mode == 'unsafe':
+        chosen['safe'] = False
+    elif mode == 'safe-missing':
+        chosen.pop('safe')
+    elif mode == 'disabled':
+        chosen['disabled'] = True
+    elif mode == 'invisible':
+        chosen['visible'] = False
+    elif mode == 'not-unique':
+        chosen['unique'] = False
+    elif mode in {'submit', 'navigates', 'commits_application'}:
+        chosen[mode] = True
+    elif mode in {'mismatch', 'wrong-first-segment', 'partial-segment', 'empty-segment'}:
+        facts['City'] = {'mismatch': 'Other City, Testland',
+                         'wrong-first-segment': 'North Region, Testland',
+                         'partial-segment': 'Testville, Test',
+                         'empty-segment': 'Testville,'}[mode]
+    elif mode == 'duplicate-label':
+        options.append(dict(chosen, selector='#twin'))
+    elif mode == 'duplicate-value':
+        options[1]['value'] = chosen['label']
+    elif mode == 'duplicate-selector':
+        options[1]['selector'] = chosen['selector']
+    elif mode == 'duplicate-fact-value':
+        chosen['value'] = options[1]['value'] = facts['City']
+    form = snapshot(options)
+    action = {'action': 'click', 'selector': '#north', 'fact': 'City'}
+    assert forms._resolve_decision_option(form, action, facts) is action
+
+
+@pytest.mark.asyncio
+async def test_unresolved_segment_ambiguity_reports_only_candidate_count(monkeypatch, caplog):
+    session, evidence, _ = await run_picker(
+        'Testville, Testland',
+        [option('Testville, North Region, Testland', '#north'),
+         option('Testville, South Region, Testland', '#south')],
+        monkeypatch=monkeypatch, caplog=caplog)
+    assert evidence['performed'] is False
+    assert evidence['segment_candidates'] == 2
+    assert 'segment_candidates=2' in caplog.text
+    assert [call for call in session.calls if call[0] == 'click'] == [('click', '#name-combo')]

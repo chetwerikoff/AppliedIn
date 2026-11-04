@@ -590,6 +590,14 @@ def _log_option_refusal(reason: str, action: dict, target: dict | None = None):
               reason, kind, 'fact' in action)
 
 
+def _option_matches_segments(option: dict, answer: str) -> bool:
+    segments = [' '.join(s.casefold().split()) for s in answer.split(',')]
+    parts = [' '.join(s.casefold().split())
+             for s in str(option.get('label') or '').split(',')]
+    return bool(segments[0] and parts[0] == segments[0]
+                and all(segment and segment in parts for segment in segments[1:]))
+
+
 def _resolve_decision_option(page: dict, action: dict, facts: dict) -> dict:
     """Normalize only a unique observed picker option, never an arbitrary click."""
     selector = action.get('selector')
@@ -626,17 +634,35 @@ def _resolve_decision_option(page: dict, action: dict, facts: dict) -> dict:
     if target.get('type') != 'combobox':
         _log_option_refusal('non-combobox-parent', action, target)
         return action
-    answer = _owner_action_answer(action, facts) if 'fact' in action else option.get('label')
+    fact_answer = _owner_action_answer(action, facts) if 'fact' in action else ''
+    answer = fact_answer or option.get('label')
     if not isinstance(answer, str) or not answer.strip():
         _log_option_refusal('empty-answer', action, target)
         return action
+    if not (_same(option.get('label', ''), answer)
+            or _same(option.get('value', ''), answer)
+            or (fact_answer and _option_matches_segments(option, answer))):
+        _log_option_refusal('candidate-count-or-identity', action, target)
+        return action
+    # Validate the fact first, then bind execution to this option's exact caption.
+    caption = option.get('label')
+    if not isinstance(caption, str) or not caption.strip():
+        _log_option_refusal('empty-answer', action, target)
+        return action
     options = (target.get('combobox') or {}).get('options')
+    exact = [o for o in options or [] if isinstance(o, dict)
+             and (_same(o.get('label', ''), answer) or _same(o.get('value', ''), answer))]
+    if len(exact) > 1:
+        _log_option_refusal('candidate-count-or-identity', action, target)
+        return action
     candidates = [o for o in options or [] if isinstance(o, dict)
-                  and (_same(o.get('label', ''), answer) or _same(o.get('value', ''), answer))]
+                  and (_same(o.get('label', ''), caption) or _same(o.get('value', ''), caption))]
     if len(candidates) != 1 or candidates[0] is not option:
         _log_option_refusal('candidate-count-or-identity', action, target)
         return action
-    return {**action, 'action': 'combobox', 'selector': target['selector'], 'value': answer}
+    resolved = {**action, 'action': 'combobox', 'selector': target['selector'], 'value': caption}
+    resolved.pop('fact', None)
+    return resolved
 
 
 
@@ -3412,10 +3438,10 @@ def _log_combobox_outcome(after: dict | None, selector: str, evidence: dict):
                     bool(text) and _same(text, option.get('label', ''))
                     or bool(value) and value == option.get('value')) else 'no'
     _LOG.info('combobox outcome option_found=%s committed=%s listbox_still_open=%s '
-              'match=%s options_seen=%s',
+              'match=%s options_seen=%s segment_candidates=%s',
               'yes' if found is True else 'no' if found is False else 'unknown',
               committed, opened, evidence.get('match', 'none'),
-              evidence.get('options_seen', 0))
+              evidence.get('options_seen', 0), evidence.get('segment_candidates', 0))
 
 
 async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
@@ -3455,16 +3481,11 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                   and (_same(o.get('label', ''), answer)
                        or _same(o.get('value', ''), answer))]
     match = 'exact' if candidates else 'none'
+    segment_candidates = 0
     if not candidates:
-        segments = [' '.join(s.casefold().split()) for s in answer.split(',')]
-        for option in options:
-            if not isinstance(option, dict):
-                continue
-            parts = [' '.join(s.casefold().split())
-                     for s in str(option.get('label') or '').split(',')]
-            if (segments[0] and parts[0] == segments[0]
-                    and all(segment and segment in parts for segment in segments[1:])):
-                candidates.append(option)
+        candidates = [o for o in options if isinstance(o, dict)
+                      and _option_matches_segments(o, answer)]
+        segment_candidates = len(candidates)
         if candidates:
             match = 'segment'
     chosen = None
@@ -3483,7 +3504,8 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     filled[selector] = chosen['label'] if chosen is not None and match == 'segment' else answer
     if write_evidence is not None:
         write_evidence.update(performed=chosen is not None, selected_option=chosen,
-                              match=match, options_seen=len(options))
+                              match=match, options_seen=len(options),
+                              segment_candidates=segment_candidates)
     return {'action': 'combobox', 'selector': selector, 'label': target.get('label','')}
 
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,

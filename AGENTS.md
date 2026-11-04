@@ -12,10 +12,6 @@ throughput, it is the wrong change.
 
 ---
 
-## Setup
-
-Asked to set this repo up and start the server? Follow [docs/setup.md](docs/setup.md) exactly; it is scripted end to end through `./appliedin`.
-
 ## Layout
 
 ```
@@ -37,14 +33,14 @@ src/
     models.py        Status, DiscoveryMode, JobRecord
     stores.py        the storage factory. Never construct storage directly
   tools/
-    claude_chrome.py THE apply engine: runs `claude --chrome` as a subprocess
+    claude_chrome.py legacy apply engine (`claude --chrome`); apply path frozen
     browser_apply.py apply() dispatch and the duplicate guard
     company_skills.py loads site-quirks for a URL or company
 web/                 the dashboard: app.js, styles.css, dashboard.html
 tests/               pytest, offline, no network
 ```
 
-`src/tools/claude_chrome.py` is where an application actually happens. Read it before changing anything about applying.
+Applications are sent by board agents: see Invariants.
 
 ---
 
@@ -137,19 +133,12 @@ apply failure in this repo was diagnosed by theory three times and by evidence
 once. Only the evidence was right, and the fix took ten minutes once the raw
 report was in the log.
 
-When the browser agent reports a failure:
+When an application or a browser run fails:
 
-1. **Read the session's own words.** `claude_chrome.py` logs the full report and
-   session output on a conflict. A one line verdict names a symptom; the report
-   names the cause.
-2. **Reproduce outside the daemon.** Run `claude --chrome -p "..."` by hand with
-   the same flags. If it fails there too, the daemon is not involved.
-3. **Bisect the page.** Try a different URL on the same domain. That is what
-   isolated the Oracle bug: `example.com` worked, the posting failed, and Oracle's
-   own 404 page worked, which ruled out both the domain and the extension and left
-   only the page.
-
-**"The page can be read but not clicked."** Reads succeeding while every click, screenshot and JavaScript call fails with `Cannot access a chrome-extension:// URL of different extension` means a browser extension has injected a frame into the page. An ad blocker replacing a social embed does this. Chrome then refuses to let any other extension act on that tab. It is not a broken posting and not a second Claude session; the fix is to apply on a URL without the embed. This is handled by `direct_board_url()` and detected by `_is_browser_conflict()`.
+1. **Read the session's own words**: the board agent's pane or the daemon log.
+   A one line verdict names a symptom; the report names the cause.
+2. **Bisect the page.** Try another URL on the same domain: that isolated the
+   Oracle bug (the domain worked, the posting failed, Oracle's 404 page worked).
 
 **Nothing happens when I click Apply.** Check the daemon log before assuming a
 dead button. Reading the posting is its own browser subprocess and can take a
@@ -164,21 +153,15 @@ probably never saw them: check whether the company should be `discovery: browser
 
 ## Invariants
 
-These are enforced in code, not requested in prompts, because a rule that lives
-only in a prompt is a rule nobody is enforcing. Do not move them into a prompt.
-For BrowserSkill applications, ordinary accessible form filling, choices,
-focus, navigation within the form and the row PDF upload are ungated preparation.
-Exactly one fresh code-owned check at raw application IPC precedes Submit or
-in-form implicit submission: it verifies five substantive conditions; an
-unconfirmed potentially committed attempt remains uncertain, never applied.
-Page-owned change/blur/upload handlers can commit early; this is an explicitly
-accepted residual risk, not protection provided by the final check. No model
-or reviewer can replace the code-owned Submit decision.
+Board agents fill and submit applications in the application profile through
+their own `bsk` sessions by `.local/operator/board-agent-brief.md` (owner
+decision 2026-11-04; the daemon's code apply path is frozen). The code-owned
+check run immediately before Submit is `.local/operator/precheck.py` (no
+duplicate, company caps, one Submit per row); field correctness is the agent's
+self-check. These invariants bind every route:
 
-- **Never declare a protected characteristic.** `guard_value()` in
-  `claude_chrome.py` intercepts every value the model writes. Disability, veteran
-  status, race and gender may be declined but never affirmed. Negatives must still
-  go through, or a required field is left blank rather than correctly declined.
+- **Never declare a protected characteristic.** Disability, veteran status, race
+  and gender may be declined but never affirmed; negatives must still go through.
 - **Never apply twice.** Checked in `browser_apply.apply()` and again immediately
   before submit.
 - **Never record an application the page did not confirm.** An unconfirmed submit
@@ -250,13 +233,13 @@ Two Chrome profiles exist on the operator's machine and never mix:
 
 - **The application profile** (its own user-data-dir, pinned in
   `config/browser.local.yaml`) holds the owner's real sign-ins. Everything done
-  in it is done as the owner. Only the daemon's paths drive it: posting reads,
-  browser discovery and approved applications.
+  in it is done as the owner. The daemon's paths (posting reads, browser
+  discovery) and board agents through their own `bsk` sessions drive it.
 - **The pack profile** (the automation Chrome on CDP 9222) is where managers and
   firefighters talk to Browser-GPT. It never opens a job site, the dashboard or
   an application form.
 
-In the application profile agents never browse ad hoc, "warm" history, sign in, create accounts, enter passwords or solve CAPTCHAs; a login wall is a human gate. No other tool (Orca's browser, `claude --chrome`, the pack Chrome) is pointed at it. Never copy, delete or reset its directory, switch the pinned instance, or publish its instance ID. Form smoke uses a local `127.0.0.1` fixture page, run by the firefighter or the operator in the primary checkout, never a worktree.
+In the application profile no agent browses outside its task, "warms" history, signs in, creates accounts, enters passwords or solves CAPTCHAs; a login wall is a human gate. Board agents use only their own `bsk` session and never touch the owner's windows or another session. No other tool (Orca's browser, `claude --chrome`, the pack Chrome) is pointed at it. Never copy, delete or reset its directory, switch the pinned instance, or publish its instance ID. Form smoke uses a local `127.0.0.1` fixture page, run by the firefighter or the operator in the primary checkout, never a worktree.
 
 ### Dedicated application Chrome health
 
@@ -275,7 +258,8 @@ systemd-run --user --scope -- setsid -f $HOME/.local/bin/appliedin-chrome --user
 Re-check after about 15 seconds; the expected state is `connected`. For any other non-connected state (including running but not connected, ambiguous, or a different instance), never launch a second Chrome. Report the exact state and detail to the architect pane for the operator's step. If the post-launch check is not `connected`, report it instead of launching again.
 
 Launching is the only action allowed on that Chrome: never close, reload,
-focus, or navigate it; never run bsk. Units never launch it; only the
+focus, or navigate it; development units never run bsk (board agents use only
+their own bsk session). Units never launch it; only the
 orchestrator does.
 
 ## Orchestrator-pack target binding
@@ -306,6 +290,8 @@ invariants, the rules above or "The rule that outranks the rest" in `CLAUDE.md`.
   run only in this checkout, by the firefighter or the operator.
 - No agent submits, approves or queues a real application in a task, smoke or
   review. Form smoke uses a local `127.0.0.1` fixture with synthetic data.
+  Board agents are owner-authorized application operators, not tasks: they
+  submit real applications by their brief.
 - Merge-time adoption: `git merge --ff-only` here (dirty or diverged: report);
   `uv sync --locked` if `uv.lock`/`pyproject.toml` changed; restart the daemon
   only when no scan, preparation or application is running.

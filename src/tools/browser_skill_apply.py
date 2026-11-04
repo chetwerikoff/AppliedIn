@@ -563,8 +563,53 @@ def control(page: dict, action: dict, caller: str = 'external') -> dict:
             'caller': caller if isinstance(caller, str) and caller in _CONTROL_CALLERS
                       else 'external',
         }
+        if caller == 'decision-action':
+            nested = _nested_option_matches(page, action.get('selector'))
+            _LOG.warning('decision-action ControlGate selector=%r unique_nested_control=%s',
+                         action.get('selector'), len(nested) == 1)
         raise ControlGate(diagnostics)
     return matches[0]
+
+def _nested_option_matches(page: dict, selector) -> list[tuple[dict, list[dict]]]:
+    if not isinstance(selector, str) or not selector:
+        return []
+    matches = []
+    for target in page.get('controls', []):
+        options = target.get('options') or (target.get('combobox') or {}).get('options') or []
+        nested = [o for o in options if isinstance(o, dict)
+                  and o.get('selector') == selector]
+        if nested:
+            matches.append((target, nested))
+    return matches
+
+
+def _resolve_decision_option(page: dict, action: dict, facts: dict) -> dict:
+    """Normalize only a unique observed picker option, never an arbitrary click."""
+    selector = action.get('selector')
+    if (action.get('action') not in {'click', 'choose', 'combobox', 'select'}
+            or any(c.get('selector') == selector for c in page.get('controls', []))):
+        return action
+    matches = _nested_option_matches(page, selector)
+    if len(matches) != 1 or len(matches[0][1]) != 1:
+        return action
+    target, [option] = matches[0]
+    if (target.get('disabled') or option.get('disabled')
+            or option.get('visible') is False or option.get('unique') is False
+            or any(option.get(k) for k in ('submit', 'navigates', 'commits_application'))
+            or is_submission(target) or native_submit(target)):
+        return action
+    if target.get('type') != 'combobox':
+        return action
+    answer = _owner_action_answer(action, facts) if 'fact' in action else option.get('label')
+    if not isinstance(answer, str) or not answer.strip():
+        return action
+    options = (target.get('combobox') or {}).get('options')
+    candidates = [o for o in options or [] if isinstance(o, dict)
+                  and (_same(o.get('label', ''), answer) or _same(o.get('value', ''), answer))]
+    if len(candidates) != 1 or candidates[0] is not option:
+        return action
+    return {**action, 'action': 'combobox', 'selector': target['selector'], 'value': answer}
+
 
 
 def label(target: dict) -> str:
@@ -4658,6 +4703,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
     write_intents = []  # Private intended values; never sent to the decision model.
     upload_receiver = None
     decision_turn = 0
+    absent_decision_retry = False
     uploaded = False
     session = None
     page = None
@@ -4796,7 +4842,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             'Initial redirect is not proven to be the same employer job.',
                             url, page.get('url'), provenance=provenance)
 
-                for _ in range(100):
+                preparation_turn = 0
+                while preparation_turn < 100 or absent_decision_retry:
+                    if not absent_decision_retry:
+                        preparation_turn += 1
                     if submitted:
                         context = handoff('A potentially committing step ran but has no new '
                                           'employer confirmation; inspect before retrying.', step)
@@ -4884,10 +4933,28 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         (ctx.decision if ctx else bsk.decision),
                         task + '\nAvailable fact keys (each is a stored, owner-approved answer; values are deliberately withheld from you and filled by the server when you return action fill/choose/combobox with fact set to the exact key; essay keys too, with essay true. A listed key is never a missing fact; gate only for a required control with no matching key): ' + repr(safe_keys)
                         + '\nDo not replay completed writes. Receipts are advisory; '
-                          'the server independently checks the final form and attachment.',
+                          'the server independently checks the final form and attachment.'
+                        + ('\nYour previous selector is not on the current page; choose only from available_choices.'
+                           if absent_decision_retry else ''),
                         model_page, model_history, model=model, facts=facts,
                         turn=decision_turn)
-                    verb = action.get('action')
+                    model_action = action
+                    action = _resolve_decision_option(page, action, facts)
+                    try:
+                        if action.get('selector'):
+                            control(page, action, 'decision-action')
+                    except ControlGate as exc:
+                        if (exc.diagnostics['reason'] == 'absent: 0 matches'
+                                and not absent_decision_retry):
+                            # Restart at PAGE, rebuilding every model receipt from
+                            # that observation; never replay the rejected action.
+                            absent_decision_retry = True
+                            continue
+                        raise
+                    absent_decision_retry = False
+                    # A normalized option must still traverse the unchanged
+                    # click/Submit classification before picker execution.
+                    verb = 'click' if action is not model_action else action.get('action')
                     if verb == 'wait':
                         await asyncio.sleep(0.25)
                         continue
@@ -4961,6 +5028,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                           'employer confirmation. Inspect before retrying.', step)
                         return {'status': 'uncertain', 'detail': context['text'],
                                 'step': context['step']}
+                    verb = action.get('action')
                     before = page
                     original_receiver = (deepcopy(target) if isinstance(target, dict)
                                          and verb in {'fill', 'select', 'choose', 'combobox'}

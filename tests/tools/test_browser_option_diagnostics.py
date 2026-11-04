@@ -96,6 +96,8 @@ def test_success_and_top_level_actions_do_not_log_refusal(caplog):
 @pytest.mark.parametrize('mode,found,committed,opened', [
     ('committed', 'yes', 'yes', 'yes'),
     ('not-committed', 'yes', 'no', 'yes'),
+    ('empty-selection', 'yes', 'unknown', 'yes'),
+    ('display-only-selection', 'yes', 'unknown', 'yes'),
     ('no-option', 'no', 'unknown', 'yes'),
     ('no-readback', 'yes', 'unknown', 'unknown'),
     ('missing-control', 'yes', 'unknown', 'unknown'),
@@ -111,7 +113,12 @@ def test_outcomes_use_only_observed_state(mode, found, committed, opened, caplog
     evidence = {'performed': True, 'selected_option': deepcopy(option)}
     after = page(target)
     if mode == 'not-committed':
+        target['combobox'].update(selected_text='PRIVATE-OTHER', selected_value='PRIVATE-OTHER')
+    elif mode in {'empty-selection', 'display-only-selection'}:
         target['combobox'].update(selected_text='', selected_value='')
+        if mode == 'display-only-selection':
+            target['combobox']['displayed_text'] = 'PRIVATE-LABEL'
+            target['value'] = 'PRIVATE-LABEL'
     elif mode == 'no-option':
         evidence = {'performed': False, 'selected_option': None}
     elif mode == 'no-readback':
@@ -156,6 +163,6 @@ async def test_existing_loop_readback_emits_one_outcome_without_extra_calls(tmp_
     assert result['status'] == 'gate'
     outcomes = [r.message for r in caplog.records if r.message.startswith('combobox outcome')]
     assert outcomes == [
-        'combobox outcome option_found=yes committed=no listbox_still_open=yes']
+        'combobox outcome option_found=yes committed=unknown listbox_still_open=yes']
     assert [c for c in harness.calls if c[0] == 'click'] == [('click', OPTION)]
     assert all('Test User' not in message for message in outcomes)

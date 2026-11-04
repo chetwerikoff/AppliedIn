@@ -3405,7 +3405,9 @@ def _log_combobox_outcome(after: dict | None, selector: str, evidence: dict):
         option = evidence.get('selected_option')
         if isinstance(option, dict):
             text, value = combo.get('selected_text'), combo.get('selected_value')
-            if isinstance(text, str) and isinstance(value, str):
+            # PAGE defaults absent optional selection attributes to empty strings.
+            if (isinstance(text, str) and isinstance(value, str)
+                    and (text.strip() or value.strip())):
                 committed = 'yes' if (
                     bool(text) and _same(text, option.get('label', ''))
                     or bool(value) and value == option.get('value')) else 'no'

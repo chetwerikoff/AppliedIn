@@ -1070,7 +1070,8 @@ async def test_selector_less_vs_selector_bearing_gate_and_finish_paths(
          None, None),
     ]
     for action, reason, with_reason in cases:
-        harness = _AfterUploadHarness(tmp_path, monkeypatch, [action])
+        # Absent selectors now receive one fresh decision before the same gate.
+        harness = _AfterUploadHarness(tmp_path, monkeypatch, [action, action])
         harness.current['controls'].append(
             _long_control(disabled=True, question='Disabled question', label='Disabled')
             | {'selector': '#experience-disabled', 'form_action': fixture.URL})

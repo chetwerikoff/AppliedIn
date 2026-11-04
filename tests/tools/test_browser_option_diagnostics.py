@@ -136,7 +136,8 @@ def test_outcomes_use_only_observed_state(mode, found, committed, opened, caplog
         forms._log_combobox_outcome(after, '#name-combo', evidence)
     assert (after, evidence) == before
     assert [r.message for r in caplog.records] == [
-        f'combobox outcome option_found={found} committed={committed} listbox_still_open={opened}']
+        f'combobox outcome option_found={found} committed={committed} listbox_still_open={opened} '
+        'match=none options_seen=0']
     assert 'PRIVATE-' not in caplog.text
 
 
@@ -163,6 +164,7 @@ async def test_existing_loop_readback_emits_one_outcome_without_extra_calls(tmp_
     assert result['status'] == 'gate'
     outcomes = [r.message for r in caplog.records if r.message.startswith('combobox outcome')]
     assert outcomes == [
-        'combobox outcome option_found=yes committed=unknown listbox_still_open=yes']
+        'combobox outcome option_found=yes committed=unknown listbox_still_open=yes '
+        'match=exact options_seen=2']
     assert [c for c in harness.calls if c[0] == 'click'] == [('click', OPTION)]
     assert all('Test User' not in message for message in outcomes)

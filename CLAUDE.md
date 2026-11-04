@@ -35,7 +35,10 @@ change trades safety for throughput, it is the wrong change.
 ## Do not
 
 - Move a guard from code into a prompt. The invariants in AGENTS.md hold because
-  the tool layer enforces them regardless of what the model emits.
+  the tool layer enforces them regardless of what the model emits. Board agents
+  (owner decision 2026-11-04) fill and submit applications by AGENTS.md
+  "Invariants": `precheck.py` enforces duplicates, caps and one Submit in code;
+  field answers there are the agent's self-check, not a code guard.
 - Commit `.local/`, `resume/base.tex` or anything under `output/`. They hold real
   personal data. `config/watchlist.yaml` and `config/preferences.yaml` are
   tracked, so treat them as public.

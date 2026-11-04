@@ -329,7 +329,7 @@ async def test_ungated_location_preparation_selects_visible_matching_option():
     assert filled == {'#current-location': ANSWER}
     assert [call for call in session.calls if call[0] != 'evaluate'] == [
         ('click', '#current-location'),
-        ('fill', '#current-location', '--value', ANSWER),
+        ('fill', '#current-location', '--value', ANSWER.split(',')[0]),
         ('click', '#location-option'),
     ]
     observed = await session.page()

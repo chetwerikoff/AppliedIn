@@ -154,7 +154,7 @@ probably never saw them: check whether the company should be `discovery: browser
 ## Invariants
 
 Board agents fill and submit applications in the application profile through
-their own `bsk` sessions by `.local/operator/board-agent-brief.md` (owner
+their own `bsk` sessions and Agent Windows by `.local/operator/board-agent-brief.md` (owner
 decision 2026-11-04; the daemon's code apply path is frozen). The code-owned
 check run immediately before Submit is `.local/operator/precheck.py` (no
 duplicate, company caps, one Submit per row); field correctness is the agent's
@@ -168,8 +168,9 @@ self-check. These invariants bind every route:
   is `uncertain`, never `applied`.
 - **Sanctions and restricted country questions take the safe answer.** Getting one
   wrong is a false statement, not a bad application.
-- **A browser fault is not a job failure.** Nothing was filled and nothing was
-  submitted, so the job is re-queued rather than burned.
+- **A browser fault is not a job failure.** Before any Submit or other committing
+  click, the row is released or re-queued, not burned. After one, an unconfirmed
+  attempt is `uncertain` (no blind retry) until the page or the mailbox decides.
 - **Never submit a résumé built from an edited base.** Tailored copies record
   their `resume_seed`; a mismatch re-tailors first.
 

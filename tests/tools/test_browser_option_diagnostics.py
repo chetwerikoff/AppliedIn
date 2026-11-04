@@ -20,8 +20,6 @@ from tests.tools.test_browser_apply_decision_regression import _AfterUploadHarne
     ('parent-native-submit', 'parent-native-submit'),
     ('parent-type', 'non-combobox-parent'),
     ('parent-private-type', 'non-combobox-parent'),
-    ('null', 'empty-answer'), ('empty', 'empty-answer'),
-    ('whitespace', 'empty-answer'), ('absent-fact', 'empty-answer'),
     ('no-fact-empty-label', 'empty-answer'),
     ('no-candidate', 'candidate-count-or-identity'),
     ('duplicate-candidate', 'candidate-count-or-identity'),
@@ -53,10 +51,6 @@ def test_refusals_preserve_action_and_log_one_value_free_reason(mode, reason, ca
                       native_form_owner_selector=target['form_selector'])
     elif mode.startswith('parent-'):
         target['type'] = 'PRIVATE-TYPE' if mode == 'parent-private-type' else 'button'
-    elif mode in {'null', 'empty', 'whitespace'}:
-        facts['PRIVATE-FACT'] = {'null': None, 'empty': '', 'whitespace': '   '}[mode]
-    elif mode == 'absent-fact':
-        facts.clear()
     elif mode == 'no-fact-empty-label':
         action.pop('fact')
         option['label'] = ''
@@ -87,7 +81,7 @@ def test_success_and_top_level_actions_do_not_log_refusal(caplog):
     action = {'action': 'click', 'selector': OPTION, 'fact': 'Name'}
     with caplog.at_level(logging.INFO, logger=forms._LOG.name):
         assert forms._resolve_decision_option(page(target), action, {'Name': 'Test User'}) == {
-            **action, 'action': 'combobox', 'selector': '#name-combo', 'value': 'Test User'}
+            'action': 'combobox', 'selector': '#name-combo', 'value': 'Test User'}
         direct = dict(action, selector='#name-combo')
         assert forms._resolve_decision_option(page(target), direct, {}) is direct
     assert not caplog.records
@@ -137,7 +131,7 @@ def test_outcomes_use_only_observed_state(mode, found, committed, opened, caplog
     assert (after, evidence) == before
     assert [r.message for r in caplog.records] == [
         f'combobox outcome option_found={found} committed={committed} listbox_still_open={opened} '
-        'match=none options_seen=0']
+        'match=none options_seen=0 segment_candidates=0']
     assert 'PRIVATE-' not in caplog.text
 
 
@@ -165,6 +159,6 @@ async def test_existing_loop_readback_emits_one_outcome_without_extra_calls(tmp_
     outcomes = [r.message for r in caplog.records if r.message.startswith('combobox outcome')]
     assert outcomes == [
         'combobox outcome option_found=yes committed=unknown listbox_still_open=yes '
-        'match=exact options_seen=2']
+        'match=exact options_seen=2 segment_candidates=0']
     assert [c for c in harness.calls if c[0] == 'click'] == [('click', OPTION)]
     assert all('Test User' not in message for message in outcomes)

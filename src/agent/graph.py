@@ -427,14 +427,26 @@ def _scorer_after_model(callback_context, llm_response):
 
 
 def _effective_scorer_score(raw: MatchScore, jd_text: str) -> int:
-    """A model label/quote proves neither side of an eligibility conflict.
+    """Only a substantive quote in scorer-visible JD can activate a code cap.
 
-    Deterministic two-sided admission lives before ADK in run.py. Retain the
-    intrinsic score here; even a verbatim quote may be an irrelevant benefit.
+    Presence is not proof of a preference conflict: kind remains model-selected.
+    Work authorization cannot add a code-owned cap, even with a real quote.
     """
-    if raw.dealbreaker is not None:
-        log.warning("scorer dealbreaker cap ignored: applicant conflict not proved")
-    return raw.score
+    claim = raw.dealbreaker
+    if claim is None or claim.kind == "authorization":
+        return raw.score
+
+    quote = " ".join((claim.quote or "").casefold().split())
+    if len(quote) < 24 or len(quote.split()) < 4:
+        # Do not expose the quoted job text or candidate preferences in logs.
+        log.warning("scorer dealbreaker cap ignored: insufficient JD quote")
+        return raw.score
+
+    visible_jd = " ".join((jd_text or "").casefold().split())
+    if quote not in visible_jd:
+        log.warning("scorer dealbreaker cap ignored: quote absent from scorer-visible JD")
+        return raw.score
+    return min(raw.score, 3)
 
 
 class _SafeScorer(LlmAgent):

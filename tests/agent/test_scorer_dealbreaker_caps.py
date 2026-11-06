@@ -1,4 +1,4 @@
-"""Offline two-sided eligibility checks: model labels are not proof.
+"""Offline scorer cap checks: quote membership, not semantic eligibility.
 
 Test User and example-co are synthetic. Real ADK fake models exercise both
 normal and prepare-only graphs; no browser, Redis, queue, or submission runs.
@@ -134,11 +134,11 @@ def test_verified_quote_projects_effective_score_after_raw_witness(
     assert len(witnessed) == 1
     raw_text, forwarded = witnessed[0]
     assert json.loads(raw_text)["score"] == 8  # unchanged ADK model witness
-    assert forwarded["score"] == 8  # a quote alone cannot prove a conflict
+    assert forwarded["score"] == 3              # after validation, before yield
     assert forwarded["dealbreaker"]["kind"] == kind
-    assert h.next.observed == [8]
-    assert h.stores.tracking.row["match_score"] == 8
-    assert h.saved[0]["match_score"] == 8
+    assert h.next.observed == [3]  # the next ADK agent sees effective score
+    assert h.stores.tracking.row["match_score"] == 3
+    assert h.saved[0]["match_score"] == 3  # existing persisted score
 
 
 @pytest.mark.parametrize("kind", ["location", "other"])
@@ -146,9 +146,25 @@ def test_code_cap_reaches_ordinary_shortlist_threshold(harness, kind):
     h = harness
     h.fake.scripted = [_response(_payload(kind=kind, quote=GOOD_QUOTE))]
     result = _run(h)
-    assert result["result"] != "skipped"
-    assert h.stores.tracking.row["match_score"] == 8
-    assert h.next.observed == [8]
+    assert result["result"] == "skipped"
+    assert h.stores.tracking.row["skip_reason"] == "low_score"
+    assert h.stores.tracking.row["match_score"] == 3
+    assert h.next.observed == []  # skip before tailoring or approvals
+    assert len(h.fake.requests) == 1
+
+
+def test_verbatim_location_dealbreaker_caps_at_three(harness, monkeypatch):
+    # A high raw fit must not bypass the shortlist gate when the scorer cites
+    # a substantive location requirement verbatim from its own visible JD.
+    h = harness
+    quote = "This role requires on-site work in Example City every weekday."
+    _fresh_scorer_state(monkeypatch, JD + " " + quote)
+    h.fake.scripted = [_response(_payload(score=9, kind="location", quote=quote))]
+    result = _run(h)
+    assert result["result"] == "skipped"
+    assert h.stores.tracking.row["skip_reason"] == "low_score"
+    assert h.stores.tracking.row["match_score"] == 3
+    assert h.next.observed == []
     assert len(h.fake.requests) == 1
 
 
@@ -235,7 +251,7 @@ def test_authorization_claim_never_adds_code_cap(
 
 
 def test_substantive_quote_can_be_misclassified_by_model(harness, monkeypatch):
-    # Misclassification cannot turn a neutral posting quote into exclusion.
+    # This is an acknowledged limitation, not semantic proof of incompatibility.
     source = JD + " Our teams collaborate across multiple international locations."
     _fresh_scorer_state(monkeypatch, source)
     h = harness
@@ -243,7 +259,7 @@ def test_substantive_quote_can_be_misclassified_by_model(harness, monkeypatch):
         kind="other", quote="Our teams collaborate across multiple international locations."
     ))]
     _run(h)
-    assert h.stores.tracking.row["match_score"] == 8
+    assert h.stores.tracking.row["match_score"] == 3
 
 
 def test_lower_raw_fit_is_never_raised_by_a_cap(harness):

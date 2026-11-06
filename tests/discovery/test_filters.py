@@ -222,3 +222,13 @@ def test_remote_superregion_or_unclassified_scope_cannot_prove_incompatibility()
     assert stage1_match(_job(loc="London, UK"), Preferences(locations=["Unknown City"]))
     assert stage1_match(_job(loc="Remote - Example South"),
                         Preferences(locations=["Example North"], remote_only=True))
+
+
+def test_unknown_preference_keywords_do_not_erase_known_country_constraints():
+    # Work-format/city keywords cannot veto the countries that were recognized.
+    prefs = Preferences(locations=["flexible", "Canada", "Example City", "Germany"])
+    assert not stage1_match(_job(loc="France"), prefs)
+    assert not stage1_match(_job(loc="Remote - France"), prefs)
+    for location in ("Canada", "Germany", "Remote - Canada", "Example City",
+                     "Paris, France", "Unknown", "Remote", ""):
+        assert stage1_match(_job(loc=location), prefs)

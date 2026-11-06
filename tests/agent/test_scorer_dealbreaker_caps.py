@@ -255,7 +255,12 @@ def test_lower_raw_fit_is_never_raised_by_a_cap(harness):
     assert h.stores.tracking.row["match_score"] == 2
 
 
-def test_explicit_sponsorship_refusal_stops_before_scorer(harness, monkeypatch):
+@pytest.mark.parametrize("private", [
+    "sponsorship: required",
+    "I do not require sponsorship.\nsponsorship: required",
+    "Review sponsorship options.\n  - sponsorship: required",
+])
+def test_explicit_sponsorship_refusal_stops_before_scorer(harness, monkeypatch, private):
     h = harness
     refusal_jd = JD + " example-co will not sponsor visa applicants."
     assert R._no_sponsorship(refusal_jd)
@@ -266,7 +271,7 @@ def test_explicit_sponsorship_refusal_stops_before_scorer(harness, monkeypatch):
 
     monkeypatch.setattr(R, "_jd_meta", denied)
     from core import steering
-    monkeypatch.setattr(steering, "read", lambda: {"content": "sponsorship: required"})
+    monkeypatch.setattr(steering, "read", lambda: {"content": private})
     result = _run(h)
     assert result["reason"] == "eligibility conflict: sponsorship"
     assert h.fake.requests == []  # no model invoked
@@ -278,7 +283,7 @@ def test_explicit_sponsorship_refusal_stops_before_scorer(harness, monkeypatch):
     "", "Please consider visa-friendly roles.", "sponsorship: not required",
     "not sponsorship: required", "sponsorship: maybe required",
     "sponsorship: required\nsponsorship: not required",
-    "sponsorship: required\nI do not require sponsorship.",
+    "Review sponsorship options.",
 ])
 def test_no_sponsorship_posting_preserved_without_unambiguous_private_need(harness, monkeypatch, private):
     from core import steering
@@ -323,6 +328,15 @@ def test_no_sponsorship_posting_preserved_without_unambiguous_private_need(harne
      "Must currently reside in example south.", False),
     ("residence", "residence: only in example south",
      "Must currently reside in example north unless relocating.", False),
+    # Prose does not invalidate or establish a typed, runtime-only constraint.
+    ("work authorization", "Review work authorization rules.\n  * work authorization: not authorized in example north",
+     "Must already be authorized to work in example north.", True),
+    ("residence", "Consider residence preferences.\n  • residence: only in example south",
+     "Must currently reside in example north.", True),
+    ("work authorization", "Review work authorization rules.",
+     "Must already be authorized to work in example north.", False),
+    ("residence", "Consider residence preferences.",
+     "Must currently reside in example north.", False),
 ])
 def test_private_and_posting_constraint_pair_before_any_tailor(harness, monkeypatch, family, private, posting, conflict):
     from core import steering
@@ -355,6 +369,10 @@ def test_private_and_posting_constraint_pair_before_any_tailor(harness, monkeypa
     ("Remote - United States", True, ["California"], False),
     ("Remote - US", True, ["United States"], False),
     ("Remote - Example South", True, ["Example North"], False),
+    ("France", False, ["flexible", "Canada", "Example City", "Germany"], True),
+    ("Canada", False, ["flexible", "Canada", "Example City", "Germany"], False),
+    ("Example City", False, ["flexible", "Canada", "Germany"], False),
+    ("Paris, France", False, ["flexible", "Canada", "Germany"], False),
 ])
 def test_typed_location_evidence_is_independent_of_model_score(harness, monkeypatch, location, remote, locations, conflict):
     from discovery.watchlist import Preferences

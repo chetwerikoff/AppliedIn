@@ -38,8 +38,10 @@ def location_conflict(location: str, prefs: Preferences) -> str | None:
         return "remote only"
     region = re.sub(r"\b(?:remote|on-site|onsite|on site|hybrid)\b", "", loc).strip(" ,-/()")
     country = _country(region)
-    preferred = [_country(p.strip().casefold()) for p in prefs.locations]
-    if country and preferred and all(preferred) and country not in preferred:
+    preferred = {_country(p.strip().casefold()) for p in prefs.locations}
+    # Non-country keywords must not erase explicit preferred countries.
+    preferred.discard(None)
+    if country and preferred and country not in preferred:
         return "location"
     return None
 

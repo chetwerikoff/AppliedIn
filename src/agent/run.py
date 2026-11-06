@@ -1280,8 +1280,10 @@ def _private_constraint(content: str, family: str) -> str | None:
     This deliberately small recognition grammar is not a general prose parser.
     Values remain runtime-only, and are never used in diagnostics.
     """
-    lines = [line.strip().casefold() for line in content.splitlines()
-             if family in line.casefold()]
+    # Prose mentions carry no typed authority and must not mask explicit lines.
+    lines = [re.sub(r"^\s*(?:[-*+•]\s*)?", "", line).strip().casefold()
+             for line in content.splitlines()]
+    lines = [line for line in lines if line.startswith(family + ":")]
     if not lines:
         return None
     if family == "sponsorship":

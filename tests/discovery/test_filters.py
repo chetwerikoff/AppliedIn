@@ -33,8 +33,9 @@ def test_a_missing_include_keyword_does_not_reject():
 
 
 def test_location_mismatch_rejects():
-    prefs = Preferences(locations=["New York"])
-    assert stage1_match(_job(loc="London, UK"), prefs) is False
+    # Country disjointness is proved; an unclassified city name is not enough.
+    prefs = Preferences(locations=["United States"])
+    assert stage1_match(_job(loc="United Kingdom"), prefs) is False
 
 
 def test_remote_only_passes_remote():
@@ -209,7 +210,15 @@ def test_remote_only_without_region_does_not_invent_an_onsite_requirement():
 
 
 def test_remote_label_does_not_erase_an_explicit_regional_restriction():
-    prefs = Preferences(locations=["Example North"], remote_only=True)
-    assert stage1_match(_job(loc="Remote - Example North"), prefs)
+    prefs = Preferences(locations=["United States"], remote_only=True)
+    assert stage1_match(_job(loc="Remote - US"), prefs)
     assert stage1_match(_job(loc="Remote - Worldwide"), prefs)
-    assert not stage1_match(_job(loc="Remote - Example South"), prefs)
+    assert not stage1_match(_job(loc="Remote - United Kingdom"), prefs)
+
+
+def test_remote_superregion_or_unclassified_scope_cannot_prove_incompatibility():
+    assert stage1_match(_job(loc="Remote - United States"),
+                        Preferences(locations=["California"], remote_only=True))
+    assert stage1_match(_job(loc="London, UK"), Preferences(locations=["Unknown City"]))
+    assert stage1_match(_job(loc="Remote - Example South"),
+                        Preferences(locations=["Example North"], remote_only=True))

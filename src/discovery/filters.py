@@ -17,17 +17,29 @@ def _contains_any(haystack: str, needles: list[str]) -> bool:
     low = haystack.lower()
     return any(n.lower() in low for n in needles)
 
+def _country(location: str) -> str | None:
+    # Compare only known atomic, equal-granularity scopes. A city/state versus
+    # a country, a list of scopes, or an unfamiliar label is not disjointness.
+    country = location.strip()
+    for aliases in (
+        ("united states", "united states of america", "us", "usa", "u.s."),
+        ("united kingdom", "uk", "gb", "great britain"),
+        ("canada",), ("germany",), ("france",), ("australia",), ("india",),
+    ):
+        if country in aliases:
+            return aliases[0]
+    return None
+
+
 def location_conflict(location: str, prefs: Preferences) -> str | None:
-    """Unknown remote scope is not a conflict; an explicit region still is."""
+    """Only demonstrated work-format or country disjointness is a hard stop."""
     loc = location.strip().casefold()
     if prefs.remote_only and re.search(r"\b(?:on-site|onsite|on site|hybrid)\b", loc):
         return "remote only"
     region = re.sub(r"\b(?:remote|on-site|onsite|on site|hybrid)\b", "", loc).strip(" ,-/()")
-    if region in ("", "unknown", "unspecified", "not specified", "anywhere", "worldwide", "global"):
-        return None
-    if prefs.locations and not any(
-            re.search(r"\b" + re.escape(p.casefold()) + r"\b", region)
-            for p in prefs.locations):
+    country = _country(region)
+    preferred = [_country(p.strip().casefold()) for p in prefs.locations]
+    if country and preferred and all(preferred) and country not in preferred:
         return "location"
     return None
 

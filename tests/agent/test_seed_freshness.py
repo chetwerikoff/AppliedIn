@@ -312,6 +312,14 @@ def pdf_world(monkeypatch, tmp_path):
         def __init__(self):
             self.calls, self.waiting, self.leased = [], set(), set()
             self.lose_removal = False
+            self.company_lease = False
+        def claim_human_outcome(self, company):
+            if self.company_lease:
+                return False
+            self.company_lease = True
+            return True
+        def release_human_outcome(self, company):
+            self.company_lease = False
         def enqueue(self, name, data):
             self.calls.append((name, data))
         def in_flight(self):
@@ -330,6 +338,7 @@ def pdf_world(monkeypatch, tmp_path):
                              apply_queue="synthetic-apply", tailor_queue="synthetic-tailor")
     world = SimpleNamespace(pk=pk, stores=stores, script=["ok"], auto=False,
                             renders=0, before_render=None, after_save=None, results=[])
+    world.real_enqueue = R._enqueue_apply
     seed = _save_doc(_SAVE_HEAD + "\n" + r"\item One")
     monkeypatch.setattr(G, "get_settings", lambda: SimpleNamespace(local_dir=str(tmp_path)))
     monkeypatch.setattr(profiles, "resolve_for", lambda row: None)
@@ -548,3 +557,80 @@ def test_retailor_runner_failure_never_becomes_compile_failure_or_readiness(pdf_
     assert out["result"] == "error" and out["reason"] == "retailor_failed"
     assert w.stores.tracking.row["status"] == "error"
     assert w.stores.queue.calls == []
+
+
+def _real_apply_queue(world):
+    import fakeredis
+    from core.apply_queue import ApplyQueue
+    queue = ApplyQueue(fakeredis.FakeRedis(decode_responses=True))
+    world.stores.queue = queue
+    return queue
+
+
+def test_real_queue_lrem_to_pk_lease_gap_cannot_admit_retailor(pdf_world, monkeypatch):
+    from copy import deepcopy
+    from agent import run as R
+    w = pdf_world
+    q = _real_apply_queue(w)
+    w.stores.tracking.row.update(status="tailored", apply_requested_at="old-request")
+    before = deepcopy(w.stores.tracking.row)
+    assert q.put(w.pk, "example-co")
+    remove = q.r.lrem
+    observed = []
+    def transfer_gap(*args, **kwargs):
+        removed = remove(*args, **kwargs)
+        assert not q.in_flight() and not q.has_pending(w.pk)
+        observed.append(R.retailor(w.pk, stores=w.stores))
+        assert w.stores.tracking.row == before
+        return removed
+    monkeypatch.setattr(q.r, "lrem", transfer_gap)
+    item = q.next()
+    assert item["pk"] == w.pk
+    assert observed == [{"result": "refused", "pk": w.pk,
+                         "reason": "apply_in_flight_or_unknown"}]
+    assert w.renders == 0
+    q.done(item)
+
+
+def test_approval_observed_before_retailor_cannot_dispatch_old_pdf(pdf_world, monkeypatch):
+    from agent import run as R
+    from core import apply_queue
+    w = pdf_world
+    q = _real_apply_queue(w)
+    monkeypatch.setattr(apply_queue, "ApplyQueue", lambda client: q)
+    w.stores.tracking.row.update(status="tailored", gate_call_id="old-approval",
+        gate_pending={"question": "Ready to apply?"}, gate_source="tailor", gate_reason="approval")
+    checked = []
+    def during_render():
+        assert q.next() is None  # The original company lease excludes dispatch.
+        checked.append(True)
+    w.before_render = during_render
+    def paused_approval(*args, **kwargs):
+        assert kwargs["expected_row"]["gate_call_id"] == "old-approval"
+        assert R.retailor(w.pk, stores=w.stores)["result"] == "ok"
+        return w.real_enqueue(*args, **kwargs)
+    monkeypatch.setattr(R, "_enqueue_apply", paused_approval)
+    out = R.resume_job(w.pk, "approved", w.stores)
+    assert out["result"] == "conflict"
+    assert checked and q.pending() == [] and not q.in_flight()
+    assert w.stores.tracking.row["status"] == "tailored"
+    assert w.stores.tracking.row["resume_s3_key"] != "resumes/old.pdf"
+
+
+def test_failed_enqueue_generation_check_withdraws_its_fresh_pending_item(pdf_world, monkeypatch):
+    from agent import run as R
+    from core import apply_queue
+    w = pdf_world
+    q = _real_apply_queue(w)
+    monkeypatch.setattr(apply_queue, "ApplyQueue", lambda client: q)
+    w.stores.tracking.row.update(status="tailored")
+    put = q.put
+    def put_then_generation_changes(*args, **kwargs):
+        fresh = put(*args, **kwargs)
+        w.stores.tracking.row.update(status="tailoring", gate_reason="", gate_pending={})
+        return fresh
+    monkeypatch.setattr(q, "put", put_then_generation_changes)
+    out = w.real_enqueue(w.pk, w.stores, require_request=False)
+    assert out["result"] == "conflict"
+    assert q.pending() == [] and q.next() is None
+    assert w.stores.tracking.row["status"] == "tailoring"

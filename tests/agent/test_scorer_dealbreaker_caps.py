@@ -347,11 +347,14 @@ def test_private_and_posting_constraint_pair_before_any_tailor(harness, monkeypa
     ("Remote", True, ["Example North"], False),
     ("Hybrid, Example North", True, ["Example North"], True),
     ("On-site, Example North", True, [], True),
-    ("Example South", False, ["Example North"], True),
+    ("United Kingdom", False, ["United States"], True),
     ("Example North", False, ["Example North"], False),
-    ("Remote - Example South", True, ["Example North"], True),
+    ("Remote - United Kingdom", True, ["United States"], True),
     ("Remote - Example North", True, ["Example North"], False),
     ("Remote - Worldwide", True, ["Example North"], False),
+    ("Remote - United States", True, ["California"], False),
+    ("Remote - US", True, ["United States"], False),
+    ("Remote - Example South", True, ["Example North"], False),
 ])
 def test_typed_location_evidence_is_independent_of_model_score(harness, monkeypatch, location, remote, locations, conflict):
     from discovery.watchlist import Preferences
@@ -427,3 +430,23 @@ def test_current_jd_location_uses_company_over_global_typed_constraints(harness,
     assert global_prefs.locations == ["Example North"] and global_prefs.remote_only
     if not conflict:
         assert "Synthetic steering: no invented claims" in _material(h.fake.requests[0])
+
+
+@pytest.mark.parametrize("steering,requirement,family", [
+    ("work authorization: not authorized in example north",
+     "Must already be authorized to work in example north", "work authorization"),
+    ("residence: only in example south",
+     "Must currently reside in example north", "residence"),
+])
+def test_punctuation_free_requirement_bullet_does_not_consume_next_line(harness, monkeypatch, steering, requirement, family):
+    from tools import posting_guard as pg
+    h = harness
+    monkeypatch.setattr("core.steering.read", lambda: {"content": steering})
+    async def source_jd(_row):
+        return pg.analyze(JD + "\n- " + requirement + "\n- Experience with Python required")
+    monkeypatch.setattr(R, "_jd_meta", source_jd)
+    h.stores.tracking.row["score_override"] = True
+    h.fake.scripted = [_response(_payload(score=9))]
+    assert _run(h) == {"result": "skipped", "pk": h.pk,
+                       "reason": "eligibility conflict: " + family}
+    assert h.next.observed == h.fake.requests == []

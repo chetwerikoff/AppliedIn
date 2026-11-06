@@ -174,8 +174,34 @@ def _browser_extract(url: str, company: str, prefs: Preferences) -> list[JobReco
 _BOARD_SOURCE = "greenhouse_board_listing"
 
 
+def _visible_source_links(html: str, careers_url: str) -> set[str]:
+    from tools import posting_guard as pg
+    page = pg.safe_extractor(html, careers_url,
+        lambda origin, url: _trusted_posting_url(url, careers_url) == url)
+    if page["posting_guard"]["status"] == "error":
+        return set()
+    manifest = page["extractor_text"].partition(
+        "VISIBLE POSTING LINKS (validated title/url pairs):\n")[2]
+    try:
+        return {item["url"] for item in json.loads(manifest)}
+    except (ValueError, KeyError, TypeError):
+        return set()
+
+
+def _observed_source_links(careers_url: str) -> set[str]:
+    # Browser-model output is not a source-link witness. If the independent
+    # listing read cannot prove an href (including JS-only pages), withhold it.
+    try:
+        response = httpx.get(careers_url, timeout=20, follow_redirects=False)
+        response.raise_for_status()
+        return _visible_source_links(response.text, careers_url)
+    except (httpx.HTTPError, ValueError):
+        return set()
+
+
 def _reconcile_browser_greenhouse(company: CompanyConfig,
-                                  jobs: list[JobRecord]) -> list[JobRecord]:
+                                  jobs: list[JobRecord], *,
+                                  observed_links: set[str] | None = None) -> list[JobRecord]:
     """Source/tenant/feed proof for new board rows, independent of legacy apply.
 
     Re-prove at the common persistence boundary, never trust a model ATS label
@@ -198,6 +224,12 @@ def _reconcile_browser_greenhouse(company: CompanyConfig,
         if (jid is not None and job.company == cfg.name
                 and job.greenhouse_board in ("", cfg.board)):
             proposed.setdefault(jid, []).append(job)
+    if not proposed:
+        return ordinary
+    if observed_links is None:
+        observed_links = _observed_source_links(cfg.careers_url)
+    proposed = {jid: variants for jid, variants in proposed.items()
+                if all(job.jd_url in observed_links for job in variants)}
     if not proposed:
         return ordinary
     try:
@@ -466,6 +498,7 @@ def _repair_duplicate(
 def _enqueue(
     company: CompanyConfig, jobs: list, stores: Any, *,
     fetched_url: str | None = None,
+    observed_links: set[str] | None = None,
 ) -> int:
     """Drop anything too old, dedup against past runs, queue what is genuinely new.
 
@@ -563,7 +596,7 @@ def _enqueue(
         if index and discovery_greenhouse_id(job.jd_url, company.careers_url) is None:
             continue
         candidates.append(job)
-    jobs = _reconcile_browser_greenhouse(company, candidates)
+    jobs = _reconcile_browser_greenhouse(company, candidates, observed_links=observed_links)
     # Existing suffix/native admission and historical repair rules are unchanged.
     jobs = [j for j in jobs if j.discovery_source == _BOARD_SOURCE or not (
         employer_gh_claim(company, j) or (company.ats == "greenhouse"
@@ -871,4 +904,4 @@ def crawl_company(
 
     progress.record(relevant=len(jobs), stage="Saving new matches")
     return 0 if progress.cancelled() else _enqueue(
-        company, jobs, stores, fetched_url=fetched_url)
+        company, jobs, stores, fetched_url=fetched_url, observed_links=observed)

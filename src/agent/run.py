@@ -1302,7 +1302,8 @@ def _private_constraint(content: str, family: str) -> str | None:
 
 def _eligibility_conflict(jd: str, location: str, prefs: Any, steering: str) -> str | None:
     """Prove both sides before scoring; raw fit/override cannot bypass this."""
-    text = " ".join(jd.casefold().split())
+    # A newline terminates a requirement even when a bullet has no punctuation.
+    text = "\n".join(" ".join(line.casefold().split()) for line in jd.splitlines())
     sponsorship = _private_constraint(steering, "sponsorship")
     if sponsorship == "required" and _no_sponsorship(jd):
         return "eligibility conflict: sponsorship"
@@ -1313,7 +1314,7 @@ def _eligibility_conflict(jd: str, location: str, prefs: Any, steering: str) -> 
         constraint = _private_constraint(steering, family)
         if not constraint:
             continue
-        for required in re.findall(pattern, text):
+        for required in re.findall(pattern, text, re.M):
             required = required.strip()
             if re.search(r"\b(?:or|and|unless|maybe|anywhere|worldwide)\b", required):
                 continue
@@ -1356,7 +1357,7 @@ def _save_output(pk: str, row: dict, jd_text: str, stores: Any) -> None:
 
 
 def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False,
-                   require_request: bool = True) -> dict:
+                   require_request: bool = True, expected_row: dict | None = None) -> dict:
     """Hand an approved job to the apply queue instead of applying it here.
 
     Approving is a decision; dispatching is the queue's job. When ▶ Apply ran the
@@ -1385,6 +1386,15 @@ def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False,
     if row.get("status") in ("applied", "applied_manual"):
         log.warning("refusing to queue %s: already %s", pk, row.get("status"))
         return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
+    if expected_row is not None:
+        check = _reader_check(pk, expected_row, stores)
+        if check:
+            return check
+        if any(row.get(key) != expected_row.get(key) for key in (
+                "gate_call_id", "gate_pending", "gate_reason")):
+            return {"result": "conflict", "pk": pk, "reason": "approval_withdrawn"}
+    if not require_request and row.get("status") not in ("tailored", "needs_human"):
+        return {"result": "refused", "pk": pk, "reason": "preparation_not_current"}
     if require_request and (
             not row.get("apply_requested_at")
             or row.get("status") not in ("tailoring", "tailored")):
@@ -1397,6 +1407,14 @@ def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False,
     # A role the owner pressed Apply on already has its go-ahead. Marking it
     # "approval" is what put it back in front of them as a question.
     requested = bool(row.get("apply_requested_at"))
+    def withdraw_stale_preparation():
+        latest = stores.tracking.get(pk) or {}
+        # Preserve the existing held/committing-row recovery route; never claim
+        # to cancel an application that may already have reached its form.
+        if (latest.get("status") in ("tailoring", "tailored", "needs_human", "error")
+                and not latest.get("confirmation_id")
+                and not submit_hold.blocked(pk, latest, tracking=stores.tracking)):
+            q.remove(pk)
     try:
         fresh = q.put(pk, row.get("company") or "", priority=priority, requested=requested)
         if not fresh:
@@ -1425,8 +1443,10 @@ def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False,
         # precondition; independent hold and confirmation are checked afresh.
         check = _reader_check(pk, row, stores)
         if check:
+            withdraw_stale_preparation()
             return check
         if require_request and not (stores.tracking.get(pk) or {}).get("apply_requested_at"):
+            withdraw_stale_preparation()
             return {"result": "refused", "pk": pk,
                     "reason": "apply_request_or_preparation_not_current"}
         committed, _ = _reader_patch(pk, row, stores, {
@@ -1435,6 +1455,7 @@ def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False,
             "fail_reason": "", "fail_kind": "",
         })
         if not committed:
+            withdraw_stale_preparation()
             return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
         ahead = q.depth()["queued"].get((row.get("company") or "").strip().lower(), 0)
     except Exception:
@@ -1638,23 +1659,30 @@ def retailor(pk: str, note: str | None = None, stores: Any = None) -> dict:
 
     if status == "tailoring":
         return {"result": "refused", "pk": pk, "reason": "preparation_in_progress"}
-    if _active_apply_lease(pk, stores) is not False:
-        return {"result": "refused", "pk": pk, "reason": "apply_in_flight_or_unknown"}
-    pending = _pending_apply_item(pk, stores)
-    if pending is None:
-        return _pending_refusal(pk, pending)
     if not _claim(pk, stores):
         return {"result": "already_running", "pk": pk}
+    from core.apply_queue import ApplyQueue
+    queue = stores.queue
+    if not callable(getattr(queue, "claim_human_outcome", None)):
+        queue = ApplyQueue(stores.tracking.r)
+    company = row.get("company") or ""
+    leased = False
     try:
+        # next() claims this exact company lease BEFORE LREM. It closes the
+        # transfer gap that separate pending/pk-lease reads cannot observe.
+        if not queue.claim_human_outcome(company):
+            return {"result": "refused", "pk": pk, "reason": "apply_in_flight_or_unknown"}
+        leased = True
+        if _active_apply_lease(pk, stores) is not False:
+            return {"result": "refused", "pk": pk, "reason": "apply_in_flight_or_unknown"}
+        pending = _pending_apply_item(pk, stores)
+        if pending is None:
+            return _pending_refusal(pk, pending)
         check = _reader_check(pk, row, stores)
         if check:
             return check
         if pending:
-            inspector = stores.queue
-            if not callable(getattr(inspector, "remove", None)):
-                from core.apply_queue import ApplyQueue
-                inspector = ApplyQueue(stores.tracking.r)
-            if not inspector.remove(pk):
+            if not queue.remove(pk):
                 return {"result": "refused", "pk": pk, "reason": "pending_withdrawal_lost"}
         # Removal can lose to next(); never assert cancellation of leased work.
         if (_active_apply_lease(pk, stores) is not False
@@ -1672,6 +1700,8 @@ def retailor(pk: str, note: str | None = None, stores: Any = None) -> dict:
             return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
         return _run(_retailor_preparation(pk, admitted, stores))
     finally:
+        if leased:
+            queue.release_human_outcome(company)
         _release(pk, stores)
 
 
@@ -1870,7 +1900,7 @@ def resume_job(pk: str, answer: str, stores: Any = None, *,
         # re-queued items) still take the one-click ▶ Apply: approving one means
         # "run the browser apply for it now".
         if row.get("status") == "tailored":
-            return _enqueue_apply(pk, stores, require_request=False)
+            return _enqueue_apply(pk, stores, require_request=False, expected_row=row)
         return {"result": "not_gated", "pk": pk}
 
     question = (row.get("gate_pending") or {}).get("question") or ""
@@ -1993,7 +2023,7 @@ def resume_job(pk: str, answer: str, stores: Any = None, *,
         # gated mode the decision belongs to Process. So it queues as ordinary
         # work, exactly as before.
         return _enqueue_apply(pk, stores, priority=bool(question) and not approval,
-                              require_request=False)
+                              require_request=False, expected_row=row)
     return _run(_resume_job_async(pk, answer, call_id, stores))
 
 

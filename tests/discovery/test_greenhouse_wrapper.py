@@ -101,6 +101,7 @@ def world(monkeypatch, tmp_path):
         root=tmp_path, config=config(), tracking=Tracking(), queue=Queue(),
         browser_rows=[listing()], feed=[board_job()], feed_error=False,
         browser_calls=[], feed_calls=[], seen_urls=set(), marked=[],
+        source_links={WRAPPER},
     )
     state.stores = SimpleNamespace(tracking=state.tracking, queue=state.queue,
                                    tailor_queue="synthetic-queue")
@@ -143,6 +144,15 @@ def world(monkeypatch, tmp_path):
                 "note": "Synthetic browser listing"}, None
 
     monkeypatch.setattr(browser_runtime, "run_task", fake_browser)
+    def source_get(url, **kwargs):
+        import html
+        import httpx
+        assert url == CAREERS
+        body = "<main>" + "".join(
+            f'<a href="{html.escape(href, quote=True)}">Platform Engineer</a>'
+            for href in state.source_links) + "</main>"
+        return httpx.Response(200, text=body, request=httpx.Request("GET", url))
+    monkeypatch.setattr(crawler.httpx, "get", source_get)
 
     def feed(self, company, client):
         state.feed_calls.append(company.board)
@@ -318,6 +328,7 @@ def test_real_board_discovery_to_current_pdf_tailored_preserves_original_url(wor
     from tools.claude_chrome import greenhouse_alias_candidate
     w = pdf_world
     world.browser_rows = [listing(MULTI)]
+    world.source_links = {MULTI}
     assert crawler.crawl_company(world.config, Preferences(), world.stores) == 1
     assert world.queue.calls == [("synthetic-queue", {"pk": w.pk})]
     # Use the same fake persisted store across producer and real runner/save.
@@ -348,6 +359,7 @@ def test_real_board_discovery_to_current_pdf_tailored_preserves_original_url(wor
 def test_bounded_safe_query_order_admits_unchanged(world, query):
     url = CAREERS + "/platform-engineer?" + query
     world.browser_rows = [listing(url)]
+    world.source_links = {url}
     assert crawler.crawl_company(world.config, Preferences(), world.stores) == 1
     assert world.tracking.put_calls[0].jd_url == url
 
@@ -386,7 +398,30 @@ def test_ambiguous_origin_path_and_id_refuse_before_effects(world, url):
     _no_new_gh_application_effects(world)
 
 
-def test_same_index_query_detail_requires_independent_feed_proof(world):
-    world.browser_rows = [listing(CAREERS + "?src=list&gh_jid=731205")]
+def test_same_index_query_detail_requires_independent_source_link_and_feed_proof(world):
+    url = CAREERS + "?src=list&gh_jid=731205"
+    world.browser_rows = [listing(url)]
+    world.source_links = {url}
     assert crawler.crawl_company(world.config, Preferences(), world.stores) == 1
     assert world.tracking.put_calls[0].job_id == "731205"
+
+
+@pytest.mark.parametrize("url", [
+    CAREERS + "/unobserved?src=list&gh_jid=731205&locale=en",
+    CAREERS + "?src=list&gh_jid=731205",
+])
+def test_matching_feed_and_model_url_do_not_prove_the_original_source_link(world, monkeypatch, url):
+    from tools import seen
+    world.browser_rows = [listing(url)]
+    assert world.source_links == {WRAPPER}  # Independent observed href differs.
+    monkeypatch.setattr(seen, "load", lambda: pytest.fail("unobserved href reached ledger"))
+    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 0
+    _no_new_gh_application_effects(world)
+
+
+def test_missing_independent_listing_read_cannot_promote_a_browser_claim(world, monkeypatch):
+    import httpx
+    monkeypatch.setattr(crawler.httpx, "get", lambda *a, **kw: (_ for _ in ()).throw(
+        httpx.ConnectError("synthetic source unavailable")))
+    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 0
+    _no_new_gh_application_effects(world)

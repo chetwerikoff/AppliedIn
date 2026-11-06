@@ -78,7 +78,9 @@ class _Stores:
     def __init__(self, row):
         self.tracking = _Tracking(row)
         from types import SimpleNamespace
-        self.queue = SimpleNamespace(in_flight=lambda: set(), has_pending=lambda pk: False)
+        # AC5: the existing company lease now excludes dispatch during re-tailor.
+        self.queue = SimpleNamespace(in_flight=lambda: set(), has_pending=lambda pk: False,
+            claim_human_outcome=lambda company: True, release_human_outcome=lambda company: None)
         data = {}
         def put(category, name, body, kind):
             key = category + "/" + name

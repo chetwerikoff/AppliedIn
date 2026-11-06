@@ -131,6 +131,7 @@ def test_unsafe_original_history_is_never_patched(world, changed):
 
 @pytest.mark.parametrize("url", [
     "https://careers.example-co.test/openings/engineer?gh_jid=731205&x=1",
+    "https://careers.example-co.test/openings/engineer?src=list&gh_jid=731205&locale=en",
     "https://careers.example-co.test/openings/engineer?gh_jid=731205&gh_jid=731205",
     "https://careers.example-co.test/openings/engineer?gh_jid=%37%33",
     "http://careers.example-co.test/openings/engineer?gh_jid=731205",
@@ -140,6 +141,16 @@ def test_noncanonical_original_url_needs_manual_identity_review(world, url):
     world.tracking.row["jd_url"] = url
     assert _once(world)["status"] == "noncanonical_wrapper"
     assert world.tracking.writes == 0
+
+
+def test_safe_new_producer_query_cannot_pin_even_when_old_feed_url_matches(world):
+    url = CAREERS + "/engineer?src=list&gh_jid=731205&locale=en"
+    world.tracking.row["jd_url"] = url
+    world.rows = [_feed(url=url)]
+    original = deepcopy(world.tracking.row)
+    outcome = _once(world, commit=True, operator_authorized=True)
+    assert outcome["status"] == "noncanonical_wrapper"
+    assert world.tracking.row == original and world.tracking.writes == 0
 
 
 @pytest.mark.parametrize("target", [

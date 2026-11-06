@@ -19,6 +19,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from contextvars import ContextVar
+
+# Invocation-local evidence, never inherited from a durable ADK session.
+_PDF_INVOCATION: ContextVar[dict | None] = ContextVar("pdf_invocation", default=None)
 
 from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
 from google.adk.models.lite_llm import LiteLlm
@@ -53,6 +57,10 @@ def save_tailored_resume(tailored_latex: str, tool_context: ToolContext) -> dict
     from core.stores import make_stores
     from tools.render import render_pdf, restore_preamble
     from tools.truthfulness import active_calls, used_macros, validate
+
+    invocation = _PDF_INVOCATION.get()
+    if invocation is not None:
+        invocation["attempted"] = True
 
     base_latex = tool_context.state.get("base_latex") or ""
     # Without the seed there is nothing to validate against, and both checks below
@@ -115,7 +123,11 @@ def save_tailored_resume(tailored_latex: str, tool_context: ToolContext) -> dict
         return failure
 
     pk = tool_context.state.get("pk", "resume")
-    stores = make_stores()
+    stores = invocation["stores"] if invocation is not None else make_stores()
+    if invocation is not None:
+        from agent.run import _reader_check
+        if pk != invocation["row"].get("pk") or _reader_check(pk, invocation["row"], stores):
+            return {"ok": False, "reason": "preparation_state_changed"}
 
     # The application goes out under a chosen profile, so the PDF must carry that
     # profile's contact details — a form saying one address while the attached
@@ -152,45 +164,45 @@ def save_tailored_resume(tailored_latex: str, tool_context: ToolContext) -> dict
             tailored_latex = fixed
             log.info("PDF render repaired by escaping bare specials for %s", pk)
         else:
-            # Never replace a previously accepted PDF or .tex with a failed
-            # render. Without a previous PDF the existing safe .tex fallback
-            # stays available, but it is still guard-validated above.
-            prev = (stores.tracking.get(pk) or {}).get("resume_s3_key", "")
-            if prev.endswith(".pdf"):
-                log.warning("PDF render failed (%s); keeping previous good PDF", exc)
-                return {"ok": False,
-                        "message": "Your edited LaTeX does NOT compile (syntax error). The "
-                                   "previous valid résumé is kept. Fix the error and re-save "
-                                   "the FULL corrected .tex."}
-            log.warning("PDF render failed (%s); storing guarded .tex only", exc)
-            fmt = "tex"
+            # A failed render must never turn TeX or a retained older PDF into
+            # successful evidence for this invocation.
+            log.warning("PDF render failed; retaining prior artifacts")
+            return {"ok": False, "format": "pdf", "reason": "pdf_compile_failed",
+                    "message": "PDF compilation failed. Fix the LaTeX syntax and "
+                               "re-save the full document; prior artifacts are retained."}
 
     # No write precedes this point. The initial, profile-adjusted and repaired
     # candidates all pass the same active anchor/bullet checks.
-    tex_key = artifacts.put("resumes", f"{pk}.tex", tailored_latex.encode(), "text/x-tex")
-    if fmt == "pdf":
-        key = artifacts.put("resumes", f"{pk}.pdf", pdf_bytes, "application/pdf")
-    else:
-        key = tex_key
+    # Generation-specific keys preserve prior evidence even if a concurrent
+    # held/applied row wins the conditional tracking commit after the upload.
+    from uuid import uuid4
+    name = f"{pk}-{uuid4().hex}" if invocation is not None else pk
+    tex_key = artifacts.put("resumes", f"{name}.tex", tailored_latex.encode(), "text/x-tex")
+    key = artifacts.put("resumes", f"{name}.pdf", pdf_bytes, "application/pdf")
+    from agent.run import _reader_check, _reader_patch, seed_fingerprint
+    from datetime import datetime, timezone
 
+    patch = dict(tailored_at=datetime.now(timezone.utc).isoformat(),
+                 resume_s3_key=key, resume_tex_key=tex_key,
+                 resume_version="tailored", resume_seed=seed_fingerprint())
+    if invocation is not None:
+        if _reader_check(pk, invocation["row"], stores):
+            return {"ok": False, "reason": "preparation_state_changed"}
+        committed, updated = _reader_patch(pk, invocation["row"], stores, patch)
+        if not committed:
+            return {"ok": False, "reason": "preparation_state_changed"}
+        invocation["row"] = updated
+    else:
+        row = stores.tracking.get(pk) or {}
+        stores.tracking.set_status(pk, row.get("status", "tailored"), **patch)
     tool_context.state["resume_s3_key"] = key
     tool_context.state["tailored"] = tailored_latex
-    # Record on the TRACKING ROW too — that's what the dashboard reads, so this is
-    # how the résumé PDF + the "what changed" diff show up in the UI.
-    row = stores.tracking.get(pk) or {}
-    # Stamp WHICH base résumé this was tailored from, so editing base.tex later
-    # makes already-tailored rows detectably stale instead of silently shipping
-    # the old content.
-    from agent.run import seed_fingerprint
-
-    from datetime import datetime, timezone
-    dates = {}
-    if fmt == "pdf" and not row.get("tailored_at"):
-        dates["tailored_at"] = datetime.now(timezone.utc).isoformat()
-    stores.tracking.set_status(pk, row.get("status", "tailored"), **dates, resume_s3_key=key,
-                               resume_tex_key=tex_key, resume_version="tailored",
-                               resume_seed=seed_fingerprint())
-    return {"ok": True, "resume_s3_key": key, "format": fmt}
+    result = {"ok": True, "resume_s3_key": key, "format": "pdf"}
+    if invocation is not None:
+        import hashlib
+        invocation["saved"] = dict(result)
+        invocation["digest"] = hashlib.sha256(pdf_bytes).hexdigest()
+    return result
 
 
 def exit_loop(tool_context: ToolContext) -> dict:
@@ -415,26 +427,14 @@ def _scorer_after_model(callback_context, llm_response):
 
 
 def _effective_scorer_score(raw: MatchScore, jd_text: str) -> int:
-    """Only a substantive quote in scorer-visible JD can activate a code cap.
+    """A model label/quote proves neither side of an eligibility conflict.
 
-    Presence is not proof of a preference conflict: kind remains model-selected.
-    Work authorization cannot add a code-owned cap, even with a real quote.
+    Deterministic two-sided admission lives before ADK in run.py. Retain the
+    intrinsic score here; even a verbatim quote may be an irrelevant benefit.
     """
-    claim = raw.dealbreaker
-    if claim is None or claim.kind == "authorization":
-        return raw.score
-
-    quote = " ".join((claim.quote or "").casefold().split())
-    if len(quote) < 24 or len(quote.split()) < 4:
-        # Do not expose the quoted job text or candidate preferences in logs.
-        log.warning("scorer dealbreaker cap ignored: insufficient JD quote")
-        return raw.score
-
-    visible_jd = " ".join((jd_text or "").casefold().split())
-    if quote not in visible_jd:
-        log.warning("scorer dealbreaker cap ignored: quote absent from scorer-visible JD")
-        return raw.score
-    return min(raw.score, 3)
+    if raw.dealbreaker is not None:
+        log.warning("scorer dealbreaker cap ignored: applicant conflict not proved")
+    return raw.score
 
 
 class _SafeScorer(LlmAgent):

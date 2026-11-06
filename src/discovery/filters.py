@@ -6,6 +6,7 @@ score runs later, in the tailoring worker.
 """
 
 from __future__ import annotations
+import re
 
 from core.models import JobRecord
 
@@ -15,6 +16,35 @@ from .watchlist import Preferences
 def _contains_any(haystack: str, needles: list[str]) -> bool:
     low = haystack.lower()
     return any(n.lower() in low for n in needles)
+
+def _country(location: str) -> str | None:
+    # Compare only known atomic, equal-granularity scopes. A city/state versus
+    # a country, a list of scopes, or an unfamiliar label is not disjointness.
+    country = location.strip()
+    for aliases in (
+        ("united states", "united states of america", "us", "usa", "u.s."),
+        ("united kingdom", "uk", "gb", "great britain"),
+        ("canada",), ("germany",), ("france",), ("australia",), ("india",),
+    ):
+        if country in aliases:
+            return aliases[0]
+    return None
+
+
+def location_conflict(location: str, prefs: Preferences) -> str | None:
+    """Only demonstrated work-format or country disjointness is a hard stop."""
+    loc = location.strip().casefold()
+    if prefs.remote_only and re.search(r"\b(?:on-site|onsite|on site|hybrid)\b", loc):
+        return "remote only"
+    region = re.sub(r"\b(?:remote|on-site|onsite|on site|hybrid)\b", "", loc).strip(" ,-/()")
+    country = _country(region)
+    preferred = {_country(p.strip().casefold()) for p in prefs.locations}
+    # Non-country keywords must not erase explicit preferred countries.
+    preferred.discard(None)
+    if country and preferred and country not in preferred:
+        return "location"
+    return None
+
 
 
 def stage1_match(job: JobRecord, prefs: Preferences) -> bool:
@@ -32,12 +62,4 @@ def stage1_match(job: JobRecord, prefs: Preferences) -> bool:
     if prefs.titles and not _contains_any(job.title, prefs.titles):
         return False
 
-    if prefs.locations:
-        loc = job.location.lower()
-        remote_ok = prefs.remote_only and "remote" in loc
-        if not remote_ok and not any(p.lower() in loc for p in prefs.locations):
-            return False
-    elif prefs.remote_only and "remote" not in job.location.lower():
-        return False
-
-    return True
+    return location_conflict(job.location, prefs) is None

@@ -33,8 +33,9 @@ def test_a_missing_include_keyword_does_not_reject():
 
 
 def test_location_mismatch_rejects():
-    prefs = Preferences(locations=["New York"])
-    assert stage1_match(_job(loc="London, UK"), prefs) is False
+    # Country disjointness is proved; an unclassified city name is not enough.
+    prefs = Preferences(locations=["United States"])
+    assert stage1_match(_job(loc="United Kingdom"), prefs) is False
 
 
 def test_remote_only_passes_remote():
@@ -186,3 +187,48 @@ def test_the_rate_limit_brake_backs_off_and_recovers():
     assert throttle.note_rate_limit() == 4.0
 
     throttle._resume_at = throttle._cooldown = throttle._last_limit = 0.0
+
+
+def test_degraded_relevance_keeps_unknown_and_remote_ambiguous_locations(monkeypatch):
+    from discovery.relevance import relevant
+    import litellm
+    from core import steering
+    monkeypatch.setattr(steering, "read", lambda: {"content": ""})
+    def outage(**kwargs):
+        raise RuntimeError("synthetic relevance outage")
+    monkeypatch.setattr(litellm, "completion", outage)
+    prefs = Preferences(titles=["Engineer"], locations=["Example North"], remote_only=True)
+    jobs = [_job(loc=loc) for loc in ("", "Unknown", "Remote", "Hybrid Example North", "On-site Example South")]
+    assert relevant(jobs, prefs, model="offline") == jobs[:3]
+
+
+def test_remote_only_without_region_does_not_invent_an_onsite_requirement():
+    prefs = Preferences(remote_only=True)
+    assert stage1_match(_job(loc=""), prefs)
+    assert stage1_match(_job(loc="Example North"), prefs)
+    assert not stage1_match(_job(loc="Hybrid Example North"), prefs)
+
+
+def test_remote_label_does_not_erase_an_explicit_regional_restriction():
+    prefs = Preferences(locations=["United States"], remote_only=True)
+    assert stage1_match(_job(loc="Remote - US"), prefs)
+    assert stage1_match(_job(loc="Remote - Worldwide"), prefs)
+    assert not stage1_match(_job(loc="Remote - United Kingdom"), prefs)
+
+
+def test_remote_superregion_or_unclassified_scope_cannot_prove_incompatibility():
+    assert stage1_match(_job(loc="Remote - United States"),
+                        Preferences(locations=["California"], remote_only=True))
+    assert stage1_match(_job(loc="London, UK"), Preferences(locations=["Unknown City"]))
+    assert stage1_match(_job(loc="Remote - Example South"),
+                        Preferences(locations=["Example North"], remote_only=True))
+
+
+def test_unknown_preference_keywords_do_not_erase_known_country_constraints():
+    # Work-format/city keywords cannot veto the countries that were recognized.
+    prefs = Preferences(locations=["flexible", "Canada", "Example City", "Germany"])
+    assert not stage1_match(_job(loc="France"), prefs)
+    assert not stage1_match(_job(loc="Remote - France"), prefs)
+    for location in ("Canada", "Germany", "Remote - Canada", "Example City",
+                     "Paris, France", "Unknown", "Remote", ""):
+        assert stage1_match(_job(loc=location), prefs)

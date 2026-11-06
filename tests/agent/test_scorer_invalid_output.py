@@ -168,6 +168,10 @@ def harness(monkeypatch, request):
     monkeypatch.setattr(R, "_release", lambda pk, stores: None)
     monkeypatch.setattr(R, "_min_score", lambda: 7)
     monkeypatch.setattr(G._steering, "instructions", lambda: "Synthetic steering: no invented claims")
+    from core import steering
+    from discovery.watchlist import Preferences
+    monkeypatch.setattr(steering, "read", lambda: {"content": ""})
+    monkeypatch.setattr(R, "_effective_prefs", lambda company: Preferences())
 
     async def _jd(_):
         # The runner consumes metadata, never an untracked plain-string fetch.

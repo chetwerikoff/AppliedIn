@@ -61,7 +61,7 @@ def test_review_graph_has_no_applier_or_submission_tools():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pdf, expected", [
-    ("resumes/1.pdf", "prepared"), ("resumes/1.tex", "failed"),
+    ("resumes/1.pdf", "failed"), ("resumes/1.tex", "failed"),
 ])
 async def test_review_finishes_without_dispatching_any_application(
         pdf, expected, monkeypatch):
@@ -81,6 +81,7 @@ async def test_review_finishes_without_dispatching_any_application(
     assert result["result"] == expected
     stores.queue.enqueue.assert_not_called()
     assert not tracking.get("acme#1").get("applied_at")
-    if expected == "prepared":
-        assert tracking.get("acme#1")["tailored_at"]
-        assert tracking.get("acme#1")["status"] == "tailored"
+    # AC5: this runner made no save call; neither an old PDF nor TeX is new readiness.
+    assert result["reason"] == "no_resume"
+    assert tracking.get("acme#1")["status"] == "failed"
+    assert tracking.get("acme#1")["resume_s3_key"] == pdf

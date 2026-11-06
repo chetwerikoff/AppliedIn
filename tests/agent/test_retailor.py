@@ -29,9 +29,24 @@ from core.storage.base import guard_observation_matches, guard_patch
 from tools import posting_guard as pg
 
 
+@pytest.fixture(autouse=True)
+def _synthetic_constraints(monkeypatch):
+    from discovery.watchlist import Preferences
+    monkeypatch.setattr(R, "_effective_prefs", lambda co: Preferences())
+    monkeypatch.setattr("core.steering.read", lambda: {"content": ""})
+
+
 class _Tracking:
     def __init__(self, row):
         self.row = dict(row)
+        self.r = None
+
+    def update_if_status(self, pk, expected_status, updates, *, expected_reader):
+        from tests.agent.test_scorer_invalid_output import _StrictTracking
+        proxy = _StrictTracking(self.row)
+        ok = proxy.update_if_status(pk, expected_status, updates, expected_reader=expected_reader)
+        self.row = proxy.row
+        return ok
 
     def get(self, pk):
         return dict(self.row) if self.row.get("pk") == pk else None
@@ -62,6 +77,16 @@ class _Tracking:
 class _Stores:
     def __init__(self, row):
         self.tracking = _Tracking(row)
+        from types import SimpleNamespace
+        # AC5: the existing company lease now excludes dispatch during re-tailor.
+        self.queue = SimpleNamespace(in_flight=lambda: set(), has_pending=lambda pk: False,
+            claim_human_outcome=lambda company: True, release_human_outcome=lambda company: None)
+        data = {}
+        def put(category, name, body, kind):
+            key = category + "/" + name
+            data[key] = body
+            return key
+        self.artifacts = SimpleNamespace(put=put, get=lambda key: data[key])
 
 
 @pytest.fixture
@@ -71,9 +96,18 @@ def ran(monkeypatch):
 
     async def _fake(pk, state, title, company):
         seen.update(state=state, pk=pk, title=title, company=company)
+        # AC5: this fake ADK completion must invoke the real saver and expose
+        # its current result; merely retaining an old PDF key is not success.
+        from agent import graph
+        from types import SimpleNamespace
+        result = graph.save_tailored_resume(state["base_latex"], SimpleNamespace(state=state))
+        R._observe_pdf(result)
 
     monkeypatch.setattr(R, "_tailor_only", _fake)
-    monkeypatch.setattr(R, "_base_latex", lambda: "\\begin{document}seed\\end{document}")
+    monkeypatch.setattr(R, "_base_latex", lambda: r"\role{example-co}{2024}" + "\n" + r"\item One")
+    monkeypatch.setattr("tools.render.render_pdf", lambda source: b"%PDF-synthetic")
+    monkeypatch.setattr("core.profiles.resolve_for", lambda row: None)
+    monkeypatch.setattr(R, "seed_fingerprint", lambda: "synthetic-seed")
     monkeypatch.setattr(R, "_github_context", lambda: "")
     monkeypatch.setattr(R, "_global_prefs", lambda: __import__("discovery.watchlist", fromlist=["Preferences"]).Preferences())
     return seen
@@ -174,8 +208,7 @@ def test_the_card_shows_as_tailoring_while_it_runs(monkeypatch):
 
 
 def test_the_row_gets_its_status_back_and_keeps_its_place(ran):
-    """Re-tailoring is not a reset. A queued row that gets a note must not fall
-    out of the queue or lose its approval — it only borrows the tailoring view."""
+    """AC5: a genuinely saved current PDF can finish tailored; no dispatch is kept."""
     stores = _Stores(_row(status="tailored"))
 
     R.retailor("stripe#1", "more Kubernetes", stores=stores)
@@ -184,8 +217,7 @@ def test_the_row_gets_its_status_back_and_keeps_its_place(ran):
 
 
 def test_a_failed_re_tailor_still_hands_the_status_back(monkeypatch):
-    """Left on `tailoring`, the row would have no Apply button and no way back —
-    a transient failure would turn into a job the owner cannot recover."""
+    """AC5: a failed started generation is recoverable ERROR, never old readiness."""
     async def _boom(pk, state, title, company):
         raise RuntimeError("the model fell over")
 
@@ -198,7 +230,9 @@ def test_a_failed_re_tailor_still_hands_the_status_back(monkeypatch):
     out = R.retailor("stripe#1", "more Kubernetes", stores=stores)
 
     assert out["result"] == "error"
-    assert stores.tracking.row["status"] == "tailored"
+    assert stores.tracking.row["status"] == "error"
+    assert not stores.tracking.row["apply_requested_at"]
+    assert not stores.tracking.row["gate_pending"]
 
 
 def test_the_pipeline_sees_the_same_note_as_the_button(monkeypatch):

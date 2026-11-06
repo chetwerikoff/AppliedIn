@@ -107,17 +107,32 @@ class _FakeRunner:
         type(self).agents.append(agent)
 
     async def run_async(self, *, user_id, session_id, new_message):
-        # Stands in for save_tailored_resume (out of scope here).
-        _FakeRunner.stores.tracking.set_status(
-            session_id, Status.TAILORING, resume_s3_key="resumes/new.pdf")
-        return
-        yield  # pragma: no cover - makes this an async generator
+        # AC5: run the real save boundary and yield its actual current response.
+        from agent.graph import save_tailored_resume
+        result = save_tailored_resume(_FakeRunner.seed, SimpleNamespace(
+            state={"pk": session_id, "base_latex": _FakeRunner.seed}))
+        yield SimpleNamespace(
+            author="tailor", content=None, get_function_calls=lambda: [],
+            get_function_responses=lambda: [SimpleNamespace(
+                name="save_tailored_resume", response=result)])
 
 
 @pytest.fixture
 def agent_doubles(monkeypatch, stores):
     _FakeRunner.agents = []
     _FakeRunner.stores = stores
+    from discovery.watchlist import Preferences
+    monkeypatch.setattr(run, "_effective_prefs", lambda co: Preferences())
+    monkeypatch.setattr("core.steering.read", lambda: {"content": ""})
+    monkeypatch.setattr("tools.render.render_pdf", lambda source: b"%PDF-synthetic")
+    monkeypatch.setattr("core.profiles.resolve_for", lambda row: None)
+    _FakeRunner.seed = r"\role{example-co}{2024}" + "\n" + r"\item One"
+    data = {}
+    def put(category, name, body, kind):
+        key = category + "/" + name
+        data[key] = body
+        return key
+    stores.artifacts = SimpleNamespace(put=put, get=lambda key: data[key])
     sessions = SimpleNamespace(get_session=AsyncMock(return_value=None),
                                create_session=AsyncMock())
     monkeypatch.setattr(run, "_session_service", lambda: sessions)
@@ -126,7 +141,7 @@ def agent_doubles(monkeypatch, stores):
 
     def session_state(row, jd_text):
         _FakeRunner.session_inputs.append(jd_text)
-        return {"base_latex": ""}
+        return {"base_latex": _FakeRunner.seed}
 
     monkeypatch.setattr(run, "_session_state", session_state)
     monkeypatch.setattr(run, "_save_output", lambda *a, **kw: None)
@@ -198,7 +213,9 @@ def test_retry_rereads_current_source_and_prepares_review_only(
     # old authority / refusal evidence gone, fresh review required
     assert not row.get("apply_requested_at")
     assert not row.get("fail_kind")
-    assert row["resume_s3_key"] == "resumes/new.pdf"
+    assert row["resume_s3_key"].startswith("resumes/" + PK + "-")
+    assert row["resume_s3_key"].endswith(".pdf")
+    assert stores.artifacts.get(row["resume_s3_key"]) == b"%PDF-synthetic"
     assert forbidden == []
     assert not stores.tracking.r.exists(f"lock:job:{PK}")
     assert ApplyQueue(stores.tracking.r).pending() == []

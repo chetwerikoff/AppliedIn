@@ -6,6 +6,7 @@ score runs later, in the tailoring worker.
 """
 
 from __future__ import annotations
+import re
 
 from core.models import JobRecord
 
@@ -15,6 +16,21 @@ from .watchlist import Preferences
 def _contains_any(haystack: str, needles: list[str]) -> bool:
     low = haystack.lower()
     return any(n.lower() in low for n in needles)
+
+def location_conflict(location: str, prefs: Preferences) -> str | None:
+    """Unknown remote scope is not a conflict; an explicit region still is."""
+    loc = location.strip().casefold()
+    if prefs.remote_only and re.search(r"\b(?:on-site|onsite|on site|hybrid)\b", loc):
+        return "remote only"
+    region = re.sub(r"\b(?:remote|on-site|onsite|on site|hybrid)\b", "", loc).strip(" ,-/()")
+    if region in ("", "unknown", "unspecified", "not specified", "anywhere", "worldwide", "global"):
+        return None
+    if prefs.locations and not any(
+            re.search(r"\b" + re.escape(p.casefold()) + r"\b", region)
+            for p in prefs.locations):
+        return "location"
+    return None
+
 
 
 def stage1_match(job: JobRecord, prefs: Preferences) -> bool:
@@ -32,12 +48,4 @@ def stage1_match(job: JobRecord, prefs: Preferences) -> bool:
     if prefs.titles and not _contains_any(job.title, prefs.titles):
         return False
 
-    if prefs.locations:
-        loc = job.location.lower()
-        remote_ok = prefs.remote_only and "remote" in loc
-        if not remote_ok and not any(p.lower() in loc for p in prefs.locations):
-            return False
-    elif prefs.remote_only and "remote" not in job.location.lower():
-        return False
-
-    return True
+    return location_conflict(job.location, prefs) is None

@@ -186,3 +186,30 @@ def test_the_rate_limit_brake_backs_off_and_recovers():
     assert throttle.note_rate_limit() == 4.0
 
     throttle._resume_at = throttle._cooldown = throttle._last_limit = 0.0
+
+
+def test_degraded_relevance_keeps_unknown_and_remote_ambiguous_locations(monkeypatch):
+    from discovery.relevance import relevant
+    import litellm
+    from core import steering
+    monkeypatch.setattr(steering, "read", lambda: {"content": ""})
+    def outage(**kwargs):
+        raise RuntimeError("synthetic relevance outage")
+    monkeypatch.setattr(litellm, "completion", outage)
+    prefs = Preferences(titles=["Engineer"], locations=["Example North"], remote_only=True)
+    jobs = [_job(loc=loc) for loc in ("", "Unknown", "Remote", "Hybrid Example North", "On-site Example South")]
+    assert relevant(jobs, prefs, model="offline") == jobs[:3]
+
+
+def test_remote_only_without_region_does_not_invent_an_onsite_requirement():
+    prefs = Preferences(remote_only=True)
+    assert stage1_match(_job(loc=""), prefs)
+    assert stage1_match(_job(loc="Example North"), prefs)
+    assert not stage1_match(_job(loc="Hybrid Example North"), prefs)
+
+
+def test_remote_label_does_not_erase_an_explicit_regional_restriction():
+    prefs = Preferences(locations=["Example North"], remote_only=True)
+    assert stage1_match(_job(loc="Remote - Example North"), prefs)
+    assert stage1_match(_job(loc="Remote - Worldwide"), prefs)
+    assert not stage1_match(_job(loc="Remote - Example South"), prefs)

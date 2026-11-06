@@ -102,6 +102,11 @@ def _trusted_posting_url(
         parts = urlsplit(raw)
     except ValueError:
         return None
+    from .canonical_job_url import claim_greenhouse_query
+    if claim_greenhouse_query(raw) and (
+            any(c in raw for c in "%#;") or "//" in parts.path
+            or any(s in (".", "..") for s in parts.path.split("/"))):
+        return None
     if parts.scheme:
         return raw if _http_url_parts(raw) is not None else None
     if not parts.path and not parts.query and not parts.netloc:
@@ -164,94 +169,56 @@ def _browser_extract(url: str, company: str, prefs: Preferences) -> list[JobReco
 
 
 
-def _greenhouse_feed_target(url: str, board: str, jid: str, wrapper_url: str) -> bool:
-    """Confirm the configured hosted identity without adopting an API URL."""
-    if not url:
-        return True
-    if url == wrapper_url:
-        return True
-    try:
-        parts = urlsplit(url)
-        return (parts.scheme == "https"
-                and parts.netloc in {"boards.greenhouse.io", "job-boards.greenhouse.io"}
-                and parts.path == f"/{board}/jobs/{jid}"
-                and not parts.query and not parts.fragment)
-    except ValueError:
-        return False
+
+
+_BOARD_SOURCE = "greenhouse_board_listing"
 
 
 def _reconcile_browser_greenhouse(company: CompanyConfig,
                                   jobs: list[JobRecord]) -> list[JobRecord]:
-    """Promote *new browser listing* identities, never static/crawl/sitemap rows.
+    """Source/tenant/feed proof for new board rows, independent of legacy apply.
 
-    A watchlist tuple supplies independently reviewed company-wide authority;
-    the actual configured-board API supplies independent posting membership.
-    Neither the model's board label nor a redirect may fill either role.
+    Re-prove at the common persistence boundary, never trust a model ATS label
+    or a previously attached discovery marker as authorization.
     """
-    if (company.discovery is not DiscoveryMode.BROWSER
-            or company.ats != "greenhouse" or not company.board or not jobs):
+    from .canonical_job_url import discovery_greenhouse_id
+    from .tenant_pin import canonical_hosted
+
+    claims = [j for j in jobs if employer_gh_claim(company, j)
+              or (company.ats == "greenhouse" and urlsplit(j.jd_url).query)]
+    if not claims:
         return jobs
-    from pathlib import Path
-
-    from core.config import get_settings
-    from tools.claude_chrome import greenhouse_alias_candidate, verified_greenhouse_alias
-    from .adapters.greenhouse import GreenhouseAdapter
-    from .watchlist import load_watchlist
-
-    try:
-        configs = load_watchlist(Path(get_settings().config_dir) / "watchlist.yaml")
-        matches = [cfg for cfg in configs
-                   if cfg.name.strip().lower() == company.name.strip().lower()]
-        if (len(matches) != 1 or matches[0].ats != "greenhouse"
-                or matches[0].discovery is not DiscoveryMode.BROWSER
-                or matches[0].board != company.board
-                or matches[0].careers_url != company.careers_url):
-            return jobs
-    except Exception as exc:
-        log.info("%s: no current unique wrapper authority (%s)", company.name, exc)
-        return jobs
-
-    board = matches[0].board
-    proposed: dict[str, list[tuple[int, JobRecord]]] = {}
-    for index, job in enumerate(jobs):
-        if job.company != company.name or not greenhouse_alias_candidate(job.jd_url):
-            continue
-        jid = urlsplit(job.jd_url).query.split("=", 1)[1]
-        pinned = job.model_copy(update={
-            "job_id": jid, "ats": "greenhouse", "greenhouse_board": board,
-        })
-        row = {"pk": pinned.pk, "company": pinned.company,
-               "job_id": pinned.job_id, "jd_url": pinned.jd_url,
-               "ats": pinned.ats, "greenhouse_board": pinned.greenhouse_board}
-        if verified_greenhouse_alias(
-                row, pk=pinned.pk, company=company.name, url=pinned.jd_url,
-                configs=configs) is not None:
-            proposed.setdefault(jid, []).append((index, pinned))
+    ordinary = [j for j in jobs if j not in claims]
+    cfg = reviewed_tuple(company.name, expected=company)
+    if cfg is None or cfg.ats != "greenhouse":
+        return ordinary
+    proposed: dict[str, list[JobRecord]] = {}
+    for job in claims:
+        jid = discovery_greenhouse_id(job.jd_url, cfg.careers_url)
+        if (jid is not None and job.company == cfg.name
+                and job.greenhouse_board in ("", cfg.board)):
+            proposed.setdefault(jid, []).append(job)
     if not proposed:
-        return jobs
-
+        return ordinary
     try:
-        with httpx.Client() as client:
-            feed = GreenhouseAdapter().fetch(matches[0], client)
-    except Exception as exc:
-        log.info("%s: configured Greenhouse jobs feed unavailable (%s)", company.name, exc)
-        return jobs
-
-    by_id: dict[str, list[JobRecord]] = {}
-    for item in feed:
-        if item.ats == "greenhouse" and item.job_id in proposed:
-            by_id.setdefault(item.job_id, []).append(item)
-    accepted = list(jobs)
+        feed = current_feed(cfg)
+    except Exception:
+        log.info("configured Greenhouse feed unavailable; no claimed rows admitted")
+        return ordinary
     for jid, variants in proposed.items():
-        witnesses = by_id.get(jid, [])
+        witnesses = [j for j in feed if j.job_id == jid]
         if len(variants) != 1 or len(witnesses) != 1:
             continue
-        index, pinned = variants[0]
-        if not _greenhouse_feed_target(
-                witnesses[0].jd_url, board, jid, pinned.jd_url):
+        proof = witnesses[0]
+        if (proof.company != cfg.name or proof.ats != "greenhouse"
+                or not (canonical_hosted(proof, "greenhouse", cfg.board, jid)
+                        or proof.jd_url == variants[0].jd_url)):
             continue
-        accepted[index] = pinned
-    return accepted
+        ordinary.append(variants[0].model_copy(update={
+            "job_id": jid, "ats": "greenhouse", "greenhouse_board": cfg.board,
+            "discovery_source": _BOARD_SOURCE, "location": proof.location,
+        }))
+    return ordinary
 
 
 _SUFFIX_SOURCE = "sitemap_greenhouse_suffix"
@@ -578,29 +545,29 @@ def _enqueue(
                              f"{undated} role(s) cannot show under Fresh. They are "
                              f"on the Pipeline board under Found."))
 
-    # A configured employer's GH query/sitemap claim is not an ordinary
-    # ats=crawl fallback. Even perfect same-ID hosted GH proof cannot grant
-    # the existing final Submit a newly canonical starting route.
-    safe_jobs = []
+    # An index is not a posting, however plausible the model's invented ID.
+    # A GH query on the same path is the sole exception here: its ID must be
+    # independently proved against the reviewed board below before any effects.
+    from .canonical_job_url import discovery_greenhouse_id
+    candidates = []
     for job in jobs:
-        gh_claim = employer_gh_claim(company, job)
-        gh_target = (company.ats == "greenhouse" and
-                     canonical_shape(job, company.board, "greenhouse"))
-        if gh_claim or gh_target:
-            reason = ("canonical_target_not_supported_by_current_guard"
-                      if (job.ats == "greenhouse" and job.greenhouse_board
-                          and gh_claim and (
-                              job.discovery_source == _SUFFIX_SOURCE or
-                              job.jd_url.endswith("?gh_jid=" + job.job_id)))
-                      or gh_target else "greenhouse_claim_unproved_or_malformed")
-            refusal = diagnostic(job, reason)
-            log.warning("%s: %s at %s; %s", company.name,
-                        refusal["status"], refusal["pk"], refusal["next_action"])
-            progress.record(note=(refusal["status"] + ": " +
-                                  refusal["next_action"])[:160])
+        target = _http_url_parts(job.jd_url)
+        if target is None or not str(job.job_id).strip():
             continue
-        safe_jobs.append(job)
-    jobs = safe_jobs
+        index = not target.path.strip("/") or any(
+            (base := _http_url_parts(url)) is not None
+            and target.hostname == base.hostname
+            and target.path.rstrip("/") == base.path.rstrip("/")
+            for url in (company.careers_url, fetched_url or company.careers_url)
+        )
+        if index and discovery_greenhouse_id(job.jd_url, company.careers_url) is None:
+            continue
+        candidates.append(job)
+    jobs = _reconcile_browser_greenhouse(company, candidates)
+    # Existing suffix/native admission and historical repair rules are unchanged.
+    jobs = [j for j in jobs if j.discovery_source == _BOARD_SOURCE or not (
+        employer_gh_claim(company, j) or (company.ats == "greenhouse"
+        and canonical_shape(j, company.board, "greenhouse")))]
     progress.record(relevant=len(jobs))
     if not jobs or progress.cancelled():
         return 0
@@ -610,6 +577,9 @@ def _enqueue(
     from tools import posting_guard as pg
 
     def merge_duplicate(job):
+        if job.discovery_source == _BOARD_SOURCE:
+            # New producer authority must never mutate historical rows on rescan.
+            return
         try:
             current = stores.tracking.get_current(job.pk)
             if (current and current.get("company") == job.company
@@ -633,7 +603,7 @@ def _enqueue(
         if job.jd_url in already:
             # A past-run URL ledger hit is still eligible for a same-pk
             # legacy repair. It remains excluded from *new* discoveries.
-            if job.discovery_source != _SUFFIX_SOURCE:
+            if job.discovery_source not in (_SUFFIX_SOURCE, _BOARD_SOURCE):
                 _repair_duplicate(company, job, stores, trusted_origin)
             merge_duplicate(job)
             continue
@@ -646,7 +616,7 @@ def _enqueue(
             new_jobs.append(job)
             enqueued += 1
         else:
-            if job.discovery_source != _SUFFIX_SOURCE:
+            if job.discovery_source not in (_SUFFIX_SOURCE, _BOARD_SOURCE):
                 _repair_duplicate(company, job, stores, trusted_origin)
             merge_duplicate(job)
     if new_jobs:
@@ -769,9 +739,7 @@ def crawl_company(
         # The explicit browser mode retains #118's existing query-form behavior.
         # On the configured crawl exception, even a fallback browser listing
         # cannot revive a PK disputed by the ordinary sitemap.
-        if force_browser:
-            found = _reconcile_browser_greenhouse(company, found)
-        elif verified_suffix:
+        if not force_browser and verified_suffix:
             found = _reconcile_suffix(
                 company, found, verified_suffix, conflicted_pks=conflicted_pks,
             )
@@ -831,6 +799,16 @@ def crawl_company(
             # Only fresh extractor output is changed: never repair stored rows.
             job.jd_url = normalized
             extracted.append(job)
+    # The deterministic visible-link manifest, not an extractor's invented
+    # address, supplies the original employer posting observation.
+    manifest = guarded_page["extractor_text"].partition(
+        "VISIBLE POSTING LINKS (validated title/url pairs):\n")[2]
+    try:
+        observed = {item["url"] for item in json.loads(manifest)}
+    except (ValueError, KeyError, TypeError):
+        observed = set()
+    extracted = [job for job in extracted
+                 if not employer_gh_claim(company, job) or job.jd_url in observed]
 
     extracted = _reconcile_suffix(
         company, extracted, verified_suffix, conflicted_pks=conflicted_pks,

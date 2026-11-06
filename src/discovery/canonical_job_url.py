@@ -90,6 +90,43 @@ def literal_gh_id(url: object) -> str | None:
     return query.split("=", 1)[1]
 
 
+def discovery_greenhouse_id(url: str, careers_url: str) -> str | None:
+    """New producer grammar only; historical pin/repair and consumers stay strict."""
+    from .tenant_pin import _parts
+
+    if not url.startswith("https://") or "#" in url:
+        return None
+    p = _parts(url)
+    source = _parts(careers_url.rstrip("/") + "/")
+    if (p is None or source is None or source.query or source.fragment
+            or p.netloc != source.netloc or p.fragment or not p.query
+            or len(p.query) > 512 or not p.query.isascii()
+            or p.path.endswith("/") and p.path != "/"):
+        return None
+    scope = source.path.rstrip("/")
+    if scope and not (p.path == scope or p.path.startswith(scope + "/")):
+        return None
+    allowed = {"src", "locale", "utm_source", "utm_medium", "utm_campaign"}
+    values = {}
+    for token in p.query.split("&"):
+        key, sep, value = token.partition("=")
+        if not sep or key in values:
+            return None
+        if key == "gh_jid":
+            if re.fullmatch(r"[0-9]{1,20}", value) is None:
+                return None
+        elif key not in allowed or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) is None:
+            return None
+        values[key] = value
+    jid = values.get("gh_jid")
+    if jid is None or len(values) > 6:
+        return None
+    suffix = re.search(r"(?:/|-)([0-9]+)$", p.path)
+    if suffix and suffix.group(1) != jid:
+        return None
+    return jid
+
+
 def canonical_shape(job: JobRecord, board: str, ats: str, *,
                     careers_url: str = "") -> bool:
     """Literal ATS target or employer-host URL with same-ID Greenhouse proof."""

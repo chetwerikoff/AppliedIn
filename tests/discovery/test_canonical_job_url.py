@@ -122,6 +122,7 @@ def test_browser_and_producer_share_bounded_attempt_classification(query, expect
 
 @pytest.mark.parametrize("query", [
     "gh_jid=731205&ref=1", "GH_JID=731205", "gh_jid=",
+    "src=list&gh_jid=731205&locale=en",
     "gh_jid=bogus", "gh_jid=731205&gh_jid=731205",
     "gh%5Fjid=731205", "gh_jid=%37%33%31%32%30%35",
 ])

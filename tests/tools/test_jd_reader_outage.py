@@ -272,6 +272,11 @@ def test_second_guard_after_successful_metadata_patch(monkeypatch, kind):
     stores = SimpleNamespace(tracking=tracking)
     text = "Error page" if kind == "unreadable" else "We do not sponsor visas. " + GOOD
 
+    # AC1: the posting's refusal alone is no longer applicant-side evidence.
+    from core import steering
+    from discovery.watchlist import Preferences
+    monkeypatch.setattr(steering, "read", lambda: {"content": "sponsorship: required"})
+    monkeypatch.setattr(run, "_effective_prefs", lambda co: Preferences())
     async def read(row, **kw):
         return text
 
@@ -485,12 +490,13 @@ def test_review_only_generic_ready_gate_never_creates_submission_authority(
 
     result = run._run(run._drive_async(
         ReviewRunner(), pk, SimpleNamespace(), stores, prepare_only=True))
-    assert result["result"] == "gated"
-    assert tracking.get(pk)["status"] == "tailored"
-    assert tracking.get(pk)["apply_requested_at"] == requested
+    # AC5: a generic ready claim with only an old PDF cannot authorize a gate.
+    assert result["result"] == "failed" and result["reason"] == "no_resume"
+    assert tracking.get(pk)["status"] == "failed"
+    assert not tracking.get(pk)["apply_requested_at"]
     queue = ApplyQueue(tracking.r)
     pending = [it for it in queue.pending() if it["pk"] == pk]
-    assert bool(pending) is bool(requested)
+    assert pending == []
     assert all(ev[0] != "applied" for ev in emits)
 
 
@@ -832,7 +838,8 @@ def test_jd_attention_retry_invalidates_old_pdf_without_new_save(monkeypatch):
     assert result["result"] == "failed" and result["reason"] == "no_resume"
     assert row["resume_s3_key"] == ""
     assert row["resume_seed"] == "synthetic-existing-seed"
-    assert row["apply_requested_at"] == request
+    # AC5: failed preparation clears the old request instead of reviving dispatch.
+    assert not row["apply_requested_at"]
     assert row["jd_read_prepare_only"] is True
     assert ApplyQueue(tracking.r).pending() == []
     assert row["status"] == "failed"

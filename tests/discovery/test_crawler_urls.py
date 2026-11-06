@@ -992,3 +992,69 @@ def test_plain_relative_query_exact_careers_resolution_without_new_path_logic(
     assert offline_pipeline.screened == [expected]
     assert offline_pipeline.marks == [[expected]]
     assert len(stores.queue.calls) == 1
+
+
+@pytest.mark.parametrize("path", ["/careers", "/careers/", "/careers?search=engineer",
+                                  "/careers?filter=remote", "/careers?jobId=123", "/"] )
+@pytest.mark.parametrize("source", ["static", "sitemap", "browser"])
+def test_careers_index_is_refused_before_ledger_even_with_fabricated_ids(
+    offline_pipeline, monkeypatch, path, source,
+ ):
+    from tools import seen
+    stores = _Stores()
+    company = _company("https://example.test/" if path == "/" else "https://example.test/careers")
+    target = "https://example.test" + path
+    monkeypatch.setattr(seen, "load", lambda: pytest.fail("index reached ledger"))
+    jobs = [_job(target, "invented-title"), _job(target, "123")]
+    if source == "static":
+        with _static_client() as client:
+            count = crawler.crawl_company(company, Preferences(), stores, client=client,
+                                           extractor=lambda *a: jobs)
+    elif source == "sitemap":
+        monkeypatch.setattr(crawler, "sitemap_jobs", lambda *a: jobs)
+        count = crawler._listed_in_sitemap(company, Preferences(), stores)
+    else:
+        monkeypatch.setattr(crawler, "_browser_extract", lambda *a: jobs)
+        company = _company(company.careers_url, DiscoveryMode.BROWSER)
+        count = crawler.crawl_company(company, Preferences(), stores)
+    assert count == 0
+    assert stores.tracking.put_calls == stores.queue.calls == offline_pipeline.marks == []
+
+
+def test_fetched_listing_path_cannot_be_renamed_into_a_detail(offline_pipeline, monkeypatch):
+    from tools import seen
+    stores = _Stores()
+    monkeypatch.setattr(seen, "load", lambda: pytest.fail("redirect index reached ledger"))
+    assert crawler._enqueue(_company(), [_job("https://example.test/dept/listings?search=python")],
+        stores, fetched_url="https://example.test/dept/listings/") == 0
+    assert stores.tracking.put_calls == stores.queue.calls == []
+
+
+@pytest.mark.parametrize("source", ["static", "sitemap", "browser"])
+def test_distinct_observed_detail_keeps_stable_pk_and_deduplicates(offline_pipeline, monkeypatch, source):
+    stores = _Stores()
+    detail = "https://example.test/careers/jobs/123"
+    if source == "static":
+        with _static_client(lambda req: httpx.Response(200, text='<a href="/careers/jobs/123">Engineer</a>')) as client:
+            for expected in (1, 0):
+                assert crawler.crawl_company(_company(), Preferences(), stores, client=client,
+                    extractor=lambda *a: [_job("/careers/jobs/123")]) == expected
+    elif source == "sitemap":
+        monkeypatch.setattr(crawler, "sitemap_jobs", lambda *a: [_job(detail)])
+        for expected in (1, 0):
+            assert crawler._listed_in_sitemap(_company(), Preferences(), stores) == expected
+    else:
+        monkeypatch.setattr(crawler, "_browser_extract", lambda *a: [_job(detail)])
+        for expected in (1, 0):
+            assert crawler.crawl_company(_company(mode=DiscoveryMode.BROWSER), Preferences(), stores) == expected
+    assert set(stores.tracking.rows) == {"example-co#123"}
+    assert stores.tracking.rows["example-co#123"].jd_url == detail
+    assert len(stores.queue.calls) == 1
+
+
+def test_root_is_not_a_detail_when_configured_listing_has_a_path(offline_pipeline, monkeypatch):
+    from tools import seen
+    stores = _Stores()
+    monkeypatch.setattr(seen, "load", lambda: pytest.fail("homepage reached ledger"))
+    assert crawler._enqueue(_company(), [_job("https://example.test/?search=engineer", "fabricated")], stores) == 0
+    assert stores.tracking.put_calls == stores.queue.calls == []

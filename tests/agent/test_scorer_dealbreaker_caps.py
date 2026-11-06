@@ -1,4 +1,4 @@
-"""Offline scorer cap checks: quote membership, not semantic eligibility.
+"""Offline two-sided eligibility checks: model labels are not proof.
 
 Test User and example-co are synthetic. Real ADK fake models exercise both
 normal and prepare-only graphs; no browser, Redis, queue, or submission runs.
@@ -30,6 +30,7 @@ GENERIC_AUTH_JD = (
     "example-co reviews applications based on skills and relevant experience."
 )
 AUTH_QUOTE = "Applicants should confirm their right to work in their local region."
+_effective_prefs = R._effective_prefs
 
 
 def _payload(score=8, *, kind=None, quote=None, include_quote=True):
@@ -133,11 +134,11 @@ def test_verified_quote_projects_effective_score_after_raw_witness(
     assert len(witnessed) == 1
     raw_text, forwarded = witnessed[0]
     assert json.loads(raw_text)["score"] == 8  # unchanged ADK model witness
-    assert forwarded["score"] == 3              # after validation, before yield
+    assert forwarded["score"] == 8  # a quote alone cannot prove a conflict
     assert forwarded["dealbreaker"]["kind"] == kind
-    assert h.next.observed == [3]  # the next ADK agent sees effective score
-    assert h.stores.tracking.row["match_score"] == 3
-    assert h.saved[0]["match_score"] == 3  # existing persisted score
+    assert h.next.observed == [8]
+    assert h.stores.tracking.row["match_score"] == 8
+    assert h.saved[0]["match_score"] == 8
 
 
 @pytest.mark.parametrize("kind", ["location", "other"])
@@ -145,10 +146,9 @@ def test_code_cap_reaches_ordinary_shortlist_threshold(harness, kind):
     h = harness
     h.fake.scripted = [_response(_payload(kind=kind, quote=GOOD_QUOTE))]
     result = _run(h)
-    assert result["result"] == "skipped"
-    assert h.stores.tracking.row["skip_reason"] == "low_score"
-    assert h.stores.tracking.row["match_score"] == 3
-    assert h.next.observed == []  # skip before tailoring or approvals
+    assert result["result"] != "skipped"
+    assert h.stores.tracking.row["match_score"] == 8
+    assert h.next.observed == [8]
     assert len(h.fake.requests) == 1
 
 
@@ -235,7 +235,7 @@ def test_authorization_claim_never_adds_code_cap(
 
 
 def test_substantive_quote_can_be_misclassified_by_model(harness, monkeypatch):
-    # This is an acknowledged limitation, not semantic proof of incompatibility.
+    # Misclassification cannot turn a neutral posting quote into exclusion.
     source = JD + " Our teams collaborate across multiple international locations."
     _fresh_scorer_state(monkeypatch, source)
     h = harness
@@ -243,7 +243,7 @@ def test_substantive_quote_can_be_misclassified_by_model(harness, monkeypatch):
         kind="other", quote="Our teams collaborate across multiple international locations."
     ))]
     _run(h)
-    assert h.stores.tracking.row["match_score"] == 3
+    assert h.stores.tracking.row["match_score"] == 8
 
 
 def test_lower_raw_fit_is_never_raised_by_a_cap(harness):
@@ -265,8 +265,165 @@ def test_explicit_sponsorship_refusal_stops_before_scorer(harness, monkeypatch):
         return pg.analyze(refusal_jd)
 
     monkeypatch.setattr(R, "_jd_meta", denied)
+    from core import steering
+    monkeypatch.setattr(steering, "read", lambda: {"content": "sponsorship: required"})
     result = _run(h)
-    assert result["reason"] == "no_sponsorship"
+    assert result["reason"] == "eligibility conflict: sponsorship"
     assert h.fake.requests == []  # no model invoked
     assert h.next.observed == []
-    assert h.stores.tracking.row["status"] == Status.FAILED.value
+    assert h.stores.tracking.row["status"] == Status.SKIPPED.value
+
+
+@pytest.mark.parametrize("private", [
+    "", "Please consider visa-friendly roles.", "sponsorship: not required",
+    "not sponsorship: required", "sponsorship: maybe required",
+    "sponsorship: required\nsponsorship: not required",
+    "sponsorship: required\nI do not require sponsorship.",
+])
+def test_no_sponsorship_posting_preserved_without_unambiguous_private_need(harness, monkeypatch, private):
+    from core import steering
+    from discovery.watchlist import Preferences
+    from tools import posting_guard as pg
+    h = harness
+    monkeypatch.setattr(steering, "read", lambda: {"content": private})
+    # Tracked notes must not establish the private requirement.
+    monkeypatch.setattr(R, "_effective_prefs", lambda company: Preferences(notes="sponsorship: required"))
+    async def read(_row):
+        return pg.analyze(JD + " No visa sponsorship is available.")
+    monkeypatch.setattr(R, "_jd_meta", read)
+    h.fake.scripted = [_response(_payload(score=9, kind="authorization", quote=AUTH_QUOTE))]
+    result = _run(h)
+    assert result.get("reason") != "eligibility conflict: sponsorship"
+    assert h.next.observed == [9]
+
+
+@pytest.mark.parametrize("family,private,posting,conflict", [
+    ("work authorization", "work authorization: not authorized in example north",
+     "Must already be authorized to work in example north.", True),
+    ("work authorization", "work authorization: not authorized in example south",
+     "Must already be authorized to work in example north.", False),
+    ("work authorization", "work authorization: authorized only in example south",
+     "Must already be authorized to work in example north.", True),
+    ("work authorization", "work authorization: authorized only in example north",
+     "Must already be authorized to work in example north.", False),
+    ("residence", "residence: not resident in example north",
+     "Must currently reside in example north.", True),
+    ("residence", "residence: only in example south",
+     "Must currently reside in example north.", True),
+    ("residence", "residence: only in example north",
+     "Must currently reside in example north.", False),
+    ("residence", "", "Must currently reside in example north.", False),
+    ("work authorization", "work authorization: not authorized in example north",
+     "Applicants should review local right-to-work rules.", False),
+    ("work authorization", "work authorization: not authorized in example north\nwork authorization: authorized only in example north",
+     "Must already be authorized to work in example north.", False),
+    ("work authorization", "work authorization: authorized only in example north",
+     "Must already be authorized to work in example north or example south.", False),
+    ("residence", "residence: only in example north and example south",
+     "Must currently reside in example south.", False),
+    ("residence", "residence: only in example south",
+     "Must currently reside in example north unless relocating.", False),
+])
+def test_private_and_posting_constraint_pair_before_any_tailor(harness, monkeypatch, family, private, posting, conflict):
+    from core import steering
+    from tools import posting_guard as pg
+    h = harness
+    monkeypatch.setattr(steering, "read", lambda: {"content": private})
+    async def read(_row):
+        return pg.analyze(JD + " " + posting)
+    monkeypatch.setattr(R, "_jd_meta", read)
+    h.stores.tracking.row["score_override"] = True
+    h.fake.scripted = [_response(_payload(score=9))]
+    result = _run(h)
+    if conflict:
+        assert result == {"result": "skipped", "pk": h.pk, "reason": "eligibility conflict: " + family}
+        assert h.next.observed == h.fake.requests == []
+    else:
+        assert h.next.observed == [9]
+
+
+@pytest.mark.parametrize("location,remote,locations,conflict", [
+    ("", True, ["Example North"], False),
+    ("Remote", True, ["Example North"], False),
+    ("Hybrid, Example North", True, ["Example North"], True),
+    ("On-site, Example North", True, [], True),
+    ("Example South", False, ["Example North"], True),
+    ("Example North", False, ["Example North"], False),
+    ("Remote - Example South", True, ["Example North"], True),
+    ("Remote - Example North", True, ["Example North"], False),
+    ("Remote - Worldwide", True, ["Example North"], False),
+])
+def test_typed_location_evidence_is_independent_of_model_score(harness, monkeypatch, location, remote, locations, conflict):
+    from discovery.watchlist import Preferences
+    h = harness
+    h.stores.tracking.row.update(location=location, score_override=True)
+    monkeypatch.setattr(R, "_effective_prefs", lambda co: Preferences(locations=locations, remote_only=remote))
+    h.fake.scripted = [_response(_payload(score=9))]
+    result = _run(h)
+    assert (result.get("result") == "skipped") is conflict
+    assert h.next.observed == ([] if conflict else [9])
+
+
+@pytest.mark.parametrize("url", [
+    "https://myworkdayjobs.com/login",
+    "https://tenant.myworkdaysite.com/recruiting/test/jobs/account",
+    "https://tenant.myworkdayjobs.com/candidateHome",
+    "https://taleo.net/careersection/external/login.ftl",
+    "https://tenant.taleo.net/careersection/2/register.ftl",
+    "https://icims.com/profile", "https://tenant.icims.com/jobs/42/login",
+    "https://successfactors.com/candidateprofile",
+    "https://tenant.successfactors.eu/myprofile",
+])
+def test_account_portal_policy_precedes_throwing_reader(harness, monkeypatch, url):
+    h = harness
+    h.stores.tracking.row["jd_url"] = url
+    async def forbidden(_row):
+        pytest.fail("portal policy must precede the reader")
+    monkeypatch.setattr(R, "_jd_meta", forbidden)
+    assert _run(h) == {"result": "skipped", "pk": h.pk, "reason": "account portal"}
+    assert h.stores.tracking.row["skip_reason"] == "account portal"
+    assert h.next.observed == h.fake.requests == []
+
+
+@pytest.mark.parametrize("url", [
+    "https://tenant.myworkdayjobs.com/External/job/Example/REQ-42",
+    "https://taleo.net/careersection/external/jobdetail.ftl?job=42",
+    "https://tenant.icims.com/jobs/42/job",
+    "https://successfactors.eu/career?career_job_req_id=42",
+    "https://myworkdayjobs.com.example.test/login",
+    "https://notmyworkdayjobs.com/login",
+    "https://example.test/login", "http://myworkdayjobs.com/login",
+    "https://myworkdayjobs.com/jobs/login-engineer",
+])
+def test_public_and_deceptive_portal_urls_keep_ordinary_pipeline(harness, url):
+    h = harness
+    h.stores.tracking.row["jd_url"] = url
+    h.fake.scripted = [_response(_payload())]
+    _run(h)
+    assert h.next.observed == [8]
+
+
+@pytest.mark.parametrize("overrides,conflict", [
+    ({}, True),
+    ({"locations": ["Example South"], "remote_only": False}, False),
+])
+def test_current_jd_location_uses_company_over_global_typed_constraints(harness, monkeypatch, overrides, conflict):
+    from core import flags
+    from discovery.watchlist import Preferences
+    from tools import posting_guard as pg
+    h = harness
+    global_prefs = Preferences(locations=["Example North"], remote_only=True)
+    monkeypatch.setattr(R, "_global_prefs", lambda: global_prefs)
+    monkeypatch.setattr(R, "_effective_prefs", _effective_prefs)
+    monkeypatch.setattr(flags, "company_pref", lambda company: overrides)
+    h.stores.tracking.row.update(location="Unknown", score_override=True)
+    async def current_jd(_row):
+        return pg.analyze(JD + "\nLocation: Hybrid, Example South.")
+    monkeypatch.setattr(R, "_jd_meta", current_jd)
+    h.fake.scripted = [_response(_payload(score=9))]
+    out = _run(h)
+    assert (out["result"] == "skipped") is conflict
+    assert h.next.observed == ([] if conflict else [9])
+    assert global_prefs.locations == ["Example North"] and global_prefs.remote_only
+    if not conflict:
+        assert "Synthetic steering: no invented claims" in _material(h.fake.requests[0])

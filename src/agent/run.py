@@ -522,7 +522,8 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
         if (result or {}).get("result") == "prepared":
             try:
                 current = stores.tracking.get(pk) or {}
-                if current.get("apply_requested_at") and not _historical_relative(current):
+                if (current.get("apply_requested_at") and not _historical_relative(current)
+                        and not _board_preparation(current)):
                     # Request authority is checked AGAIN inside the queue entry.
                     # The first GET can race a cancellation in any prepare-only
                     # mode, not just a JD-attention recovery.
@@ -548,7 +549,9 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     # Original relative URLs can only be processed by the review agent, even
     # after a verified operational read and an earlier application request.
     prepare_only = bool(prepare_only or _historical_relative(row)
-                        or guard_recovery is not None)
+                        or guard_recovery is not None or _board_preparation(row))
+    if _account_portal(row.get("jd_url", "")):
+        return _preparation_skip(pk, row, stores, "account portal")
     try:
         jd_meta = await (_jd_meta(row, fresh=True) if guard_recovery is not None
                          else _jd_meta(row))
@@ -700,22 +703,12 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
              url=row.get("jd_url"))
         return {"result": "failed", "pk": pk, "reason": "no_jd"}
 
-    if _no_sponsorship(jd_text):
-        try:
-            check = _reader_check(pk, row, stores)
-            if check:
-                return check
-            committed, _ = _reader_patch(pk, row, stores, {
-                "status": Status.FAILED, "fail_reason": _NO_SPONSOR_REASON,
-                "skip_reason": "no_sponsorship"})
-        except Exception as exc:
-            return _reader_storage_error(pk, stores, row, exc)
-        if not committed:
-            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
-        from core.events import emit
-        emit("failed", pk=pk, detail="no visa sponsorship — closed",
-             url=row.get("jd_url"))
-        return {"result": "failed", "pk": pk, "reason": "no_sponsorship"}
+    from core import steering
+    conflict = _eligibility_conflict(
+        jd_text, row.get("location") or "",
+        _effective_prefs(row.get("company", "")), steering.read()["content"])
+    if conflict:
+        return _preparation_skip(pk, row, stores, conflict)
 
     try:
         check = _reader_check(pk, row, stores)
@@ -762,7 +755,7 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     from .graph import ScorerInvalidOutput
 
     try:
-        extra = {"no_enqueue": True} if guard_recovery is not None else {}
+        extra = {"no_enqueue": True} if guard_recovery is not None or _board_preparation(row) else {}
         result = await _drive_async(runner, pk, msg, stores,
                                     prepare_only=prepare_only, **extra)
     except ScorerInvalidOutput:
@@ -780,8 +773,10 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     # The writer gets the current validated score, never the pre-run row's
     # historical score (which could describe a different evaluation).
     current = stores.tracking.get(pk) or {}
-    _save_output(pk, {**row, "match_score": current.get("match_score")},
-                 jd_text, stores)
+    output = {**row, **current}
+    if result.get("result") not in ("prepared", "gated", "queued_apply"):
+        output.update(resume_tex_key="", resume_s3_key="")
+    _save_output(pk, output, jd_text, stores)
     return result
 
 
@@ -1238,6 +1233,108 @@ def _no_sponsorship(jd_text: str) -> bool:
     norm = " ".join(jd_text.lower().split())
     return any(p in norm for p in _NO_SPONSOR_PHRASES)
 
+def _account_portal(url: str) -> bool:
+    """Bounded URL policy, not a claim that an authentication wall was seen."""
+    from urllib.parse import urlsplit
+    if not isinstance(url, str) or not url.startswith("https://"):
+        return False
+    if any(c.isspace() or c in "\\%" for c in url):
+        return False
+    try:
+        p = urlsplit(url)
+        if not p.hostname or p.netloc != p.hostname or p.fragment:
+            return False
+    except ValueError:
+        return False
+    host = p.hostname
+    def vendor(*domains):
+        return any(host == d or host.endswith("." + d) for d in domains)
+    path = p.path.rstrip("/").lower()
+    if vendor("myworkdaysite.com", "myworkdayjobs.com"):
+        return bool(re.search(r"/(?:login|signin|account|candidatehome)(?:/|$)", path))
+    if vendor("taleo.net"):
+        return bool(re.fullmatch(r"/careersection/(?:[^/]+/)+(?:login|register|myjobpage)\.ftl", path))
+    if vendor("icims.com"):
+        return bool(re.fullmatch(r"/(?:login|profile|account)(?:/.*)?|/jobs/[^/]+/(?:login|account|profile)(?:/.*)?", path))
+    if vendor("successfactors.com", "successfactors.eu"):
+        return bool(re.fullmatch(r"/(?:login|account|candidateprofile|myprofile)(?:/.*)?", path))
+    return False
+
+
+def _preparation_skip(pk: str, row: dict, stores: Any, reason: str) -> dict:
+    check = _reader_check(pk, row, stores)
+    if check:
+        return check
+    ok, _ = _reader_patch(pk, row, stores, {
+        "status": Status.SKIPPED, "skip_reason": reason,
+        "gate_reason": "", "gate_pending": {}, "apply_requested_at": "",
+    })
+    if not ok:
+        return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+    return {"result": "skipped", "pk": pk, "reason": reason}
+
+
+def _private_constraint(content: str, family: str) -> str | None:
+    """Only complete explicit lines; one ambiguous/contradictory line is unknown.
+
+    This deliberately small recognition grammar is not a general prose parser.
+    Values remain runtime-only, and are never used in diagnostics.
+    """
+    lines = [line.strip().casefold() for line in content.splitlines()
+             if family in line.casefold()]
+    if not lines:
+        return None
+    if family == "sponsorship":
+        allowed = r"sponsorship: (required|not required)"
+    elif family == "work authorization":
+        allowed = r"work authorization: ((?:not authorized in|authorized only in) [a-z][a-z -]{1,60})"
+    else:
+        allowed = r"residence: ((?:only in|not resident in) [a-z][a-z -]{1,60})"
+    values = set()
+    for line in lines:
+        match = re.fullmatch(allowed, line)
+        if match is None or re.search(
+                r"\b(?:maybe|unless|or|and|unknown|not sure|anywhere|worldwide)\b", match[1]):
+            return None
+        values.add(match[1])
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def _eligibility_conflict(jd: str, location: str, prefs: Any, steering: str) -> str | None:
+    """Prove both sides before scoring; raw fit/override cannot bypass this."""
+    text = " ".join(jd.casefold().split())
+    sponsorship = _private_constraint(steering, "sponsorship")
+    if sponsorship == "required" and _no_sponsorship(jd):
+        return "eligibility conflict: sponsorship"
+    for family, pattern in (
+        ("work authorization", r"(?:must (?:already )?be (?:legally )?authorized to work|existing right to work (?:is )?required) in ([a-z][a-z -]{1,60})(?=[.;]|$)"),
+        ("residence", r"(?:must (?:currently )?(?:reside|live) in|residence (?:is )?required in) ([a-z][a-z -]{1,60})(?=[.;]|$)"),
+    ):
+        constraint = _private_constraint(steering, family)
+        if not constraint:
+            continue
+        for required in re.findall(pattern, text):
+            required = required.strip()
+            if re.search(r"\b(?:or|and|unless|maybe|anywhere|worldwide)\b", required):
+                continue
+            only = "authorized only in " if family == "work authorization" else "only in "
+            negative = "not authorized in " if family == "work authorization" else "not resident in "
+            if ((constraint.startswith(only) and constraint[len(only):] != required)
+                    or constraint == negative + required):
+                return "eligibility conflict: " + family
+    from discovery.filters import location_conflict
+    loc = location.strip().casefold()
+    if loc in ("", "unknown", "unspecified", "not specified"):
+        found = re.search(r"(?:^|\n)location: ([^\n.;]+)", jd, re.I)
+        loc = found[1].strip().casefold() if found else loc
+    reason = location_conflict(loc, prefs)
+    return "eligibility conflict: " + reason if reason else None
+
+
+def _board_preparation(row: dict) -> bool:
+    return row.get("discovery_source") == "greenhouse_board_listing"
+
+
 
 def _save_output(pk: str, row: dict, jd_text: str, stores: Any) -> None:
     """Drop the JD + tailored résumé into output/<stamp>_<company>_<id>/."""
@@ -1245,11 +1342,11 @@ def _save_output(pk: str, row: dict, jd_text: str, stores: Any) -> None:
 
     tex = pdf = None
     try:
-        tex = stores.artifacts.get(f"resumes/{pk}.tex").decode()
+        tex = stores.artifacts.get(row["resume_tex_key"]).decode()
     except Exception:
         pass
     try:
-        pdf = stores.artifacts.get(f"resumes/{pk}.pdf")
+        pdf = stores.artifacts.get(row["resume_s3_key"])
     except Exception:
         pass
     write_job_output(pk, company=row.get("company", ""), title=row.get("title", ""),
@@ -1484,8 +1581,10 @@ async def _tailor_only(pk: str, state: dict, title: str, company: str) -> None:
     runner = Runner(agent=tailor, app_name=_APP, session_service=sessions)
     msg = types.Content(role="user", parts=[types.Part(
         text=f"Tailor the résumé for {title} at {company}.")])
-    async for _ in runner.run_async(user_id=_USER, session_id=sid, new_message=msg):
-        pass
+    async for event in runner.run_async(user_id=_USER, session_id=sid, new_message=msg):
+        for response in event.get_function_responses() or []:
+            if response.name == "save_tailored_resume":
+                _observe_pdf(response.response)
 
 
 def retailor(pk: str, note: str | None = None, stores: Any = None) -> dict:
@@ -1537,53 +1636,90 @@ def retailor(pk: str, note: str | None = None, stores: Any = None) -> dict:
         log.warning("refusing to re-tailor %s (%s)", pk, status)
         return {"result": "refused", "pk": pk, "status": status, "reason": why}
 
-    if note is not None:
-        # Keep the row exactly where it is. A queued row that gets a note must not
-        # fall out of the queue or lose its approval.
-        stores.tracking.set_status(pk, status or Status.FOUND, tailor_note=note.strip())
-        row = stores.tracking.get(pk) or row
-
+    if status == "tailoring":
+        return {"result": "refused", "pk": pk, "reason": "preparation_in_progress"}
+    if _active_apply_lease(pk, stores) is not False:
+        return {"result": "refused", "pk": pk, "reason": "apply_in_flight_or_unknown"}
+    pending = _pending_apply_item(pk, stores)
+    if pending is None:
+        return _pending_refusal(pk, pending)
+    if not _claim(pk, stores):
+        return {"result": "already_running", "pk": pk}
     try:
-        inspected = _run(_jd_meta(row))
+        check = _reader_check(pk, row, stores)
+        if check:
+            return check
+        if pending:
+            inspector = stores.queue
+            if not callable(getattr(inspector, "remove", None)):
+                from core.apply_queue import ApplyQueue
+                inspector = ApplyQueue(stores.tracking.r)
+            if not inspector.remove(pk):
+                return {"result": "refused", "pk": pk, "reason": "pending_withdrawal_lost"}
+        # Removal can lose to next(); never assert cancellation of leased work.
+        if (_active_apply_lease(pk, stores) is not False
+                or _pending_apply_item(pk, stores) is not False):
+            return {"result": "refused", "pk": pk, "reason": "apply_dispatch_not_withdrawn"}
+        check = _reader_check(pk, row, stores)
+        if check:
+            return check
+        ok, admitted = _reader_patch(pk, row, stores, {
+            "status": Status.TAILORING, "gate_reason": "", "gate_pending": {},
+            "gate_call_id": "", "gate_source": "", "apply_requested_at": "",
+            **({"tailor_note": note.strip()} if note is not None else {}),
+        })
+        if not ok:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+        return _run(_retailor_preparation(pk, admitted, stores))
+    finally:
+        _release(pk, stores)
+
+
+async def _retailor_preparation(pk: str, row: dict, stores: Any) -> dict:
+    from .graph import _PDF_INVOCATION
+    from core import steering
+    from tools import posting_guard as pg
+
+    invocation = {"row": row, "stores": stores, "retailor": True}
+    token = _PDF_INVOCATION.set(invocation)
+    try:
+        if _account_portal(row.get("jd_url", "")):
+            return _preparation_skip(pk, row, stores, "account portal")
+        inspected = await _jd_meta(row)
         updated = _commit_posting_meta(pk, row, inspected, stores)
         if updated is None:
             return {"result": "conflict", "pk": pk, "reason": "posting_guard_state_changed"}
-        row = updated
-        jd_text = row.get("jd_text") or ""
+        invocation["row"] = updated
+        jd = updated.get("jd_text") or ""
+        conflict = _eligibility_conflict(jd, updated.get("location") or "",
+            _effective_prefs(updated.get("company", "")), steering.read()["content"])
+        if conflict:
+            return _preparation_skip(pk, updated, stores, conflict)
+        await _tailor_only(pk, _session_state(updated, jd),
+                           pg.analyze(updated.get("title", ""))["text"],
+                           updated.get("company", ""))
+        problem = _pdf_problem(pk, stores)
+        if problem:
+            return problem
+        problem = _pdf_patch(pk, stores, {
+            "status": Status.TAILORED, "retailored_at": _utc_now().isoformat()})
+        if problem:
+            return problem
+        return {"result": "ok", "pk": pk,
+                "resume_key": invocation["row"]["resume_s3_key"],
+                "note": invocation["row"].get("tailor_note", "")}
     except Exception:
-        log.exception("re-tailor could not establish a guarded posting for %s", pk)
-        return {"result": "gated", "pk": pk, "reason": "posting_guard_review_required"}
-    if not jd_text.strip():
-        return {"result": "no_jd", "pk": pk}
-
-    state = _session_state(row, jd_text)
-    log.info("re-tailoring %s%s", pk,
-             " with the owner's note" if state["tailor_note"] else "")
-    # Show it working. A click that changes nothing on screen reads as a dead
-    # button — the same complaint the gate answer produced. TAILORING is a real
-    # pipeline status the board already renders as in-progress, so the card moves
-    # to the tailoring view for the duration and the button can show it is busy.
-    #
-    # BORROWED, not reset: the row keeps its queue entry and gets its own status
-    # back at the end. A queued row that gets a note must not fall out of the
-    # queue or lose its approval, and one left on `tailoring` by a failure would
-    # have no Apply button and no way back.
-    stores.tracking.set_status(pk, Status.TAILORING)
-    try:
-        from tools import posting_guard as pg
-        _run(_tailor_only(pk, state, pg.analyze(row.get("title", ""))["text"],
-                          row.get("company", "")))
-    except Exception as exc:  # noqa: BLE001 — the status must come back regardless
-        stores.tracking.set_status(pk, status or Status.FOUND)
-        log.exception("re-tailor failed for %s", pk)
-        return {"result": "error", "pk": pk, "reason": str(exc)}
-    from datetime import datetime, timezone
-    stores.tracking.set_status(pk, status or Status.FOUND,
-                               retailored_at=datetime.now(timezone.utc).isoformat())
-    after = stores.tracking.get(pk) or {}
-    return {"result": "ok", "pk": pk,
-            "resume_key": after.get("resume_s3_key", ""),
-            "note": state["tailor_note"]}
+        log.exception("re-tailor preparation failed")
+        detail = "Re-tailoring did not complete. Retry preparation; prior artifacts are retained."
+        problem = _pdf_patch(pk, stores, {
+            "status": Status.ERROR, "fail_kind": "retailor_failed",
+            "error": detail, "fail_reason": detail,
+            "gate_reason": "", "gate_pending": {}, "gate_call_id": "",
+            "gate_source": "", "apply_requested_at": "",
+        })
+        return problem or {"result": "error", "pk": pk, "reason": "retailor_failed"}
+    finally:
+        _PDF_INVOCATION.reset(token)
 
 
 def _consume_direct_gate(pk: str, row: dict, stores: Any, *, skip: bool = False,
@@ -2884,7 +3020,88 @@ def _auto_decision(pk: str, stores: Any) -> str:
     return "go"
 
 
+def _observe_pdf(response: Any) -> None:
+    from .graph import _PDF_INVOCATION
+    invocation = _PDF_INVOCATION.get()
+    if invocation is None:
+        return
+    invocation["attempted"] = True
+    if (isinstance(response, dict) and response.get("ok") is True
+            and response.get("format") == "pdf"
+            and response == invocation.get("saved")):
+        invocation["observed"] = dict(response)
+
+
+def _pdf_problem(pk: str, stores: Any) -> dict | None:
+    """A current tool response, committed bytes and the same row generation."""
+    import hashlib
+    from .graph import _PDF_INVOCATION
+    invocation = _PDF_INVOCATION.get()
+    if invocation is None:
+        raise RuntimeError("Missing preparation invocation")
+    row = invocation["row"]
+    check = _reader_check(pk, row, stores)
+    if check:
+        return check
+    saved = invocation.get("saved")
+    if saved and saved == invocation.get("observed"):
+        key = saved["resume_s3_key"]
+        current = stores.tracking.get(pk) or {}
+        if current.get("resume_s3_key") != key:
+            return {"result": "conflict", "pk": pk, "reason": "pdf_artifact_changed"}
+        try:
+            data = stores.artifacts.get(key)
+            if (row.get("resume_s3_key") == key and data.startswith(b"%PDF-")
+                    and hashlib.sha256(data).hexdigest() == invocation["digest"]):
+                return None
+        except Exception:
+            pass
+    attempted = invocation.get("attempted", False)
+    failed = attempted or invocation.get("retailor", False)
+    reason = "pdf_save_failed" if attempted else "no_resume"
+    detail = ("PDF compilation/save did not complete for this run. Fix the LaTeX "
+              "or artifact storage and retry; prior artifacts are retained."
+              if attempted else "No résumé was saved in this run. Retry preparation.")
+    ok, updated = _reader_patch(pk, row, stores, {
+        "status": Status.ERROR if failed else Status.FAILED,
+        "fail_kind": reason, "error": detail, "fail_reason": detail,
+        "gate_reason": "", "gate_pending": {}, "gate_call_id": "",
+        "gate_source": "", "apply_requested_at": "",
+    })
+    if not ok:
+        return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+    invocation["row"] = updated
+    return {"result": "error" if failed else "failed", "pk": pk, "reason": reason}
+
+
+def _pdf_patch(pk: str, stores: Any, changes: dict) -> dict | None:
+    from .graph import _PDF_INVOCATION
+    invocation = _PDF_INVOCATION.get()
+    check = _reader_check(pk, invocation["row"], stores)
+    if check:
+        return check
+    ok, updated = _reader_patch(pk, invocation["row"], stores, changes)
+    if not ok:
+        return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+    invocation["row"] = updated
+    return None
+
+
 async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
+                       prepare_only: bool = False, no_enqueue: bool = False) -> dict:
+    from .graph import _PDF_INVOCATION
+    row = stores.tracking.get(pk) or {}
+    if _board_preparation(row):
+        prepare_only = no_enqueue = True
+    token = _PDF_INVOCATION.set({"row": row, "stores": stores})
+    try:
+        return await _drive_preparation(runner, pk, message, stores,
+                                        prepare_only=prepare_only, no_enqueue=no_enqueue)
+    finally:
+        _PDF_INVOCATION.reset(token)
+
+
+async def _drive_preparation(runner: Runner, pk: str, message: Any, stores: Any, *,
                        prepare_only: bool = False, no_enqueue: bool = False) -> dict:
     """Run the agent, streaming each step's input/response; catch the human gate.
     In AUTO mode the "Ready to apply?" approval is decided by code (score ≥
@@ -2906,6 +3123,7 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
     last_author = None
     apply_result: Any = None  # the browser apply() return, if the applier ran it
     auto_go = False           # approval auto-granted → run _apply_direct after close
+    board_ready = False
     # aclosing() closes the run generator in THIS context when we return early
     # (score-skip / gate) — otherwise ADK's OTel span detach fires in the wrong
     # context and prints a spurious traceback.
@@ -2939,22 +3157,13 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
                     if (question.startswith("Ready to apply")
                             and _historical_relative(stores.tracking.get(pk) or {})):
                         return _relative_attention(pk, stores)
-                    # NEVER offer "the tailored résumé is saved" unless one actually
-                    # is. The tailor sometimes drifts into chat and finishes without
-                    # calling save_tailored_resume; approving that gate would open a
-                    # browser and submit an application with NO résumé attached.
-                    if question.startswith("Ready to apply") and not (
-                            stores.tracking.get(pk) or {}).get("resume_s3_key"):
-                        stores.tracking.set_status(
-                            pk, Status.FAILED, fail_kind="no_resume",
-                            fail_reason="Tailoring finished without saving a résumé — "
-                                        "nothing to upload, so the apply was not offered. "
-                                        "Retry to tailor it again.")
-                        emit("failed", pk=pk, agent=author,
-                             detail="no résumé was saved — apply gate suppressed",
-                             url=(stores.tracking.get(pk) or {}).get("jd_url"))
-                        log.warning("suppressed apply gate for %s: no resume saved", pk)
-                        return {"result": "failed", "pk": pk, "reason": "no_resume"}
+                    if question.startswith("Ready to apply"):
+                        problem = _pdf_problem(pk, stores)
+                        if problem:
+                            return problem
+                        if _board_preparation(current):
+                            board_ready = True
+                            break
                     if question.startswith("Ready to apply") and not prepare_only:
                         verdict = _auto_decision(pk, stores)
                         if verdict == "go":
@@ -2970,12 +3179,12 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
                     # set for one-click approval. Real questions gate needs_human.
                     gate_status = (Status.TAILORED if reason == "approval"
                                    else Status.NEEDS_HUMAN)
-                    stores.tracking.set_status(pk, gate_status,
-                                               **_clear_infra_failure(pk, stores),
-                                               gate_reason=reason,
-                                               gate_pending={"question": question},
-                                               gate_call_id=call.id,
-                                               gate_source=author)
+                    problem = _pdf_patch(pk, stores, dict(
+                        status=gate_status, **_clear_infra_failure(pk, stores),
+                        gate_reason=reason, gate_pending={"question": question},
+                        gate_call_id=call.id, gate_source=author))
+                    if problem:
+                        return problem
                     row = stores.tracking.get(pk) or {}
                     # A finished tailor goes straight into the apply queue. Before
                     # the queue existed, approving each card WAS the throttle —
@@ -3006,10 +3215,12 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
                 emit("action", pk=pk, agent=author, detail=call.name,
                      input=_short(call.args or {}))
 
-            if auto_go:
+            if auto_go or board_ready:
                 break  # leave the agent loop; aclosing() closes the generator
 
             for fr in event.get_function_responses() or []:  # tool result = OUTPUT
+                if fr.name == "save_tailored_resume":
+                    _observe_pdf(fr.response)
                 if fr.name == "apply_to_job":
                     apply_result = fr.response  # capture, to verify a real submit
                 emit("result", pk=pk, agent=author, detail=fr.name, output=_short(fr.response))
@@ -3024,7 +3235,9 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
         # never re-swept, but does NOT show as "applying" while it just waits in the
         # apply queue. The apply worker flips it to SUBMITTING when it actually
         # starts, so only the jobs truly in-flight read as submitting.
-        stores.tracking.set_status(pk, Status.TAILORED)
+        problem = _pdf_problem(pk, stores) or _pdf_patch(pk, stores, {"status": Status.TAILORED})
+        if problem:
+            return problem
         stores.queue.enqueue(stores.apply_queue, {"pk": pk})
         emit("running", pk=pk, agent="applier",
              detail="auto-approved (score ≥ threshold) — queued to apply")
@@ -3035,10 +3248,9 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
         row = stores.tracking.get(pk) or {}
         if _historical_relative(row):
             return _relative_attention(pk, stores)
-        if not str(row.get("resume_s3_key") or "").endswith(".pdf"):
-            stores.tracking.set_status(pk, Status.FAILED, fail_kind="no_resume",
-                                       fail_reason="No PDF was saved. Retry preparation.")
-            return {"result": "failed", "pk": pk, "reason": "no_resume"}
+        problem = _pdf_problem(pk, stores)
+        if problem:
+            return problem
         if row.get("apply_requested_at") and not no_enqueue:
             # Check fresh request/status/hold/confirmation inside enqueue, not
             # the row read before preparation or a pre-recovery request.
@@ -3048,10 +3260,14 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
             emit("running", pk=pk, agent="applier",
                  detail="Résumé ready — queued to apply, as you asked")
             return {"result": "queued_apply", "pk": pk}
-        stores.tracking.set_status(pk, Status.TAILORED, gate_reason="approval",
-                                   **_clear_infra_failure(pk, stores),
-                                   gate_pending={"question":
-                                                 "Ready to apply? Review the résumé first."})
+        problem = _pdf_patch(pk, stores, dict(
+            status=Status.TAILORED, gate_reason="" if _board_preparation(row) else "approval",
+            **_clear_infra_failure(pk, stores),
+            gate_pending={} if _board_preparation(row) else {"question": "Ready to apply? Review the résumé first."},
+            **({"apply_requested_at": "", "gate_call_id": "", "gate_source": ""}
+               if _board_preparation(row) else {})))
+        if problem:
+            return problem
         emit("gate", pk=pk, detail="Résumé ready for review. Nothing submitted.")
         return {"result": "prepared", "pk": pk}
 

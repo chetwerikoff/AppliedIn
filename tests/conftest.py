@@ -16,7 +16,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import runpy
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlsplit
@@ -27,6 +30,27 @@ import pytest
 import redis
 import redis.asyncio
 
+
+# Establish the session boundary before core.config or any collected module can
+# load checkout settings. Children inherit both the safe defaults and the hook.
+_SESSION_LOCAL = tempfile.TemporaryDirectory(prefix="appliedin-offline-tests-")
+for _key in list(os.environ):
+    if _key.startswith("APPLIEDIN_"):
+        del os.environ[_key]
+os.environ["APPLIEDIN_OFFLINE_TEST_ROOT"] = _SESSION_LOCAL.name
+os.environ["APPLIEDIN_MODE"] = "local"
+os.environ["APPLIEDIN_LOCAL_DIR"] = _SESSION_LOCAL.name
+os.environ["APPLIEDIN_REDIS_URL"] = "redis://offline.invalid:1/0"
+os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+# redis-py 8's maintenance negotiation asks even a fake socket for its DNS
+# address. A fake transport has no hostname to resolve (or network to consult).
+fakeredis.FakeRedisConnection.get_resolved_ip = lambda self: "127.0.0.1"
+_OFFLINE_STARTUP = Path(__file__).parent / "offline"
+os.environ["PYTHONPATH"] = os.pathsep.join(
+    [str(_OFFLINE_STARTUP), str(Path(__file__).resolve().parents[1] / "src"),
+     os.environ.get("PYTHONPATH", "")]
+)
+runpy.run_path(str(_OFFLINE_STARTUP / "sitecustomize.py"))
 
 # Install these guards while conftest is imported, before test collection.
 # They never delegate to redis-py: a higher-scope fixture or collection-time
@@ -169,7 +193,8 @@ def _isolate_owner_config(_isolate_redis, tmp_path):
 
     original_settings_cache = get_settings.cache_clear
     with pytest.MonkeyPatch.context() as private:
-        for key in [key for key in os.environ if key.startswith("APPLIEDIN_")]:
+        for key in [key for key in os.environ if key.startswith("APPLIEDIN_")
+                    and key != "APPLIEDIN_OFFLINE_TEST_ROOT"]:
             private.delenv(key, raising=False)
         private.setattr(browser_runtime, "_config_path",
                         lambda settings: tmp_path / "browser.local.yaml")
@@ -187,14 +212,18 @@ def pytest_runtest_protocol(item, nextitem):
     A shared monkeypatch can be undone mid-test and can otherwise restore a
     stale APPLIEDIN_LOCAL_DIR at teardown. Preserve the pre-test environment.
     """
-    before = os.environ.get("APPLIEDIN_LOCAL_DIR")
+    before = {key: value for key, value in os.environ.items() if key.startswith("APPLIEDIN_")}
     try:
         return (yield)
     finally:
-        if before is None:
-            os.environ.pop("APPLIEDIN_LOCAL_DIR", None)
-        else:
-            os.environ["APPLIEDIN_LOCAL_DIR"] = before
+        # CLI calls and explicit dotenv loads can add keys that no fixture's
+        # MonkeyPatch recorded. Restore the session identity between tests too.
+        for key in list(os.environ):
+            if key.startswith("APPLIEDIN_"):
+                del os.environ[key]
+        os.environ.update(before)
+        if item.config.getoption("redis_isolation_proof"):
+            _prove_closed_session_boundary()
 
 
 @pytest.fixture(autouse=True)
@@ -204,6 +233,8 @@ def _isolate_local_dir(_isolate_owner_config, tmp_path):
 
     original_settings_cache = get_settings.cache_clear
     with pytest.MonkeyPatch.context() as private:
+        private.setattr(sys, "_appliedin_offline_test_root", str(tmp_path))
+        private.setenv("APPLIEDIN_OFFLINE_TEST_ROOT", str(tmp_path))
         private.setenv("APPLIEDIN_LOCAL_DIR", str(tmp_path / "local"))
         original_settings_cache()
         try:
@@ -247,6 +278,7 @@ def pytest_addoption(parser):
 def pytest_collection_modifyitems(config, items):
     if not config.getoption("redis_isolation_proof"):
         return
+    _prove_closed_session_boundary()
     workers = config.getoption("numprocesses", default=0)
     if workers not in (None, 0, "0"):
         raise pytest.UsageError("Redis isolation proof requires -n 0 (one process)")
@@ -256,6 +288,45 @@ def pytest_collection_modifyitems(config, items):
             "Redis isolation proof requires exactly the two ordered existing nodes: "
             f"{_PROOF_FIRST} {_PROOF_SECOND}"
         )
+
+
+def _prove_closed_session_boundary():
+    from core.config import Settings, get_settings
+
+    get_settings.cache_clear()
+    assert Path(Settings().local_dir).resolve() == Path(_SESSION_LOCAL.name).resolve()
+    assert Settings().redis_url == "redis://offline.invalid:1/0"
+    _prove_alias_connections_closed()
+
+
+def _prove_alias_connections_closed():
+    # These aliases intentionally bypass the convenient fake constructors. The
+    # transport guard must reject them before DNS or a listening Redis is used.
+    for factory in (redis.StrictRedis, redis.client.Redis, redis.from_url):
+        client = (factory("redis://127.0.0.1:1/0") if factory is redis.from_url
+                  else factory(host="127.0.0.1", port=1))
+        with pytest.raises(RuntimeError, match="Offline test isolation"):
+            client.ping()
+
+    async def check():
+        from redis.asyncio.retry import Retry
+        from redis.backoff import NoBackoff
+
+        # redis-py wraps async transport errors as ConnectionError; its default
+        # retry backoff would only delay proving the same forbidden operation.
+        client = redis.asyncio.Redis(host="127.0.0.1", port=1, retry=Retry(NoBackoff(), 0))
+        try:
+            with pytest.raises(redis.ConnectionError, match="Offline test isolation"):
+                await client.ping()
+        finally:
+            await client.aclose()
+
+    asyncio.run(check())
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if session.config.getoption("redis_isolation_proof"):
+        _prove_closed_session_boundary()
 
 
 def _prove_factories_flags_events_stores(server, tmp_path):
@@ -294,6 +365,66 @@ def _prove_factories_flags_events_stores(server, tmp_path):
             await client.aclose()
 
     asyncio.run(check_async())
+    _prove_alias_connections_closed()
+    child_source = '''
+import os, sys
+from pathlib import Path
+import redis
+expected = sys.argv[1]
+if sys.argv[2] == "sanitized":
+    os.environ.clear()
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    expected = sys._appliedin_offline_test_root
+from core.config import get_settings
+s = get_settings()
+assert Path(s.local_dir) == Path(expected)
+assert s.redis_url == "redis://offline.invalid:1/0"
+if sys.argv[2] == "custom":
+    assert os.environ["SYNTHETIC_CHILD_STARTUP"] == "loaded"
+try:
+    redis.Redis(host="127.0.0.1", port=1).ping()
+except RuntimeError as exc:
+    assert "Offline test isolation" in str(exc)
+else:
+    raise AssertionError("child connected to real Redis")
+'''
+    (tmp_path / "sitecustomize.py").write_text(
+        'import os\nos.environ["SYNTHETIC_CHILD_STARTUP"] = "loaded"\n'
+    )
+    for child_env, mode in (
+        (None, "inherited"),
+        ({"APPLIEDIN_LOCAL_DIR": settings.local_dir, "PYTHONPATH": str(tmp_path)}, "custom"),
+        (None, "sanitized"),
+    ):
+        child = subprocess.run(
+            [sys.executable, "-c", child_source, settings.local_dir, mode],
+            env=child_env, capture_output=True, text=True, timeout=30,
+        )
+        assert child.returncode == 0, child.stderr
+
+    outside = tmp_path.parent / f"outside-{tmp_path.name}"
+    outside.mkdir()
+    sentinel = outside / "keep"
+    sentinel.write_text("preserve")
+    escape = tmp_path / "outside-link"
+    escape.symlink_to(outside, target_is_directory=True)
+    for mode, unsafe in (("local", outside), ("local", escape),
+                         ("cloud", outside), ("cloud", escape)):
+        child = subprocess.run(
+            [sys.executable, "-c", '''
+from core.stores import make_stores
+try:
+    make_stores()
+except ValueError as exc:
+    assert "Offline local_dir" in str(exc)
+else:
+    raise AssertionError("child accepted an outside runtime directory")
+'''], env={"APPLIEDIN_LOCAL_DIR": str(unsafe), "APPLIEDIN_MODE": mode},
+            capture_output=True, text=True, timeout=30,
+        )
+        assert child.returncode == 0, child.stderr
+        assert sentinel.read_text() == "preserve"
+        assert list(outside.iterdir()) == [sentinel]
     assert raw.get("redis-isolation:async") == b"from-async"
     assert direct.get("redis-isolation:async") == "from-async"
 

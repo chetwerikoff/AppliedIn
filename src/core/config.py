@@ -8,14 +8,48 @@ in tests (moto) and prod unchanged.
 from __future__ import annotations
 
 import os
+import sys
 from functools import lru_cache
+from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Load .env into the environment so both APPLIEDIN_* settings and the raw
 # provider keys (read by LiteLLM) are available from one file.
-load_dotenv()
+_OFFLINE_TEST_ROOT = (os.environ.get("APPLIEDIN_OFFLINE_TEST_ROOT")
+                      or getattr(sys, "_appliedin_offline_test_root", None))
+if not _OFFLINE_TEST_ROOT:
+    load_dotenv()
+
+_SETUP_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+
+
+def _offline_test_root():
+    return getattr(sys, "_appliedin_offline_test_root", _OFFLINE_TEST_ROOT)
+
+
+def _declared_worktree_root():
+    # The setup file belongs to this checkout. An exported marker alone cannot
+    # identify it: dotenv intentionally leaves empty/stale exports untouched.
+    if _offline_test_root():
+        return None
+    values = dotenv_values(_SETUP_ENV_FILE, interpolate=False)
+    declared = None
+    if "APPLIEDIN_WORKTREE_ROOT" in values:
+        value = values["APPLIEDIN_WORKTREE_ROOT"]
+        if not value or Path(value).resolve() != _SETUP_ENV_FILE.parent.resolve():
+            raise ValueError("Invalid worktree setup declaration; rerun Orca setup")
+        declared = Path(value).resolve()
+    worktree = os.environ.get("ORCA_WORKTREE_PATH")
+    primary = os.environ.get("ORCA_ROOT_PATH")
+    if worktree and worktree != primary:
+        actual = Path(worktree).resolve()
+        if declared is not None and declared != actual:
+            raise ValueError("Orca context conflicts with worktree setup; rerun Orca setup")
+        return actual
+    return declared
 
 # This product runs on the owner's machine and says so. Any library that reads
 # this at import time gets the answer the product already gives: no phoning home.
@@ -72,8 +106,45 @@ class Settings(BaseSettings):
     mode: str = "local"  # local | cloud
 
     # Local-mode backends
-    redis_url: str = "redis://localhost:6379/0"
-    local_dir: str = ".local"  # artifacts on disk
+    redis_url: str = Field(default_factory=lambda: (
+        "redis://offline.invalid:1/0" if _offline_test_root()
+        else "redis://localhost:6379/0"
+    ))
+    local_dir: str = Field(default_factory=lambda: (
+        _offline_test_root() or ".local"
+    ))
+    worktree_root: str = Field(default_factory=lambda: (
+        str(_declared_worktree_root() or "")
+    ))
+
+    @model_validator(mode="after")
+    def explicit_worktree_storage(self):
+        # Persisted by setup: later CLI shells need not retain Orca's own env.
+        # dotenv does not override inherited primary settings, and --port can
+        # select a reserved DB, so validate before stores or --fresh can act.
+        offline = _offline_test_root()
+        local = Path(self.local_dir).resolve()
+        if offline:
+            if not local.is_relative_to(Path(offline).resolve()):
+                raise ValueError("Offline local_dir must stay inside its test temporary root")
+            return self
+        if self.mode != "local":
+            return self
+        root = _declared_worktree_root()
+        if root is not None or self.worktree_root:
+            from redis.connection import parse_url
+
+            if (root is None or not self.worktree_root
+                    or Path(self.worktree_root).resolve() != root):
+                raise ValueError("Worktree root conflicts with Orca/setup identity; rerun Orca setup")
+            if self.local_dir == ".local" or local == root or not local.is_relative_to(root):
+                raise ValueError("Worktrees require an explicit APPLIEDIN_LOCAL_DIR inside "
+                                 "APPLIEDIN_WORKTREE_ROOT; rerun Orca setup")
+            # Use redis-py's parser: a query-string db overrides the URL path.
+            if parse_url(self.redis_url).get("db", 0) in {0, 14}:
+                raise ValueError("Worktrees cannot use reserved Redis databases 0 or 14; "
+                                 "rerun Orca setup or choose another --port")
+        return self
 
     # Resource names / URLs (cloud mode; injected by CDK)
     applications_table: str = "applications"

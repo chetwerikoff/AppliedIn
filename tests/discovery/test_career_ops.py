@@ -113,6 +113,10 @@ def test_invalid_batch_changes_nothing(board):
     "https://example.com/careers/jobs?location=remote",
     "https://jobs.ashbyhq.com/example-co", "https://jobs.lever.co/example-co",
     "https://boards.greenhouse.io/example-co",
+    "https://example.com/careers/open-positions",
+    "https://example.com/careers/open-roles",
+    "https://example.com/jobs/job-openings",
+    "https://example.com/careers/all-jobs",
 ])
 def test_prepare_does_not_turn_index_path_or_invented_id_into_a_posting(board, url):
     stores, rows = board

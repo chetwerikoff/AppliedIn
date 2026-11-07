@@ -563,7 +563,8 @@ def _index_without_job_id(url: str) -> bool:
     path = parts.path.strip("/").casefold()
     leaf = path.rsplit("/", 1)[-1]
     if not path or leaf in {"careers", "career", "jobs", "job", "positions", "openings",
-                            "opportunities", "index", "index.html", "search", "job-search"}:
+                            "opportunities", "index", "index.html", "search", "job-search",
+                            "open-positions", "open-roles", "job-openings", "all-jobs"}:
         return True
     return parts.hostname in {"jobs.ashbyhq.com", "jobs.lever.co", "boards.greenhouse.io",
                               "job-boards.greenhouse.io"} and "/" not in path

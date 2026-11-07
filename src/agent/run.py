@@ -1313,13 +1313,18 @@ def _remote_in_home_region(jd: str, location: str, steering: str) -> bool:
     if not home:
         return False
     labels = [location] if location.strip().casefold() not in (
-        "", "unknown", "unspecified", "not specified") else []
-    labels.extend(re.findall(r"(?:^|\n)location: ([^\n.;]+)", jd, re.I))
+        "", "unknown", "unspecified", "not specified", "remote") else []
+    labels.extend(re.findall(
+        r"(?:^|[\n.!?;]\s*)(?:location|work location|work arrangement|worksite|workplace):"
+        r"\s*([^\n.;!?]+)", jd, re.I))
     # A scoped remote sentence is evidence; an incidental mention of remote
     # tools or a country elsewhere in the posting is not.
-    labels.extend("remote - " + region for region in re.findall(
+    labels.extend(arrangement + " - " + region for arrangement, region in re.findall(
         r"(?:^|[.!?]\s*|\n)(?:this (?:role|position) is )?(?:fully )?"
-        r"remote (?:in|within|from) ([^\n.;!?]+)", jd, re.I))
+        r"(remote|on-site|onsite|on site|hybrid) (?:in|within|from) ([^\n.;!?]+)", jd, re.I))
+    # Bare Remote carries no geographic evidence and must not veto a scoped JD;
+    # it cannot prove the home-region exception by itself either.
+    labels = [label for label in labels if label.strip().casefold() != "remote"]
     if not labels or any(re.search(r"\b(?:on-site|onsite|on site|hybrid)\b", label, re.I)
                          for label in labels):
         return False

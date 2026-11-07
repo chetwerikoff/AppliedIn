@@ -60,7 +60,7 @@ def test_only_completed_fetch_input_urls_ground_interest_results(monkeypatch):
     assert admitted["model"] == "openai/test-model"
 
 
-@pytest.mark.parametrize("failure", ["searchless", "fetchless", "cancelled-search", "incomplete", "error", "text", "schema", "later-text"])
+@pytest.mark.parametrize("failure", ["searchless", "fetchless", "incomplete", "error", "text", "schema", "later-text"])
 def test_incomplete_or_invalid_final_answer_never_imports(failure):
     events = stream()
     searches = None
@@ -68,9 +68,6 @@ def test_incomplete_or_invalid_final_answer_never_imports(failure):
         searches = []
     elif failure == "fetchless":
         events = [event for event in events if event["type"] != "tool_use"]
-    elif failure == "cancelled-search":
-        events.insert(1, {"type": "tool_use", "part": {"tool": "websearch", "state": {
-            "status": "error", "error": "Web search cancelled"}}})
     elif failure == "incomplete":
         events.pop()
     elif failure == "error":
@@ -135,7 +132,7 @@ def test_standalone_model_key_scrub_config_isolation_and_own_session_cleanup(cli
     assert settings["plugin"] == [] and settings["mcp"] == {}
     assert settings["provider"] == {"openai": {
         "options": {"baseURL": "https://chatgpt.com/backend-api/codex"},
-        "models": {"gpt-6.1-sol": {"limit": {"context": 272000, "input": 272000, "output": 128000}}},
+        "models": {"test-model": {"limit": {"context": 272000, "input": 272000, "output": 128000}}},
     }}
     assert "apiKey" not in json.dumps(settings)
     assert result["model"] == "openai/test-model"
@@ -270,6 +267,27 @@ def test_failed_fetch_does_not_discard_other_grounded_postings():
     result = replay(events)
     assert result["source_urls"] == {GOOD}
     assert UNREAD not in result["source_urls"]
+
+
+def test_denied_websearch_does_not_discard_completed_fetches():
+    events = stream()
+    events.insert(1, {"type": "tool_use", "part": {"tool": "websearch", "state": {
+        "status": "error", "input": {"query": "ignored model query"},
+        "error": "Permission denied"}}})
+    result = replay(events)
+    assert result["source_urls"] == {GOOD}
+    assert result["queries"] == ["example-co engineering"]
+
+
+def test_search_config_rejects_non_openai_provider_before_cli(cli, monkeypatch):
+    from core import config
+
+    monkeypatch.setattr(config, "get_settings", lambda: SimpleNamespace(search_model="other/example-model"))
+    _, launch, cleanup = cli
+    with pytest.raises(ValueError, match="supports only openai/<model>"):
+        oc.run_search("public prompt", SCHEMA, lambda _: None)
+    launch.assert_not_called()
+    cleanup.assert_not_called()
 
 
 @pytest.mark.parametrize("second_response", ["exit", "malformed"])

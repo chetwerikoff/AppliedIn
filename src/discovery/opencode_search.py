@@ -14,7 +14,10 @@ from jsonschema import ValidationError, validate
 from discovery.claude_search import TIMEOUT, watch_cancellation
 
 
-def search_env(cwd):
+def search_env(cwd, model):
+    provider, _, name = model.partition("/")
+    if provider != "openai" or not name.strip():
+        raise ValueError("OpenCode search supports only openai/<model> with your ChatGPT login.")
     # An allowlist excludes provider keys AND inherited OpenCode config/agent
     # overrides. The default data location retains OAuth; a temporary DB loses it.
     env = {k: v for k, v in os.environ.items() if k in (
@@ -34,7 +37,7 @@ def search_env(cwd):
             "mcp": {},
             "provider": {"openai": {
                 "options": {"baseURL": "https://chatgpt.com/backend-api/codex"},
-                "models": {"gpt-6.1-sol": {"limit": {
+                "models": {name: {"limit": {
                     "context": 272000, "input": 272000, "output": 128000,
                 }}},
             }},
@@ -67,8 +70,6 @@ class SearchEvents:
             self.text += part.get("text", "")
         elif kind == "tool_use":
             state = part.get("state") or {}
-            if state.get("status") == "error" and part.get("tool") == "websearch":
-                self.failed = True
             if state.get("status") != "completed":
                 return
             inputs = state.get("input") or {}
@@ -175,7 +176,7 @@ def run_search(prompt, schema, progress, *, cancelled=None, interests="", titles
         raise ValueError("Install OpenCode CLI (opencode2) and sign in with your ChatGPT account.")
     model = get_settings().search_model
     with tempfile.TemporaryDirectory(prefix="appliedin-opencode-search-") as cwd:
-        env = search_env(cwd)
+        env = search_env(cwd, model)
         events = SearchEvents(progress, schema, model)
         progress(f"OpenCode is searching with {model} using your ChatGPT login…")
         deadline = time.monotonic() + TIMEOUT

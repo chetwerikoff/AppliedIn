@@ -1,4 +1,6 @@
 """Offline argv tests: bsk 0.4.1 shared-tab actions carry the sync observation id."""
+import json
+
 import pytest
 
 from tools import browser_skill as bsk
@@ -152,3 +154,66 @@ async def test_lifecycle_commands_never_get_observation(make):
     for call in fake.calls:
         if call[0] in {"session", "cooperate"}:
             assert "--observation" not in call and "--context" not in call
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind,refusals,attempts", [
+    ("crawl", 1, 2), ("crawl", 2, 2),
+    ("apply", 1, 1), ("jd", 1, 1), ("read", 1, 1),
+])
+async def test_observation_race_has_one_shared_retry_for_crawl_only(
+        monkeypatch, kind, refusals, attempts):
+    calls = []
+
+    async def cli(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("cooperate", "sync"):
+            return {"context_id": "fresh-context", "observation_id": "fresh-observation"}
+        if len([c for c in calls if c[0] == "evaluate"]) <= refusals:
+            return bsk._result(json.dumps({
+                "ok": False, "code": "permission_denied",
+                "data": {"reason": "observation_changed", "effect_state": "none"},
+            }), 1)
+        return {"ok": True}
+
+    monkeypatch.setattr(bsk, "command", cli)
+    session = bsk.Session(kind)
+    session.id = "synthetic-session"
+    session._context, session._observation = "old-context", "old-observation"
+    if kind == "crawl" and refusals == 1:
+        assert await session._run(("evaluate", "1"), {}) == {"ok": True}
+    else:
+        with pytest.raises(bsk.Unavailable) as error:
+            await session._run(("evaluate", "1"), {})
+        assert error.value.reason == "observation_changed"
+    actions = [c for c in calls if c[0] == "evaluate"]
+    assert len(actions) == attempts
+    assert len([c for c in calls if c[0] == "cooperate"]) == attempts - 1
+    if attempts == 2:
+        assert flag(actions[1], "--context") == "fresh-context"
+        assert flag(actions[1], "--observation") == "fresh-observation"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,reason,state", [
+    ("permission_denied", "observation_changed", "unknown"),
+    ("permission_denied", "observation_changed", "committed"),
+    ("permission_denied", "observation_changed", ""),
+    ("other_failure", "observation_changed", "none"),
+    ("permission_denied", "other_reason", "none"),
+])
+async def test_crawl_observation_retry_requires_exact_no_effect_refusal(
+        monkeypatch, code, reason, state):
+    calls = []
+
+    async def cli(*args, **kwargs):
+        calls.append(args)
+        return bsk._result(json.dumps({
+            "ok": False, "code": code,
+            "data": {"reason": reason, "effect_state": state},
+        }), 1)
+
+    monkeypatch.setattr(bsk, "command", cli)
+    with pytest.raises(bsk.Unavailable):
+        await bsk.Session("crawl")._run(("evaluate", "1"), {})
+    assert len(calls) == 1  # No sync or blind second action after an uncertain effect.

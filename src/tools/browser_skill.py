@@ -514,6 +514,11 @@ class Session:
                 except Unavailable as exc:
                     if not wants or attempt or not (
                             _sync_required(exc)
+                            or (self.kind == "crawl"
+                                and exc.code == "permission_denied"
+                                and exc.reason == "observation_changed"
+                                and exc.identifiers == {"permission_denied", "observation_changed"}
+                                and exc.effect_state == "none")
                             or (self.kind == "apply" and self._fixed_application_read(args)
                                 and _document_changed_read(exc))):
                         raise

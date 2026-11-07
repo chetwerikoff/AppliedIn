@@ -179,7 +179,7 @@ def test_exact_browser_wrapper_and_fresh_feed_are_observation_not_new_submit_aut
     assert world.browser_calls[0]["urls"] == [CAREERS]
     assert world.feed_calls == [BOARD]
     job = world.tracking.put_calls[0]
-    assert (job.company, job.ats, job.job_id, job.jd_url) == (COMPANY, "greenhouse", "731205", WRAPPER)
+    assert (job.company, job.ats, job.job_id, job.jd_url) == (COMPANY, "greenhouse", "731205", HOSTED)
     assert world.queue.calls == [("synthetic-queue", {"pk": job.pk})]
 
 
@@ -329,6 +329,7 @@ def test_real_board_discovery_to_current_pdf_tailored_preserves_original_url(wor
     w = pdf_world
     world.browser_rows = [listing(MULTI)]
     world.source_links = {MULTI}
+    world.feed = [board_job(url=MULTI)]
     assert crawler.crawl_company(world.config, Preferences(), world.stores) == 1
     assert world.queue.calls == [("synthetic-queue", {"pk": w.pk})]
     # Use the same fake persisted store across producer and real runner/save.
@@ -356,12 +357,47 @@ def test_real_board_discovery_to_current_pdf_tailored_preserves_original_url(wor
     "src=list&gh_jid=731205&locale=en", "locale=en&gh_jid=731205&src=list",
     "gh_jid=731205&src=" + "A" * 64 + "&utm_source=x&utm_medium=y&utm_campaign=z&locale=en",
 ])
-def test_bounded_safe_query_order_admits_unchanged(world, query):
+def test_bounded_safe_query_order_admits_feed_absolute_url(world, query):
     url = CAREERS + "/platform-engineer?" + query
     world.browser_rows = [listing(url)]
     world.source_links = {url}
     assert crawler.crawl_company(world.config, Preferences(), world.stores) == 1
-    assert world.tracking.put_calls[0].jd_url == url
+    assert world.tracking.put_calls[0].jd_url == HOSTED
+
+
+def test_source_proven_extra_parameters_match_feed_without_relaxing_consumers(world):
+    from discovery.tenant_pin import (
+        exact_feed_match, greenhouse_feed_identity, greenhouse_query_id,
+    )
+    from tools.claude_chrome import verified_greenhouse_alias
+
+    # A listing may add tracking to the employer route returned by the feed.
+    world.browser_rows = [listing(MULTI)]
+    world.source_links = {MULTI}
+    world.feed = [board_job(url=WRAPPER)]
+    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 1
+    assert world.tracking.put_calls[0].jd_url == WRAPPER
+
+    extra = board_job(url=MULTI)
+    assert greenhouse_query_id(MULTI, CAREERS) is None
+    assert not greenhouse_feed_identity(extra, world.config)
+    assert exact_feed_match(world.config, extra.job_id, [extra]) is None
+    assert verified_greenhouse_alias(
+        {**extra.model_dump(), "greenhouse_board": BOARD},
+        pk=extra.pk, company=COMPANY, url=MULTI, configs=[world.config]) is None
+
+
+@pytest.mark.parametrize("feed_url", [
+    CAREERS + "/platform-engineer?gh_jid=999999&src=list",
+    CAREERS + "/platform-engineer?gh_jid=731205&unknown=x",
+    "https://foreign.test/openings/platform-engineer?gh_jid=731205&src=list",
+])
+def test_extra_parameter_feed_identity_must_still_be_source_scoped(world, feed_url):
+    world.browser_rows = [listing(MULTI)]
+    world.source_links = {MULTI}
+    world.feed = [board_job(url=feed_url)]
+    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 0
+    _no_new_gh_application_effects(world)
 
 
 @pytest.mark.parametrize("query", [

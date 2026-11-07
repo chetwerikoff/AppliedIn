@@ -1302,12 +1302,44 @@ def _private_constraint(content: str, family: str) -> str | None:
     return next(iter(values)) if len(values) == 1 else None
 
 
+def _remote_in_home_region(jd: str, location: str, steering: str) -> bool:
+    """Only explicit remote-in-region evidence can waive a sponsorship stop."""
+    from discovery.filters import _country, posting_country
+
+    residence = _private_constraint(steering, "residence")
+    if not residence or not residence.startswith("only in "):
+        return False
+    home = _country(residence.removeprefix("only in "))
+    if not home:
+        return False
+    labels = [location] if location.strip().casefold() not in (
+        "", "unknown", "unspecified", "not specified", "remote") else []
+    labels.extend(re.findall(
+        r"(?:^|[\n.!?;]\s*)(?:location|work location|work arrangement|worksite|workplace):"
+        r"\s*([^\n.;!?]+)", jd, re.I))
+    # A scoped remote sentence is evidence; an incidental mention of remote
+    # tools or a country elsewhere in the posting is not.
+    labels.extend(arrangement + " - " + region for arrangement, region in re.findall(
+        r"(?:^|[.!?]\s*|\n)(?:this (?:role|position) is )?(?:fully )?"
+        r"(remote|on-site|onsite|on site|hybrid) (?:in|within|from) ([^\n.;!?]+)", jd, re.I))
+    # Bare Remote carries no geographic evidence and must not veto a scoped JD;
+    # it cannot prove the home-region exception by itself either.
+    labels = [label for label in labels if label.strip().casefold() != "remote"]
+    if not labels or any(re.search(r"\b(?:on-site|onsite|on site|hybrid)\b", label, re.I)
+                         for label in labels):
+        return False
+    return (any(re.search(r"\bremote\b", label, re.I) for label in labels)
+            and all(posting_country(re.sub(r"\bremote (?:in|within|from)\b", "remote -",
+                                          label, flags=re.I)) == home for label in labels))
+
+
 def _eligibility_conflict(jd: str, location: str, prefs: Any, steering: str) -> str | None:
     """Prove both sides before scoring; raw fit/override cannot bypass this."""
     # A newline terminates a requirement even when a bullet has no punctuation.
     text = "\n".join(" ".join(line.casefold().split()) for line in jd.splitlines())
     sponsorship = _private_constraint(steering, "sponsorship")
-    if sponsorship == "required" and _no_sponsorship(jd):
+    if (sponsorship == "required" and _no_sponsorship(jd)
+            and not _remote_in_home_region(jd, location, steering)):
         return "eligibility conflict: sponsorship"
     for family, pattern in (
         ("work authorization", r"(?:must (?:already )?be (?:legally )?authorized to work|existing right to work (?:is )?required) in ([a-z][a-z -]{1,60})(?=[.;]|$)"),

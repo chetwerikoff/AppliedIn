@@ -1441,6 +1441,72 @@ def test_invalid_network_resume_keeps_original_batch_start_until_repaired(
     assert len(stores.tracking.all()) == 1
 
 
+def test_scheduled_network_stop_between_reservation_and_worker_start_is_not_lost(
+    board, monkeypatch,
+):
+    # The scheduler pauses after successful reservation; a real stopper then
+    # signals before Thread.start. A later scheduler clear used to erase it.
+    from threading import Event, Thread
+
+    network, stores, _, _ = _network_fixture(board, monkeypatch)
+    events = Mock(return_value=iter(()))
+    prepare = Mock()
+    monkeypatch.setattr(network, "events", events)
+    monkeypatch.setattr(co, "auto_prepare", prepare)
+
+    reserved = Event()
+    stop_finished = Event()
+    stop_results = []
+    original_reserve = co.reserve_scan
+
+    def reserve_then_wait(kind="feeds", company="", message="", **kwargs):
+        acquired = original_reserve(kind, company, message, **kwargs)
+        if acquired and kind == "network":
+            assert co._RUNNING and co._ACTIVE.get("kind") == "network"
+            assert not network.STOP.is_set()
+            reserved.set()
+            assert stop_finished.wait(5), "Public Stop did not finish after reservation"
+        return acquired
+
+    def public_stop():
+        try:
+            assert reserved.wait(5), "Scheduled scan never acquired its reservation"
+            stop_results.append(network.stop())
+        finally:
+            stop_finished.set()
+
+    worker_start_stop_state = []
+
+    class InlineAfterStop:
+        def __init__(self, *, target, args=(), kwargs=None, **unused):
+            self.target, self.args, self.kwargs = target, args, kwargs or {}
+
+        def start(self):
+            worker_start_stop_state.append(network.STOP.is_set())
+            self.target(*self.args, **self.kwargs)
+
+    monkeypatch.setattr(co, "reserve_scan", reserve_then_wait)
+    monkeypatch.setattr(co.threading, "Thread", InlineAfterStop)
+    stopper = Thread(target=public_stop)
+    stopper.start()
+    try:
+        co.scheduled_tick()
+    finally:
+        stop_finished.set()
+        stopper.join(5)
+
+    assert not stopper.is_alive()
+    assert stop_results == [{"stopping": True}]
+    assert worker_start_stop_state == [True]
+    events.assert_not_called()
+    prepare.assert_not_called()
+    assert not stores.tracking.all()
+    stores.queue.enqueue.assert_not_called()
+    stopped = co._read()["last_network"]
+    assert stopped["stopped"] and not stopped["batch_success"]
+    assert not co._SCAN.locked() and not co._RUNNING
+
+
 def test_public_network_stop_signals_while_tracking_create_holds_board_lock(
     board, monkeypatch,
 ):

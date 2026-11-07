@@ -321,10 +321,21 @@ def report_progress(message: str) -> None:
         del events[:-80]
 
 
-def reserve_scan(kind: str = "feeds", company: str = "", message: str = "") -> bool:
+def reserve_scan(
+    kind: str = "feeds",
+    company: str = "",
+    message: str = "",
+    *,
+    clear_network_stop: bool = False,
+) -> bool:
     global _RUNNING, _ACTIVE
     if not _SCAN.acquire(blocking=False):
         return False
+    if kind == "network" and clear_network_stop:
+        from discovery import career_network
+
+        # Clear stale process-local state before the active run becomes stoppable.
+        career_network.STOP.clear()
     with _LOCK:
         _RUNNING = True
         _ACTIVE = {"kind": kind, "company": company, "started_at": now()}
@@ -781,14 +792,12 @@ def scheduled_tick() -> None:
     # An available reservation services one oldest due item. No timestamp is
     # consumed when acquisition or thread start fails.
     for _, _, kind in sorted(due):
-        if not reserve_scan(kind):
+        if not reserve_scan(kind, clear_network_stop=(kind == "network")):
             return
         try:
             if kind == "network":
                 from discovery import career_network
 
-                # STOP is process-local. A busy reservation must not clear it.
-                career_network.STOP.clear()
                 worker = threading.Thread(
                     target=career_network.run_reserved,
                     args=(None,),

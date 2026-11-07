@@ -60,8 +60,10 @@ async def test_sqlite_session_service_configures_every_pooled_connection(sqlite_
         async with service.db_engine.connect() as first:
             async with service.db_engine.connect() as second:
                 for connection in (first, second):
-                    assert (await connection.exec_driver_sql("PRAGMA busy_timeout")).scalar_one() == 30000
-                    assert (await connection.exec_driver_sql("PRAGMA journal_mode")).scalar_one() == "wal"
+                    timeout = (await connection.exec_driver_sql("PRAGMA busy_timeout")).scalar_one()
+                    mode = (await connection.exec_driver_sql("PRAGMA journal_mode")).scalar_one()
+                    assert timeout == 30000
+                    assert mode == "wal"
     finally:
         await service.db_engine.dispose()
 

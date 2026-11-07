@@ -1229,6 +1229,8 @@ def test_relevance_work_is_not_limited_to_fifty_and_age_policy_remains_per_compa
     calls = []
 
     def screen(jobs, prefs):
+        if not jobs:
+            return []
         calls.append(jobs[0].company)
         return jobs if jobs[0].company.endswith("-069") else []
 

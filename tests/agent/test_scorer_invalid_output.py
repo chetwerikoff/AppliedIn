@@ -267,6 +267,73 @@ def test_reopen_resets_same_seed_session_before_rescoring(harness, monkeypatch):
     assert len(h.fake.requests) == 1
 
 
+@pytest.mark.parametrize("skip", [False, True])
+def test_unsent_root_fallthrough_preserves_accepted_skip(harness, monkeypatch, skip):
+    h = harness
+    if h.prep:
+        # Exercise the unsent branch using this fixture's fully offline graph;
+        # the normal root singleton is not patched by the review-shell fixture.
+        monkeypatch.setattr(R, "root_agent", G.review_agent)
+    h.prep = False
+
+    async def no_tool(self, ctx):
+        if skip:
+            h.stores.tracking.set_status(h.pk, Status.SKIPPED, skip_reason="user_skipped")
+        if False:
+            yield
+
+    monkeypatch.setattr(_NextAgent, "_run_async_impl", no_tool)
+    h.fake.scripted = [_response('{"score":9,"reasoning":"fit"}')]
+    result = _run(h)
+    assert result["result"] == ("conflict" if skip else "failed")
+    row = h.stores.tracking.row
+    assert row["status"] == ("skipped" if skip else "failed")
+    if skip:
+        assert row["skip_reason"] == "user_skipped"
+    assert row["resume_s3_key"] == "resumes/historical.pdf"
+    assert len(h.fake.requests) == 1
+
+
+def test_reopen_session_delete_failure_never_reuses_stale_preferences(harness, monkeypatch):
+    h = harness
+    sessions = R._session_service()
+    reads, released = [], []
+    h.stores.tracking.row["rescore_requested"] = True
+
+    async def cannot_delete(**kwargs):
+        raise RuntimeError("synthetic session deletion failure")
+
+    async def stale_but_readable(**kwargs):
+        reads.append(kwargs["session_id"])
+        return SimpleNamespace(state={
+            **SYNTHETIC_STATE, "prefs_brief": "synthetic old preferences",
+            "posting_guard_generation": h.stores.tracking.row["posting_guard"]["generation"]})
+
+    monkeypatch.setattr(sessions, "delete_session", cannot_delete)
+    monkeypatch.setattr(sessions, "get_session", stale_but_readable)
+    monkeypatch.setattr(R, "_release", lambda *args: released.append(True))
+    with pytest.raises(RuntimeError, match="synthetic session deletion failure"):
+        _run(h)
+    assert reads == [h.pk]
+    assert released == [True]
+    assert h.stores.tracking.row["status"] == "error"
+    assert h.fake.requests == h.next.observed == []
+
+
+def test_reopen_can_reset_a_genuinely_absent_session(harness, monkeypatch):
+    sessions = R._session_service()
+
+    async def missing(**kwargs):
+        raise KeyError("synthetic absent session")
+
+    async def absent(**kwargs):
+        return None
+
+    monkeypatch.setattr(sessions, "delete_session", missing)
+    monkeypatch.setattr(sessions, "get_session", absent)
+    R._run(R._reset_session(harness.pk, strict=True))
+
+
 @pytest.mark.parametrize("kind", ["state_mismatch", "no_terminal_output", "model_error"])
 def test_event_rejections_log_one_safe_token_per_attempt(monkeypatch, caplog, kind):
     """Cover ADK state drift and empty streams, not only malformed model text."""

@@ -525,7 +525,8 @@ def process_backlog_once(companies: list | None = None,
     # 1) EVALUATE — score + tailor every waiting `found` job. Qualifying jobs are
     #    enqueued to the apply queue by run_job; low scorers are skipped there.
     found = [r for r in stores.tracking.query_status(Status.FOUND)
-             if not is_internal_pk(r.get("pk", "")) and _reader_eligible(r)]
+             if not r.get("rescore_requested")
+             and not is_internal_pk(r.get("pk", "")) and _reader_eligible(r)]
     if sel or skipped:
         found = [r for r in found if _in_scope(r.get("company"))]
     from core import preparation

@@ -506,7 +506,7 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
              url=row.get("jd_url"))
         try:
             if admitted.get("rescore_requested"):
-                _run(_reset_session(pk))
+                _run(_reset_session(pk, strict=True))
             result = _run(_run_job_async(pk, admitted, stores, prepare_only=prepare_only))
         except Exception as exc:
             from .graph import ScorerModelError
@@ -2944,13 +2944,18 @@ def _stale_posting(session: Any, current: dict, jd_text: str) -> bool:
         return True
 
 
-async def _reset_session(pk: str) -> None:
+async def _reset_session(pk: str, *, strict: bool = False) -> None:
     """Delete the ADK session for a pk so run_job re-creates it fresh."""
     sessions = _session_service()
     try:
         await sessions.delete_session(app_name=_APP, user_id=_USER, session_id=pk)
-    except Exception:  # no session yet, or already gone — fine
-        pass
+    except Exception:
+        # Reopen promises fresh preferences even when seed/JD are unchanged.
+        # A genuinely absent session needs no deletion; a failed delete of a
+        # still-readable session must not silently reuse yesterday's state.
+        if strict and await sessions.get_session(
+                app_name=_APP, user_id=_USER, session_id=pk) is not None:
+            raise
 
 
 def _short(obj: Any, n: int = 600) -> str:
@@ -3409,8 +3414,17 @@ async def _drive_preparation(runner: Runner, pk: str, message: Any, stores: Any,
     if outcome.get("reason") == "posting_guard_review_required":
         return _guard_refusal(pk, stores)
     reason = _fail_reason(outcome)
-    stores.tracking.set_status(pk, Status.FAILED, fail_reason=reason,
-                               fail_kind=outcome.get("reason") or "")
+    from .graph import _PDF_INVOCATION
+    invocation = _PDF_INVOCATION.get()
+    if apply_result is None and invocation is not None:
+        committed, _ = _reader_patch(pk, invocation["row"], stores, {
+            "status": Status.FAILED, "fail_reason": reason,
+            "fail_kind": outcome.get("reason") or ""})
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+    else:
+        stores.tracking.set_status(pk, Status.FAILED, fail_reason=reason,
+                                   fail_kind=outcome.get("reason") or "")
     emit("error", pk=pk, agent="applier", detail=reason, url=final.get("jd_url"),
          screenshot=_art_url(final.get("screenshot_s3_key")))
     log.info("failed pk=%s: %s", pk, reason)

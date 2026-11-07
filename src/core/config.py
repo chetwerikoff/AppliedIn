@@ -36,9 +36,10 @@ try:
     # a guess of ours. Set here because it covers every completion() call and the
     # ADK path alike, the same way drop_params does.
     litellm.num_retries = 4
-    # Five attempts at most: 5 * 120s = 600s of provider request time.
-    # Retry-after/backoff and the shared throttle wait are additional queue time,
-    # not time spent in a provider request. This also covers ADK's LiteLlm.
+    # Each SDK HTTP attempt is bounded, including ADK's LiteLlm path. With
+    # four LiteLLM retries and OpenAI's two SDK retries, the request-time ceiling
+    # is 5 * 3 * 120s = 1800s. Retry-after/backoff and shared throttle waits are
+    # additional queue time; other providers retain their adapter retry policy.
     litellm.request_timeout = 120
 
     # chatgpt/* only returns the completion on the stream. Without stream=True,

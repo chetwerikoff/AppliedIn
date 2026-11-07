@@ -661,7 +661,8 @@ def test_many_reopens_share_evaluate_lanes_and_release_failed_runs(monkeypatch, 
     barrier = threading.Barrier(2, timeout=5)
     reset = []
 
-    async def reset_session(target):
+    async def reset_session(target, *, strict):
+        assert strict
         reset.append(target)
 
     async def provider(target, admitted, current_stores, **kwargs):
@@ -826,6 +827,57 @@ def test_evaluate_worker_survives_pre_run_tracking_read_failure(monkeypatch):
     assert reads == ["example-co#unreadable", "example-co#next"]
     assert evaluated == ["example-co#next"]
     assert len(sleeps) == 2
+
+
+def test_manual_process_does_not_add_a_third_reopen_lane(monkeypatch):
+    """Hold two real admitted workers while manual Process sees queued reopens."""
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    import daemon
+    from core import flags
+
+    _quiet(monkeypatch)
+    tracking, _ = _synthetic_tracking()
+    pks = [f"example-co#reopened-{n}" for n in range(4)]
+    for target in pks:
+        tracking.set_status(target, Status.FOUND, company="example-co", rescore_requested=True)
+    # The unrelated synthetic fixture row must not become manual work here.
+    tracking.set_status("example-co#job-1", Status.SKIPPED)
+    stores = SimpleNamespace(tracking=tracking)
+    monkeypatch.setattr(daemon, "make_stores", lambda: stores)
+    monkeypatch.setattr(flags, "paused", lambda: False)
+    monkeypatch.setattr(flags, "skipped_companies", lambda: set())
+    monkeypatch.setattr(flags, "stop_epoch", lambda: 0)
+    monkeypatch.setattr(daemon, "_pass_cancelled", lambda *args: False)
+    monkeypatch.setattr(run, "prefetch_browser_jds", lambda *args: None)
+
+    async def reset(target, *, strict):
+        assert strict
+
+    barrier, release = threading.Barrier(3, timeout=5), threading.Event()
+    started = []
+
+    async def provider(target, admitted, current_stores, **kwargs):
+        started.append(target)
+        if target in pks[:2]:
+            barrier.wait()
+            assert release.wait(5)
+        raise RuntimeError("synthetic provider failure")
+
+    monkeypatch.setattr(run, "_reset_session", reset)
+    monkeypatch.setattr(run, "_run_job_async", provider)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        workers = [pool.submit(daemon._evaluate_one, target) for target in pks[:2]]
+        try:
+            barrier.wait()
+            assert daemon.process_backlog_once(prepare_only=True)["evaluated"] == 0
+            assert sorted(started) == sorted(pks[:2])
+            assert all(tracking.get(target)["status"] == "found" for target in pks[2:])
+        finally:
+            release.set()
+        for worker in workers:
+            worker.result()
+    assert all(not run._claimed(target, stores) for target in pks)
 
 
 def test_requested_queue_put_hold_race_preserves_manual_terminal(monkeypatch):

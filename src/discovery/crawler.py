@@ -244,10 +244,14 @@ def _reconcile_browser_greenhouse(company: CompanyConfig,
         proof = witnesses[0]
         if (proof.company != cfg.name or proof.ats != "greenhouse"
                 or not (canonical_hosted(proof, "greenhouse", cfg.board, jid)
-                        or proof.jd_url == variants[0].jd_url)):
+                        or proof.jd_url == variants[0].jd_url
+                        or discovery_greenhouse_id(proof.jd_url, cfg.careers_url) == jid)):
             continue
+        # Discovery may recognize bounded listing parameters without widening
+        # the frozen application guards. Persist the feed's route, not a model's.
         ordinary.append(variants[0].model_copy(update={
             "job_id": jid, "ats": "greenhouse", "greenhouse_board": cfg.board,
+            "jd_url": proof.jd_url,
             "discovery_source": _BOARD_SOURCE, "location": proof.location,
         }))
     return ordinary

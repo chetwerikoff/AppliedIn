@@ -23,7 +23,7 @@ companies:
     discovery: browser
     mode: gated
   - name: Mistral AI
-    careers_url: https://mistral.ai/careers
+    careers_url: https://jobs.ashbyhq.com/mistral.ai
     mode: gated
   - name: Microsoft
     careers_url: https://careers.microsoft.com/v2/global/en/home.html
@@ -98,7 +98,8 @@ companies:
     discovery: feed
     mode: gated
   - name: Hugging Face
-    careers_url: https://apply.workable.com/huggingface
+    careers_url: https://apply.workable.com/huggingface/
+    discovery: feed
     mode: gated
   - name: Weights & Biases
     careers_url: https://wandb.ai/site/careers
@@ -197,7 +198,8 @@ companies:
     mode: gated
 
   - name: Thinking Machine
-    careers_url: https://job-boards.greenhouse.io/thinkingmachines
+    careers_url: https://thinkingmachines.ai/
+    discovery: browser
     mode: gated
 
   - name: Snap

@@ -233,6 +233,8 @@ def _isolate_local_dir(_isolate_owner_config, tmp_path):
 
     original_settings_cache = get_settings.cache_clear
     with pytest.MonkeyPatch.context() as private:
+        private.setattr(sys, "_appliedin_offline_test_root", str(tmp_path))
+        private.setenv("APPLIEDIN_OFFLINE_TEST_ROOT", str(tmp_path))
         private.setenv("APPLIEDIN_LOCAL_DIR", str(tmp_path / "local"))
         original_settings_cache()
         try:
@@ -399,6 +401,30 @@ else:
             env=child_env, capture_output=True, text=True, timeout=30,
         )
         assert child.returncode == 0, child.stderr
+
+    outside = tmp_path.parent / f"outside-{tmp_path.name}"
+    outside.mkdir()
+    sentinel = outside / "keep"
+    sentinel.write_text("preserve")
+    escape = tmp_path / "outside-link"
+    escape.symlink_to(outside, target_is_directory=True)
+    for mode, unsafe in (("local", outside), ("local", escape),
+                         ("cloud", outside), ("cloud", escape)):
+        child = subprocess.run(
+            [sys.executable, "-c", '''
+from core.stores import make_stores
+try:
+    make_stores()
+except ValueError as exc:
+    assert "Offline local_dir" in str(exc)
+else:
+    raise AssertionError("child accepted an outside runtime directory")
+'''], env={"APPLIEDIN_LOCAL_DIR": str(unsafe), "APPLIEDIN_MODE": mode},
+            capture_output=True, text=True, timeout=30,
+        )
+        assert child.returncode == 0, child.stderr
+        assert sentinel.read_text() == "preserve"
+        assert list(outside.iterdir()) == [sentinel]
     assert raw.get("redis-isolation:async") == b"from-async"
     assert direct.get("redis-isolation:async") == "from-async"
 

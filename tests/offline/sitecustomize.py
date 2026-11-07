@@ -33,8 +33,9 @@ def _offline_popen_init(self, *args, **kwargs):
     positional = list(args)
     env = positional[10] if len(positional) > 10 else kwargs.get("env")
     env = dict(os.environ if env is None else env)
-    env["APPLIEDIN_OFFLINE_TEST_ROOT"] = _root
-    env.setdefault("APPLIEDIN_LOCAL_DIR", _root)
+    root = getattr(sys, "_appliedin_offline_test_root", _root)
+    env["APPLIEDIN_OFFLINE_TEST_ROOT"] = root
+    env.setdefault("APPLIEDIN_LOCAL_DIR", root)
     env.setdefault("APPLIEDIN_REDIS_URL", "redis://offline.invalid:1/0")
     env["PYTHONPATH"] = os.pathsep.join([_startup, env.get("PYTHONPATH", "")])
     if len(positional) > 10:

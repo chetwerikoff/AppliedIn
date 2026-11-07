@@ -34,7 +34,8 @@ def test_per_test_override_still_wins(monkeypatch, tmp_path):
     monkeypatch.setenv("APPLIEDIN_LOCAL_DIR", str(other))
     get_settings.cache_clear()
     assert get_settings().local_dir == str(other)
-    assert Settings(local_dir="explicit").local_dir == "explicit"
+    explicit = str(tmp_path / "explicit")
+    assert Settings(local_dir=explicit).local_dir == explicit
 
 
 def test_session_default_survives_missing_per_test_override(monkeypatch):
@@ -50,7 +51,8 @@ def test_worktree_requires_explicit_storage_but_accepts_disposable_path(monkeypa
     monkeypatch.setenv("ORCA_WORKTREE_PATH", str(tmp_path))
     monkeypatch.delenv("APPLIEDIN_LOCAL_DIR", raising=False)
     monkeypatch.delenv("APPLIEDIN_OFFLINE_TEST_ROOT", raising=False)
-    monkeypatch.setattr("core.config._OFFLINE_TEST_ROOT", None)
+    monkeypatch.setattr("core.config._offline_test_root", lambda: None)
+    monkeypatch.setattr("core.config._SETUP_ENV_FILE", tmp_path / "absent.env")
     with pytest.raises(ValueError, match="explicit APPLIEDIN_LOCAL_DIR"):
         Settings()
     assert not (tmp_path / ".local").exists()
@@ -68,7 +70,8 @@ def test_a_replaced_get_settings_does_not_break_the_fixture(monkeypatch, tmp_pat
 def test_orca_primary_context_does_not_become_a_disposable_worktree(monkeypatch, tmp_path):
     monkeypatch.setenv("ORCA_ROOT_PATH", str(tmp_path))
     monkeypatch.setenv("ORCA_WORKTREE_PATH", str(tmp_path))
-    monkeypatch.setattr("core.config._OFFLINE_TEST_ROOT", None)
+    monkeypatch.setattr("core.config._offline_test_root", lambda: None)
+    monkeypatch.setattr("core.config._SETUP_ENV_FILE", tmp_path / "absent.env")
     settings = Settings(local_dir=str(tmp_path / "synthetic-primary"),
                         redis_url="redis://offline.invalid:1/14")
     assert settings.worktree_root == ""

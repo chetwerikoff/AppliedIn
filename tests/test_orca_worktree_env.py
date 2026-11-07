@@ -9,12 +9,21 @@ import pytest
 from dotenv import dotenv_values, load_dotenv
 
 import cli
+import core.config
 from core.config import get_settings
 
 
 ORCA_YAML = Path(__file__).resolve().parents[1] / "orca.yaml"
 ROOT_SENTINEL = b"COPIED_SECRET_SENTINEL=fixture-only\n"
 STALE_SENTINEL = b"STALE_SENTINEL=fixture-only\n"
+
+
+@pytest.fixture(autouse=True)
+def _product_settings_boundary(_isolate_local_dir, monkeypatch, tmp_path):
+    # Exercise product identity validation with synthetic declarations only;
+    # the process transport guard and temporary paths remain active.
+    monkeypatch.setattr(core.config, "_offline_test_root", lambda: None)
+    monkeypatch.setattr(core.config, "_SETUP_ENV_FILE", tmp_path / "absent.env")
 
 
 def _base_port(worktree: Path) -> int:
@@ -73,6 +82,7 @@ def _assert_isolated_env(worktree: Path) -> None:
         "APPLIEDIN_REDIS_URL": f"redis://localhost:6379/{1 + port % 15}",
     }
     with pytest.MonkeyPatch.context() as private:
+        private.setattr(core.config, "_SETUP_ENV_FILE", env_file)
         for key, value in values.items():
             private.setenv(key, value)
         private.delenv("ORCA_WORKTREE_PATH", raising=False)
@@ -203,6 +213,7 @@ def test_inherited_storage_cannot_escape_declared_worktree(
     # Match normal dotenv precedence: inherited storage wins over the file,
     # while the setup-persisted worktree identity still binds the process.
     load_dotenv(worktree / ".env", override=False)
+    monkeypatch.setattr(core.config, "_SETUP_ENV_FILE", worktree / ".env")
     monkeypatch.setattr(cli, "CONFIGURED_PORT", _selected_port(worktree))
     monkeypatch.setattr(cli, "_wipe_instance", lambda: pytest.fail("wipe reached invalid storage"))
     expected = "APPLIEDIN_LOCAL_DIR" if directory != "inside" else "reserved Redis"
@@ -217,6 +228,7 @@ def test_explicit_fresh_port_cannot_select_reserved_worktree_database(monkeypatc
     worktree.mkdir()
     monkeypatch.chdir(worktree)
     monkeypatch.setenv("APPLIEDIN_WORKTREE_ROOT", str(worktree))
+    monkeypatch.setenv("ORCA_WORKTREE_PATH", str(worktree))
     monkeypatch.setattr(cli, "CONFIGURED_PORT", 9000)
     monkeypatch.setattr(cli, "_wipe_instance", lambda: pytest.fail("reserved DB reached wipe"))
     assert cli._instance_db(8788) == 14
@@ -230,8 +242,42 @@ def test_explicit_safe_fresh_instance_still_uses_disposable_stores(monkeypatch, 
     worktree.mkdir()
     monkeypatch.chdir(worktree)
     monkeypatch.setenv("APPLIEDIN_WORKTREE_ROOT", str(worktree))
+    monkeypatch.setenv("ORCA_WORKTREE_PATH", str(worktree))
     monkeypatch.setattr(cli, "CONFIGURED_PORT", 9000)
     instance = cli._apply_instance(9001, fresh=True)
     assert instance["wiped"]["flushed"] is True  # The per-test fake Redis is usable.
     assert (worktree / ".local-9001").is_dir()
     assert not (worktree / ".local").exists()
+
+
+@pytest.mark.parametrize("orca_context", [False, True])
+@pytest.mark.parametrize("inherited", ["", "other-worktree", "copied-declaration"])
+def test_empty_or_stale_export_cannot_replace_actual_setup_identity(
+        monkeypatch, tmp_path, orca_context, inherited):
+    root, worktree = tmp_path / "synthetic-root", tmp_path / "task-worktree"
+    root.mkdir()
+    worktree.mkdir()
+    _run_setup(tmp_path, root, worktree)
+    other = tmp_path / "other-worktree"
+    other.mkdir()
+    sentinel = other / "untouched"
+    sentinel.write_text("preserve")
+    if inherited == "copied-declaration":
+        (worktree / ".env").write_text(f'APPLIEDIN_WORKTREE_ROOT="{other}"\n')
+    monkeypatch.chdir(worktree)
+    monkeypatch.setattr(core.config, "_SETUP_ENV_FILE", worktree / ".env")
+    monkeypatch.setenv("APPLIEDIN_WORKTREE_ROOT", str(other) if inherited else "")
+    monkeypatch.setenv("APPLIEDIN_LOCAL_DIR", str(other / ".local-test"))
+    monkeypatch.setenv("APPLIEDIN_REDIS_URL", "redis://offline.invalid:1/7")
+    if orca_context:
+        monkeypatch.setenv("ORCA_WORKTREE_PATH", str(worktree))
+    else:
+        monkeypatch.delenv("ORCA_WORKTREE_PATH", raising=False)
+    load_dotenv(worktree / ".env", override=False)
+    monkeypatch.setattr(cli, "CONFIGURED_PORT", _selected_port(worktree))
+    monkeypatch.setattr(cli, "_wipe_instance", lambda: pytest.fail("identity bypass reached wipe"))
+    expected = "Invalid worktree setup" if inherited == "copied-declaration" else "Worktree root conflicts"
+    with pytest.raises(ValueError, match=expected):
+        cli._apply_instance(8788, fresh=True)
+    assert sentinel.read_text() == "preserve"
+    assert not (worktree / ".local-8788").exists()

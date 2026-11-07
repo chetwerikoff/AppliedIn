@@ -151,8 +151,9 @@ def _evaluate_one(pk: str) -> None:
     if flags.paused():  # pause must interrupt a long batch, not just start one
         stores.queue.enqueue(stores.tailor_queue, {"pk": pk})
         return
-    admitted = stores.tracking.get(pk) or {}
+    admitted = None
     try:
+        admitted = stores.tracking.get(pk)
         log.info("pipeline: %s", run_job(pk, stores))
     except Exception:
         # NEVER get stuck: mark the job errored so it leaves the `found`
@@ -160,8 +161,9 @@ def _evaluate_one(pk: str) -> None:
         log.exception("pipeline failed for %s", pk)
         try:
             from core.models import Status
-            _reader_patch(pk, admitted, stores, {
-                "status": Status.ERROR, "error": "pipeline error — see logs"})
+            if admitted is not None:
+                _reader_patch(pk, admitted, stores, {
+                    "status": Status.ERROR, "error": "pipeline error — see logs"})
         except Exception:
             log.exception("could not mark %s errored", pk)
 
@@ -498,7 +500,7 @@ def process_backlog_once(companies: list | None = None,
     loops are running. Blocking — run it in a background thread."""
     import asyncio
 
-    from agent.run import _apply_direct, _reader_eligible, prefetch_browser_jds, run_job
+    from agent.run import _apply_direct, _reader_eligible, _reader_patch, prefetch_browser_jds, run_job
     from core import flags as _flags
     from core.config import get_settings
     from core.models import Status
@@ -546,8 +548,8 @@ def process_backlog_once(companies: list | None = None,
             except Exception:
                 log.exception("process: evaluate failed for %s", row.get("pk"))
                 try:
-                    stores.tracking.set_status(row["pk"], Status.ERROR,
-                                               error="pipeline error — see logs")
+                    _reader_patch(row["pk"], row, stores, {
+                        "status": Status.ERROR, "error": "pipeline error — see logs"})
                 except Exception:
                     log.exception("could not mark %s errored", row.get("pk"))
 

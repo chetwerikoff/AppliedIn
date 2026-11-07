@@ -758,6 +758,76 @@ def test_process_backlog_contains_reader_storage_fault_after_manual_decision(
     assert not tracking.r.exists(f"lock:job:{pk}")
 
 
+@pytest.mark.parametrize("skip", [False, True])
+def test_manual_backlog_late_scorer_error_respects_admitted_generation(monkeypatch, skip):
+    import daemon
+    from agent.graph import ScorerModelError
+    from core import flags
+
+    _quiet(monkeypatch)
+    tracking, pk = _synthetic_tracking()
+    stores = SimpleNamespace(tracking=tracking)
+    monkeypatch.setattr(daemon, "make_stores", lambda: stores)
+    monkeypatch.setattr(flags, "skipped_companies", lambda: set())
+    monkeypatch.setattr(flags, "stop_epoch", lambda: 0)
+    monkeypatch.setattr(daemon, "_pass_cancelled", lambda *args: False)
+    monkeypatch.setattr(run, "prefetch_browser_jds", lambda *args: None)
+
+    async def fail(target, admitted, current_stores, **kwargs):
+        assert admitted["status"] == "tailoring"
+        if skip:
+            tracking.set_status(target, Status.SKIPPED, skip_reason="user_skipped")
+        raise ScorerModelError("synthetic provider failure")
+
+    monkeypatch.setattr(run, "_run_job_async", fail)
+    assert daemon.process_backlog_once(prepare_only=True)["evaluated"] == 0
+    row = tracking.get(pk)
+    assert row["status"] == ("skipped" if skip else "error")
+    if skip:
+        assert row["skip_reason"] == "user_skipped"
+    else:
+        # The manual wrapper must not overwrite run_job's useful failure reason.
+        assert "Scorer model/request failed" in row["error"]
+    assert not run._claimed(pk, stores)
+
+
+def test_evaluate_worker_survives_pre_run_tracking_read_failure(monkeypatch):
+    """A failed snapshot must not escape pool.map and kill subsequent sweeps."""
+    import daemon
+    from core import flags
+
+    batches = iter([[{"pk": "example-co#unreadable"}], [{"pk": "example-co#next"}]])
+    reads, evaluated = [], []
+
+    def get(pk):
+        reads.append(pk)
+        if pk.endswith("unreadable"):
+            raise RuntimeError("synthetic storage fault")
+        return {"pk": pk, "status": "found"}
+
+    stores = SimpleNamespace(tracking=SimpleNamespace(get=get), tailor_queue="tailor",
+                             queue=SimpleNamespace(drain=lambda queue: next(batches)))
+    monkeypatch.setattr(daemon, "make_stores", lambda: stores)
+    monkeypatch.setattr(flags, "paused", lambda: False)
+    monkeypatch.setattr(run, "run_job", lambda pk, stores: evaluated.append(pk))
+    sleeps = []
+
+    class SweepsFinished(Exception):
+        pass
+
+    def next_sweep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            raise SweepsFinished
+
+    monkeypatch.setattr(daemon.time, "sleep", next_sweep)
+    with pytest.raises(SweepsFinished):
+        daemon._worker_loop()
+    assert reads == ["example-co#unreadable", "example-co#next"]
+    assert evaluated == ["example-co#next"]
+    assert len(sleeps) == 2
+
+
 def test_requested_queue_put_hold_race_preserves_manual_terminal(monkeypatch):
     """A refused queue insertion cannot turn a newer APPLIED_MANUAL into TAILORED."""
     from core.apply_queue import ApplyQueue

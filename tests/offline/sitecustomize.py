@@ -24,6 +24,9 @@ sys.addaudithook(_offline_connection_guard)
 _popen_init = subprocess.Popen.__init__
 _startup = str(Path(__file__).resolve().parent)
 _root = os.environ["APPLIEDIN_OFFLINE_TEST_ROOT"]
+# Fixture entrypoints sanitize os.environ before importing product modules.
+# Keep the synthetic default available without requiring them to retain secrets.
+sys._appliedin_offline_test_root = _root
 
 
 def _offline_popen_init(self, *args, **kwargs):

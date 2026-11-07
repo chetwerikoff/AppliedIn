@@ -50,6 +50,7 @@ def test_worktree_requires_explicit_storage_but_accepts_disposable_path(monkeypa
     monkeypatch.setenv("ORCA_WORKTREE_PATH", str(tmp_path))
     monkeypatch.delenv("APPLIEDIN_LOCAL_DIR", raising=False)
     monkeypatch.delenv("APPLIEDIN_OFFLINE_TEST_ROOT", raising=False)
+    monkeypatch.setattr("core.config._OFFLINE_TEST_ROOT", None)
     with pytest.raises(ValueError, match="explicit APPLIEDIN_LOCAL_DIR"):
         Settings()
     assert not (tmp_path / ".local").exists()

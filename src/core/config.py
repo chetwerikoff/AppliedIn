@@ -8,6 +8,7 @@ in tests (moto) and prod unchanged.
 from __future__ import annotations
 
 import os
+import sys
 from functools import lru_cache
 
 from dotenv import load_dotenv
@@ -16,7 +17,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Load .env into the environment so both APPLIEDIN_* settings and the raw
 # provider keys (read by LiteLLM) are available from one file.
-if not os.environ.get("APPLIEDIN_OFFLINE_TEST_ROOT"):
+_OFFLINE_TEST_ROOT = (os.environ.get("APPLIEDIN_OFFLINE_TEST_ROOT")
+                      or getattr(sys, "_appliedin_offline_test_root", None))
+if not _OFFLINE_TEST_ROOT:
     load_dotenv()
 
 # This product runs on the owner's machine and says so. Any library that reads
@@ -70,11 +73,11 @@ class Settings(BaseSettings):
 
     # Local-mode backends
     redis_url: str = Field(default_factory=lambda: (
-        "redis://offline.invalid:1/0" if os.environ.get("APPLIEDIN_OFFLINE_TEST_ROOT")
+        "redis://offline.invalid:1/0" if _OFFLINE_TEST_ROOT
         else "redis://localhost:6379/0"
     ))
     local_dir: str = Field(default_factory=lambda: (
-        os.environ.get("APPLIEDIN_OFFLINE_TEST_ROOT") or ".local"
+        _OFFLINE_TEST_ROOT or ".local"
     ))
 
     @model_validator(mode="after")

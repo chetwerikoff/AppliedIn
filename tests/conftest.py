@@ -366,11 +366,16 @@ def _prove_factories_flags_events_stores(server, tmp_path):
 import os, sys
 from pathlib import Path
 import redis
+expected = sys.argv[1]
+if sys.argv[2] == "sanitized":
+    os.environ.clear()
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    expected = sys._appliedin_offline_test_root
 from core.config import get_settings
 s = get_settings()
-assert Path(s.local_dir) == Path(sys.argv[1])
+assert Path(s.local_dir) == Path(expected)
 assert s.redis_url == "redis://offline.invalid:1/0"
-if len(sys.argv) > 2:
+if sys.argv[2] == "custom":
     assert os.environ["SYNTHETIC_CHILD_STARTUP"] == "loaded"
 try:
     redis.Redis(host="127.0.0.1", port=1).ping()
@@ -382,11 +387,13 @@ else:
     (tmp_path / "sitecustomize.py").write_text(
         'import os\nos.environ["SYNTHETIC_CHILD_STARTUP"] = "loaded"\n'
     )
-    for child_env in (None, {"APPLIEDIN_LOCAL_DIR": settings.local_dir,
-                             "PYTHONPATH": str(tmp_path)}):
+    for child_env, mode in (
+        (None, "inherited"),
+        ({"APPLIEDIN_LOCAL_DIR": settings.local_dir, "PYTHONPATH": str(tmp_path)}, "custom"),
+        (None, "sanitized"),
+    ):
         child = subprocess.run(
-            [sys.executable, "-c", child_source, settings.local_dir,
-             *(["custom-startup"] if child_env is not None else [])],
+            [sys.executable, "-c", child_source, settings.local_dir, mode],
             env=child_env, capture_output=True, text=True, timeout=30,
         )
         assert child.returncode == 0, child.stderr

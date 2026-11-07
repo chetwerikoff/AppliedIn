@@ -55,14 +55,17 @@ def _resolve_opencode2():
     if saw_shim:
         # mise needs the caller's environment to select its installed tool;
         # do this before constructing the restricted OpenCode child environment.
-        try:
-            resolved = subprocess.run(
-                ["mise", "which", "opencode2"], env=os.environ.copy(),
-                capture_output=True, text=True, timeout=10,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        else:
+        for command in (
+            ["mise", "which", "opencode2"],
+            ["mise", "which", "opencode2", "--tool", "opencode@latest"],
+        ):
+            try:
+                resolved = subprocess.run(
+                    command, env=os.environ.copy(),
+                    capture_output=True, text=True, timeout=10,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
             binary = resolved.stdout.strip()
             if (resolved.returncode == 0 and Path(binary).is_absolute()
                     and Path(binary).is_file() and os.access(binary, os.X_OK)

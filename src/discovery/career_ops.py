@@ -175,6 +175,13 @@ def canonical(url: str) -> str:
     return urlunsplit(("https", host, p.path.rstrip("/"), urlencode(query), ""))
 
 
+def _query_job_id(url: str) -> str:
+    values = [value.strip() for key, value in parse_qsl(urlsplit(url).query)
+              if key.casefold() in {"gh_jid", "jobid", "job_id", "jid", "requisitionid", "reqid"}
+              and value.strip()]
+    return values[0] if len(values) == 1 else ""
+
+
 def normalize(raw: dict, company: str, provider: str, *,
               directory_event: bool = False) -> dict | None:
     url, title = str(raw.get("url") or ""), str(raw.get("title") or "").strip()
@@ -210,7 +217,7 @@ def normalize(raw: dict, company: str, provider: str, *,
         "id": identity,
         "job_id": str(
             raw.get("id")
-            or dict(parse_qsl(urlsplit(url).query)).get("gh_jid")
+            or _query_job_id(url)
             or urlsplit(url).path.rstrip("/").split("/")[-1]
             or identity
         ),
@@ -548,6 +555,21 @@ def search_reserved(
             _SCAN.release()
 
 
+def _index_without_job_id(url: str) -> bool:
+    """An invented result ID or last path segment cannot turn an index into a JD."""
+    parts = urlsplit(url)
+    if _query_job_id(url):
+        return False
+    path = parts.path.strip("/").casefold()
+    leaf = path.rsplit("/", 1)[-1]
+    if not path or leaf in {"careers", "career", "jobs", "job", "positions", "openings",
+                            "opportunities", "index", "index.html", "search", "job-search",
+                            "open-positions", "open-roles", "job-openings", "all-jobs"}:
+        return True
+    return parts.hostname in {"jobs.ashbyhq.com", "jobs.lever.co", "boards.greenhouse.io",
+                              "job-boards.greenhouse.io"} and "/" not in path
+
+
 def prepare(ids: list[str], stores=None, *, apply_requested: bool = False) -> dict:
     """Idempotent handoff; only an explicit Apply action authorizes submission."""
     stores = stores or make_stores()
@@ -566,6 +588,8 @@ def prepare(ids: list[str], stores=None, *, apply_requested: bool = False) -> di
         for identity in dict.fromkeys(ids):
             row = data["jobs"][identity]
             url = row["url"]
+            if _index_without_job_id(url):
+                continue
             if row["state"] != "new" or url in tracked or url in handled:
                 duplicates += 1
                 if url in tracked:
@@ -578,7 +602,7 @@ def prepare(ids: list[str], stores=None, *, apply_requested: bool = False) -> di
             path_id = urlsplit(url).path.rstrip("/").split("/")[-1]
             job = JobRecord(
                 company=row["company"],
-                job_id=row.get("job_id") or path_id or identity,
+                job_id=_query_job_id(url) or row.get("job_id") or path_id or identity,
                 title=row["title"],
                 jd_url=url,
                 jd_text=row["description"],

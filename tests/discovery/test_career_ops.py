@@ -108,6 +108,54 @@ def test_invalid_batch_changes_nothing(board):
     assert not stores.tracking.all()
 
 
+@pytest.mark.parametrize("url", [
+    "https://example.com/", "https://example.com/careers",
+    "https://example.com/careers/jobs?location=remote",
+    "https://jobs.ashbyhq.com/example-co", "https://jobs.lever.co/example-co",
+    "https://boards.greenhouse.io/example-co",
+    "https://example.com/careers/open-positions",
+    "https://example.com/careers/open-roles",
+    "https://example.com/jobs/job-openings",
+    "https://example.com/careers/all-jobs",
+])
+def test_prepare_does_not_turn_index_path_or_invented_id_into_a_posting(board, url):
+    stores, rows = board
+    data = co._read()
+    row = co.normalize({"url": url, "title": "Engineer", "id": "invented"}, "Acme", "web_search")
+    data["jobs"] = {row["id"]: row}
+    co._write(data)
+    assert co.prepare([row["id"]])["prepared"] == 0
+    assert not stores.tracking.all()
+    stores.queue.enqueue.assert_not_called()
+    assert co._read()["jobs"][row["id"]]["state"] == "new"
+
+
+@pytest.mark.parametrize("url", [
+    "https://example.com/careers/engineer-123",
+    "https://example.com/careers?gh_jid=123",
+    "https://example.com/jobs?jobId=123",
+])
+def test_prepare_preserves_detail_paths_and_explicit_query_job_ids(board, url):
+    stores, rows = board
+    data = co._read()
+    row = co.normalize({"url": url, "title": "Engineer"}, "Acme", "web_search")
+    data["jobs"] = {row["id"]: row}
+    co._write(data)
+    assert co.prepare([row["id"]])["prepared"] == 1
+    assert stores.tracking.all()[0]["jd_url"] == co.canonical(url)
+
+
+def test_query_details_on_one_index_keep_distinct_tracking_identities(board):
+    stores, _ = board
+    data = co._read()
+    rows = [co.normalize({"url": f"https://example.com/jobs?jobId={i}", "title": "Engineer"},
+                         "Acme", "web_search") for i in (123, 456)]
+    data["jobs"] = {row["id"]: row for row in rows}
+    co._write(data)
+    assert co.prepare(list(data["jobs"]))["prepared"] == 2
+    assert {row["pk"] for row in stores.tracking.all()} == {"acme#123", "acme#456"}
+
+
 def test_detail_drawer_reads_saved_description_without_starting_an_agent(board):
     stores, rows = board
     data = co._read()

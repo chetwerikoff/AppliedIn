@@ -31,13 +31,43 @@ def _country(location: str) -> str | None:
     return None
 
 
+_POSTING_CITIES = {
+    "toronto": "canada",
+    "hyderabad": "india",
+    "new york": "united states",
+    "new york city": "united states",
+    "nyc": "united states",
+    "sydney": "australia",
+}
+
+
+def posting_country(location: str) -> str | None:
+    """Resolve one posting place offline; never reinterpret allowed preferences.
+
+    A city plus its country describes one place. Two cities/countries, even in
+    the same country, or an unclassified component cannot prove disjointness.
+    """
+    region = re.sub(r"\b(?:remote|on-site|onsite|on site|hybrid)\b", "",
+                    location.strip().casefold()).strip(" ,-/()")
+    if country := _country(region):
+        return country
+    if region in _POSTING_CITIES:
+        return _POSTING_CITIES[region]
+    parts = [p.strip() for p in re.split(r"[,()]|\s+-\s+", region) if p.strip()]
+    if len(parts) != 2:
+        return None
+    for city, country in (parts, parts[::-1]):
+        if city in _POSTING_CITIES and _country(country) == _POSTING_CITIES[city]:
+            return _POSTING_CITIES[city]
+    return None
+
+
 def location_conflict(location: str, prefs: Preferences) -> str | None:
     """Only demonstrated work-format or country disjointness is a hard stop."""
     loc = location.strip().casefold()
     if prefs.remote_only and re.search(r"\b(?:on-site|onsite|on site|hybrid)\b", loc):
         return "remote only"
-    region = re.sub(r"\b(?:remote|on-site|onsite|on site|hybrid)\b", "", loc).strip(" ,-/()")
-    country = _country(region)
+    country = posting_country(loc)
     preferred = {_country(p.strip().casefold()) for p in prefs.locations}
     # Non-country keywords must not erase explicit preferred countries.
     preferred.discard(None)

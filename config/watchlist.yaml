@@ -198,8 +198,8 @@ companies:
     mode: gated
 
   - name: Thinking Machine
-    careers_url: https://thinkingmachines.ai/
-    discovery: browser
+    careers_url: https://jobs.ashbyhq.com/ThinkingMachines
+    discovery: feed
     mode: gated
 
   - name: Snap

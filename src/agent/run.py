@@ -45,6 +45,25 @@ def _session_service():
     if url.startswith("sqlite:///"):
         url = url.replace("sqlite:///", "sqlite+aiosqlite:///", 1)
     Path(s.local_dir).mkdir(parents=True, exist_ok=True)
+    if url.startswith("sqlite+aiosqlite://"):
+        from sqlalchemy import event
+
+        service = DatabaseSessionService(db_url=url, connect_args={"timeout": 30})
+
+        def _configure_sqlite(dbapi_connection, _connection_record):
+            # Each pooled connection needs the longer wait before trying WAL,
+            # or simultaneous ADK schema checks can fail with "database is locked".
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute("PRAGMA busy_timeout=30000")
+                cursor.execute("PRAGMA journal_mode=WAL")
+            finally:
+                cursor.close()
+
+        # ADK owns an async engine; configure its synchronous connect-event bridge
+        # per service instead of sharing engine state between loops or threads.
+        event.listen(service.db_engine.sync_engine, "connect", _configure_sqlite)
+        return service
     return DatabaseSessionService(db_url=url)
 
 

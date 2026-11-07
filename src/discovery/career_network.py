@@ -20,8 +20,27 @@ SOURCES = ("greenhouse", "lever", "ashby", "workday", "icims")
 
 def defaults() -> dict:
     prefs = co.search_preferences()
+    titles = prefs.get("titles", [])
+    # The scanner matches titles by substring, so a preference containing a
+    # strictly shorter listed title finds nothing new; drop only those, in
+    # original priority order, before the 100-title budget applies.
+    folded = [title.casefold() for title in titles]
+    positive = [
+        title for index, title in enumerate(titles)
+        if not any(
+            len(other) < len(folded[index]) and other in folded[index]
+            for other in folded
+        )
+    ]
+    if len(positive) > 100:
+        co.log.warning(
+            "Career Ops network titles: %d survive coverage filtering; "
+            "using the first 100.",
+            len(positive),
+        )
+        positive = positive[:100]
     return {
-        "positive": prefs.get("titles", [])[:50],
+        "positive": positive,
         "negative": prefs.get("exclude_keywords", [])[:50],
         "locations": prefs.get("locations", [])[:200],
         "ats": list(SOURCES[:4]),
@@ -39,7 +58,7 @@ def _saved_state(data: dict) -> dict:
     filters = state.get("filters")
     if not isinstance(filters, dict):
         raise ValueError("Saved network search filters are missing or invalid.")
-    for key, maximum in (("positive", 50), ("negative", 50), ("locations", 200)):
+    for key, maximum in (("positive", 100), ("negative", 50), ("locations", 200)):
         values = filters.get(key)
         if (not isinstance(values, list) or len(values) > maximum
                 or any(not isinstance(item, str) for item in values)):

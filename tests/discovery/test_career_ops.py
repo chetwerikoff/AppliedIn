@@ -1,6 +1,7 @@
 """A public search result cannot silently become an approved application."""
 
 import json
+import logging
 import subprocess
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ from unittest.mock import Mock
 import fakeredis
 import pytest
 from fastapi import BackgroundTasks
+from pydantic import ValidationError
 
 from core.models import JobRecord, Status
 from core.storage.local import RedisTracking
@@ -873,14 +875,15 @@ def test_scheduled_defaults_are_bounded_and_saved_filters_stay_exact(
     board, monkeypatch,
 ):
     network, _, clock, _ = _network_fixture(board, monkeypatch)
-    positive = [f"Title {i}" for i in range(64)]
+    # Same-length distinct titles: none can contain a strictly shorter one.
+    positive = [f"Title {i:03d}" for i in range(77)]
     negative = [f"Excluded {i}" for i in range(55)]
     locations = [f"Region {i}" for i in range(211)]
     monkeypatch.setattr(co, "search_preferences", lambda company="": {
         "titles": positive, "exclude_keywords": negative, "locations": locations,
     })
     defaults = network.defaults()
-    assert defaults["positive"] == positive[:50]
+    assert defaults["positive"] == positive
     assert defaults["negative"] == negative[:50]
     assert defaults["locations"] == locations[:200]
     assert "provider" not in defaults and "interests" not in defaults
@@ -922,6 +925,70 @@ def test_scheduled_defaults_are_bounded_and_saved_filters_stay_exact(
     assert after["network_search"]["filters"] == filters
     assert after["network_search"]["id"] == state["id"]
     assert after["last_network"]["started_at"] == clock["now"].isoformat()
+
+
+def test_network_defaults_drop_only_titles_covered_by_shorter_listed_title(
+    monkeypatch,
+):
+    from discovery import career_network as network
+
+    # "senior ENGINEER" is covered case-insensitively; "Analyst" stays in order.
+    monkeypatch.setattr(co, "search_preferences", lambda company="": {
+        "titles": ["Engineer", "senior ENGINEER", "Analyst"],
+        "exclude_keywords": [], "locations": [],
+    })
+    assert network.defaults()["positive"] == ["Engineer", "Analyst"]
+
+
+def test_network_defaults_keep_seventy_seven_uncovered_titles(monkeypatch):
+    from discovery import career_network as network
+
+    titles = [f"Title {i:03d}" for i in range(77)]
+    monkeypatch.setattr(co, "search_preferences", lambda company="": {
+        "titles": titles, "exclude_keywords": [], "locations": [],
+    })
+    assert network.defaults()["positive"] == titles
+
+
+def test_network_defaults_warn_once_and_keep_first_hundred_on_overflow(
+    monkeypatch, caplog,
+):
+    from discovery import career_network as network
+
+    titles = [f"Title {i:03d}" for i in range(130)]
+    monkeypatch.setattr(co, "search_preferences", lambda company="": {
+        "titles": titles, "exclude_keywords": [], "locations": [],
+    })
+    with caplog.at_level(logging.WARNING, logger="discovery.career_ops"):
+        defaults = network.defaults()
+    assert defaults["positive"] == titles[:100]
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+
+
+def test_network_api_positive_cap_is_one_hundred_titles():
+    titles = [f"Title {i:03d}" for i in range(100)]
+    assert api.NetworkSearch(ats=["ashby"], positive=titles).positive == titles
+    with pytest.raises(ValidationError):
+        api.NetworkSearch(ats=["ashby"], positive=[*titles, "One more"])
+
+
+def test_saved_state_positive_cap_is_one_hundred_titles():
+    from discovery import career_network as network
+
+    titles = [f"Title {i:03d}" for i in range(100)]
+    state = {
+        "id": "example-search", "filters": _network_filters(positive=titles),
+        "cursor": {}, "cutoff": "2026-10-08T12:00:00+00:00", "coverage": {},
+    }
+    assert network._saved_state({"network_search": state})["filters"]["positive"] == titles
+    oversized = {
+        "id": "example-search",
+        "filters": _network_filters(positive=[*titles, "One more"]),
+        "cursor": {}, "cutoff": "2026-10-08T12:00:00+00:00", "coverage": {},
+    }
+    with pytest.raises(ValueError, match="positive"):
+        network._saved_state({"network_search": oversized})
 
 
 def test_invalid_saved_search_is_visible_and_not_reconstructed(board, monkeypatch):
@@ -1330,7 +1397,7 @@ def test_invalid_network_resume_keeps_original_batch_start_until_repaired(
     elif corruption == "cutoff":
         state["cutoff"] = "invalid-cutoff"
     else:
-        state["filters"] = {**state["filters"], "positive": ["Engineer"] * 51}
+        state["filters"] = {**state["filters"], "positive": ["Engineer"] * 101}
 
     data = co._read()
     data["jobs"].update({row["id"]: row for row in rows})

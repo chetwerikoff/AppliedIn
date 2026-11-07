@@ -72,8 +72,10 @@ def search(
         from discovery.codex_search import run_search
     elif provider == "claude":
         from discovery.claude_search import run_search
+    elif provider == "opencode":
+        from discovery.opencode_search import run_search
     else:
-        raise ValueError("Choose Claude or Codex for AI search.")
+        raise ValueError("Choose Claude, Codex or OpenCode for AI search.")
 
     schema = {
         "type": "object",
@@ -184,7 +186,8 @@ def search(
         if jobs
         else re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", str(parsed.get("summary") or ""))
     )
-    return {"jobs": jobs, "summary": summary, "queries": queries}
+    return {"jobs": jobs, "summary": summary, "queries": queries,
+            **({"model": result["model"]} if "model" in result else {})}
 
 
 def _verify_lead(row: dict) -> dict | None:

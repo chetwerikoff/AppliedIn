@@ -24,7 +24,7 @@ class BoardSettings(BaseModel):
     auto_prepare: bool
     interests: str = Field(default="", max_length=600)
     scheduled_interests: bool = False
-    search_provider: Literal["claude", "codex"] = "claude"
+    search_provider: Literal["claude", "codex", "opencode"] = "claude"
 
 
 class ScanScope(BaseModel):
@@ -33,11 +33,11 @@ class ScanScope(BaseModel):
 
 class InterestSearch(ScanScope):
     interests: str | None = Field(default=None, max_length=600)
-    provider: Literal["claude", "codex"] = "claude"
+    provider: Literal["claude", "codex", "opencode"] = "claude"
 
 
 class SearchProvider(BaseModel):
-    provider: Literal["claude", "codex"]
+    provider: Literal["claude", "codex", "opencode"]
 
 
 @router.post("/provider")
@@ -50,7 +50,7 @@ def provider(body: SearchProvider):
 
 
 class NetworkSearch(BaseModel):
-    provider: Literal["claude", "codex"] = "claude"
+    provider: Literal["claude", "codex", "opencode"] = "claude"
     interests: str = Field(default="", max_length=600)
     positive: list[str] = Field(default_factory=list, max_length=50)
     negative: list[str] = Field(default_factory=list, max_length=50)

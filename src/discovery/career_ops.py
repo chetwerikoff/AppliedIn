@@ -515,6 +515,7 @@ def search_reserved(
             provider=provider,
         )
         receipt.update(summary=result["summary"], queries=result["queries"])
+        receipt.update({"model": result["model"]} if "model" in result else {})
         grouped = {}
         from discovery.watchlist import load_watchlist
 

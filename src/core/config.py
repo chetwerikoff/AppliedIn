@@ -104,6 +104,7 @@ class Settings(BaseSettings):
     #   local -> Redis (tracking/queue) + filesystem (artifacts)
     #   cloud -> DynamoDB + SQS + S3
     mode: str = "local"  # local | cloud
+    search_model: str = "openai/gpt-6.1-sol"
 
     # Local-mode backends
     redis_url: str = Field(default_factory=lambda: (

@@ -163,10 +163,6 @@ def run_reserved(filters: dict, resume: bool = False) -> None:
 
             from discovery.interest_search import search
 
-            if filters["provider"] == "codex":
-                from discovery.codex_search import run_search
-            else:
-                from discovery.claude_search import run_search
             prefs = {
                 **co.search_preferences(),
                 "titles": filters["positive"],
@@ -174,6 +170,14 @@ def run_reserved(filters: dict, resume: bool = False) -> None:
                 "exclude_keywords": filters["negative"],
             }
             try:
+                if filters["provider"] == "codex":
+                    from discovery.codex_search import run_search
+                elif filters["provider"] == "claude":
+                    from discovery.claude_search import run_search
+                elif filters["provider"] == "opencode":
+                    from discovery.opencode_search import run_search
+                else:
+                    raise ValueError("Choose Claude, Codex or OpenCode for AI search.")
                 result = search(
                     prefs,
                     filters.get("interests", ""),
@@ -194,6 +198,7 @@ def run_reserved(filters: dict, resume: bool = False) -> None:
                     receipt,
                 )
                 receipt["queries"] = result["queries"]
+                receipt.update({"model": result["model"]} if "model" in result else {})
             except Exception as exc:
                 if not STOP.is_set():
                     receipt["errors"].append({"company": filters["provider"], "error": str(exc)})

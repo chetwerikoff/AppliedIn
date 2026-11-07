@@ -14,6 +14,67 @@ from jsonschema import ValidationError, validate
 from discovery.claude_search import TIMEOUT, watch_cancellation
 
 
+_INSTALL_CLI_ERROR = "Install OpenCode CLI (opencode2) and sign in with your ChatGPT account."
+
+
+def _is_mise_shim(path):
+    # A mise shim may be first on PATH, but cannot run under the search sandbox.
+    candidate = Path(path)
+    if candidate.is_symlink():
+        # User/system shims_dir can be a shared bin dir: recognize Unix mise
+        # links by target, not by rejecting every executable in that directory.
+        target = candidate.resolve()
+        if target.name == "mise":
+            return True
+        mise = shutil.which("mise")
+        if mise and target == Path(mise).resolve():
+            return True
+    for location in (candidate, candidate.resolve()):
+        parts = location.parts
+        if any(part == "shims" and ("mise" in parts[:index] or ".mise" in parts[:index])
+               for index, part in enumerate(parts)):
+            return True
+        data_dir = os.environ.get("MISE_DATA_DIR")
+        if data_dir and location.is_relative_to((Path(data_dir).expanduser() / "shims").resolve()):
+            return True
+    return False
+
+
+def _resolve_opencode2():
+    saw_shim = False
+    for directory in os.get_exec_path():
+        found = shutil.which("opencode2", path=directory)
+        if not found:
+            continue
+        found = os.path.abspath(found)
+        if _is_mise_shim(found):
+            saw_shim = True
+            continue
+        return found
+
+    if saw_shim:
+        # mise needs the caller's environment to select its installed tool;
+        # do this before constructing the restricted OpenCode child environment.
+        for command in (
+            ["mise", "which", "opencode2"],
+            ["mise", "which", "opencode2", "--tool", "opencode@latest"],
+        ):
+            try:
+                resolved = subprocess.run(
+                    command, env=os.environ.copy(),
+                    capture_output=True, text=True, timeout=10,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            binary = resolved.stdout.strip()
+            if (resolved.returncode == 0 and Path(binary).is_absolute()
+                    and Path(binary).is_file() and os.access(binary, os.X_OK)
+                    and not _is_mise_shim(binary)):
+                return binary
+    raise ValueError(_INSTALL_CLI_ERROR)
+
+
+
 def search_env(cwd, model):
     provider, _, name = model.partition("/")
     if provider != "openai" or not name.strip():
@@ -171,9 +232,7 @@ def run_search(prompt, schema, progress, *, cancelled=None, interests="", titles
     from core.config import get_settings
     from core.steering import prompt as steer
 
-    binary = shutil.which("opencode2")
-    if not binary:
-        raise ValueError("Install OpenCode CLI (opencode2) and sign in with your ChatGPT account.")
+    binary = _resolve_opencode2()
     model = get_settings().search_model
     with tempfile.TemporaryDirectory(prefix="appliedin-opencode-search-") as cwd:
         env = search_env(cwd, model)

@@ -538,7 +538,7 @@ def test_recovered_reader_uses_review_agent_for_ordinary_posting(monkeypatch):
 
     monkeypatch.setattr(run, "Runner", FakeRunner)
 
-    async def prepared(runner, pk, message, stores, *, prepare_only):
+    async def prepared(runner, pk, message, stores, *, prepare_only, observed):
         assert prepare_only
         stores.tracking.set_status(pk, Status.TAILORED,
                                    resume_s3_key="resumes/example-co-job-1.pdf")
@@ -577,7 +577,9 @@ def test_reopen_safe_closed_row_schedules_once_and_conflicts_stop(monkeypatch):
 
     tracking, pk = _synthetic_tracking()
     tracking.set_status(pk, Status.SKIPPED, skip_reason="synthetic")
-    stores = SimpleNamespace(tracking=tracking)
+    queued = []
+    stores = SimpleNamespace(tracking=tracking, tailor_queue="tailor",
+                             queue=SimpleNamespace(enqueue=lambda q, item: queued.append(item)))
     monkeypatch.setattr(server, "make_stores", lambda *a, **kw: stores)
     monkeypatch.setattr(server, "get_settings", lambda: SimpleNamespace())
     events = []
@@ -590,7 +592,9 @@ def test_reopen_safe_closed_row_schedules_once_and_conflicts_stop(monkeypatch):
     assert result["ok"] is True
     assert tracking.get(pk)["status"] == "found"
     assert tracking.get(pk)["jd_read_revision"] == 1
-    assert len(tasks.tasks) == 1
+    assert not tasks.tasks
+    assert queued == [{"pk": pk}]
+    assert tracking.get(pk)["rescore_requested"] is True
     assert len(events) == 1
 
     tracking.set_status(pk, Status.FAILED, jd_read_attempts=0,
@@ -611,6 +615,85 @@ def test_reopen_safe_closed_row_schedules_once_and_conflicts_stop(monkeypatch):
     assert tracking.get(pk)["jd_read_attempts"] == before["jd_read_attempts"]
     assert not events
     assert not tasks.tasks
+
+
+@pytest.mark.parametrize("hanging", [False, True], ids=["raising", "hanging"])
+def test_many_reopens_share_evaluate_lanes_and_release_failed_runs(monkeypatch, hanging):
+    """Exercise the real queue drain/pool, admission, error exit and claim release.
+
+    The fake provider honors LiteLLM's configured request timeout without ever
+    making a request. Synchronizing lane entry proves actual overlap, not just
+    that some sequential invocation happened to stay below the limit.
+    """
+    import threading
+    import litellm
+    import daemon
+    import server
+    from core import flags
+    from fastapi import BackgroundTasks
+
+    tracking, pk = _synthetic_tracking()
+    pending = []
+    stores = SimpleNamespace(
+        tracking=tracking, tailor_queue="tailor",
+        queue=SimpleNamespace(
+            enqueue=lambda queue, item: pending.append(item),
+            drain=lambda queue: list(pending)))
+    monkeypatch.setattr(server, "make_stores", lambda *a, **kw: stores)
+    monkeypatch.setattr(server, "get_settings", lambda: SimpleNamespace())
+    monkeypatch.setattr(daemon, "make_stores", lambda: stores)
+    monkeypatch.setattr(flags, "paused", lambda: False)
+    monkeypatch.setattr("core.events.emit", lambda *a, **kw: None)
+    monkeypatch.setattr(daemon, "_EVAL_LANES", 2)
+    monkeypatch.setattr(litellm, "request_timeout", 0.01)
+    endpoint = next(r.endpoint for r in server.create_app().routes
+                    if getattr(r, "path", "") == "/actions/reopen/{pk:path}")
+    pks = [f"example-co#synthetic-{n}" for n in range(8)]
+    for target in pks:
+        tracking.set_status(target, Status.SKIPPED, company="example-co",
+                            title="Synthetic role", jd_url="https://example.com/test")
+        tasks = BackgroundTasks()
+        assert endpoint(target, tasks)["status"] == "queued"
+        assert not tasks.tasks
+    assert len(pending) == len(pks)
+    active = maximum = 0
+    lock = threading.Lock()
+    barrier = threading.Barrier(2, timeout=5)
+    reset = []
+
+    async def reset_session(target):
+        reset.append(target)
+
+    async def provider(target, admitted, current_stores, **kwargs):
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+        try:
+            barrier.wait()
+            if hanging:
+                await asyncio.wait_for(asyncio.Event().wait(), litellm.request_timeout)
+            raise RuntimeError("synthetic provider failure")
+        finally:
+            with lock:
+                active -= 1
+
+    class BatchFinished(Exception):
+        pass
+
+    def finish_batch(seconds):
+        raise BatchFinished
+
+    monkeypatch.setattr(run, "_reset_session", reset_session)
+    monkeypatch.setattr(run, "_run_job_async", provider)
+    monkeypatch.setattr(daemon.time, "sleep", finish_batch)
+    with pytest.raises(BatchFinished):
+        daemon._worker_loop()
+    assert maximum == 2 and active == 0
+    assert sorted(reset) == sorted(pks)
+    for target in pks:
+        assert tracking.get(target)["status"] == "error"
+        assert not run._claimed(target, stores)
 
 
 def test_process_backlog_contains_reader_storage_fault_after_manual_decision(
@@ -895,7 +978,7 @@ def test_actual_skip_then_retry_remains_review_only(
     async def recovered(row, **kw):
         return GOOD
 
-    async def prepared(runner, current_pk, message, current_stores, *, prepare_only):
+    async def prepared(runner, current_pk, message, current_stores, *, prepare_only, observed):
         assert prepare_only is True
         current_stores.tracking.set_status(
             current_pk, Status.TAILORED,

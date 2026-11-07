@@ -472,18 +472,32 @@ def test_committed_artifact_must_match_current_successful_tool_result(pdf_world)
     assert w.stores.queue.calls == []
 
 
-@pytest.mark.parametrize("concurrent", ["applied", "submitting", "needs_human"])
+@pytest.mark.parametrize("concurrent", ["applied", "submitting", "needs_human", "skipped"])
 def test_pdf_commit_and_failure_never_overwrite_competing_generation(pdf_world, concurrent):
     from agent import run as R
     w = pdf_world
     def compete():
-        w.stores.tracking.row.update(status=concurrent, jd_read_revision=100,
+        w.stores.tracking.row.update(status=concurrent,
                                     confirmation_id="synthetic" if concurrent == "applied" else "")
+        if concurrent != "skipped":
+            w.stores.tracking.row["jd_read_revision"] = 100
     w.before_render = compete
     out = R.run_job(w.pk, w.stores, prepare_only=True)
     assert out["result"] in ("conflict", "refused")
     assert w.stores.tracking.row["status"] == concurrent
     assert w.stores.tracking.row["resume_s3_key"] == "resumes/old.pdf"
+    assert w.stores.artifacts.get("resumes/old.pdf") == b"%PDF-old"
+    assert w.stores.queue.calls == []
+
+
+@pytest.mark.parametrize("script", [["runner-error"], ["ok", "runner-error"]])
+def test_preparation_exception_uses_latest_pdf_witness_and_leaves_no_working_row(pdf_world, script):
+    from agent import run as R
+    w = pdf_world
+    w.script = script
+    with pytest.raises(RuntimeError, match="synthetic runner failure"):
+        R.run_job(w.pk, w.stores, prepare_only=True)
+    assert w.stores.tracking.row["status"] == "error"
     assert w.stores.artifacts.get("resumes/old.pdf") == b"%PDF-old"
     assert w.stores.queue.calls == []
 

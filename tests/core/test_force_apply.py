@@ -64,6 +64,8 @@ def test_score_override_does_not_lower_the_bar_for_other_roles(force):
     assert endpoint('meta#low', BackgroundTasks())['ok']
     assert run._score_gate('meta#low', '{"score":6}', stores) is None
     assert stores.tracking.get('meta#low')['match_score'] == 6
+    # The other scorer has independently admitted its row before scoring.
+    stores.tracking.set_status('other#low', Status.TAILORING)
     assert run._score_gate('other#low', '{"score":6}', stores)['result'] == 'skipped'
 
 

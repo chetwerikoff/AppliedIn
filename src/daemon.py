@@ -144,13 +144,14 @@ def _evaluate_one(pk: str) -> None:
     if _flags.paused():
         return
 
-    from agent.run import run_job
+    from agent.run import _reader_patch, run_job
     from core import flags
 
     stores = make_stores()
     if flags.paused():  # pause must interrupt a long batch, not just start one
         stores.queue.enqueue(stores.tailor_queue, {"pk": pk})
         return
+    admitted = stores.tracking.get(pk) or {}
     try:
         log.info("pipeline: %s", run_job(pk, stores))
     except Exception:
@@ -159,8 +160,8 @@ def _evaluate_one(pk: str) -> None:
         log.exception("pipeline failed for %s", pk)
         try:
             from core.models import Status
-            stores.tracking.set_status(pk, Status.ERROR,
-                                       error="pipeline error — see logs")
+            _reader_patch(pk, admitted, stores, {
+                "status": Status.ERROR, "error": "pipeline error — see logs"})
         except Exception:
             log.exception("could not mark %s errored", pk)
 

@@ -418,3 +418,73 @@ def test_shim_only_resolution_failure_keeps_install_cli_error(cli, tmp_path, mon
         oc.run_search("Synthetic query", SCHEMA, lambda _: None)
     subprocess_run.assert_called_once()
     launch.assert_not_called()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="mise Unix shims are symlinks")
+@pytest.mark.parametrize("shim_setting", [None, "MISE_SHIMS_DIR", "MISE_SYSTEM_SHIMS_DIR"])
+def test_custom_mise_symlink_shim_does_not_shadow_later_real_binary(
+        cli, tmp_path, monkeypatch, shim_setting):
+    # A global/system shims_dir can be shared-bin with no 'mise/shims' ancestor.
+    # The symlink points at mise; a later real CLI must win without calling mise.
+    mise = synthetic_executable(tmp_path / "installed-tools" / "mise")
+    shared = tmp_path / "shared-bin"
+    shared.mkdir()
+    (shared / "opencode2").symlink_to(mise)
+    real = synthetic_executable(tmp_path / "real-bin" / "opencode2")
+    monkeypatch.delenv("MISE_SHIMS_DIR", raising=False)
+    monkeypatch.delenv("MISE_SYSTEM_SHIMS_DIR", raising=False)
+    if shim_setting:
+        monkeypatch.setenv(shim_setting, str(shared))
+    monkeypatch.setenv("PATH", os.pathsep.join((str(shared), str(real.parent))))
+    monkeypatch.setattr(oc.shutil, "which", real_which)
+    _, launch, cleanup = cli
+
+    result = oc.run_search("Find synthetic roles", SCHEMA, lambda _: None)
+
+    assert result["source_urls"] == {GOOD}
+    assert [call.args[0][0] for call in launch.call_args_list] == [str(real), str(real)]
+    cleanup.assert_called_once()
+    assert cleanup.call_args.args[0][0] == str(real)
+
+
+@pytest.mark.parametrize("shim_setting", ["MISE_SHIMS_DIR", "MISE_SYSTEM_SHIMS_DIR"])
+def test_real_executable_in_configured_shared_shims_dir_is_not_skipped(
+        cli, tmp_path, monkeypatch, shim_setting):
+    # Directory membership alone is unsafe: a shared shims_dir can hold real CLIs.
+    real = synthetic_executable(tmp_path / "shared-bin" / "opencode2")
+    monkeypatch.setenv(shim_setting, str(real.parent))
+    monkeypatch.setenv("PATH", str(real.parent))
+    monkeypatch.setattr(oc.shutil, "which", real_which)
+    _, launch, cleanup = cli
+
+    oc.run_search("Find synthetic roles", SCHEMA, lambda _: None)
+
+    assert [call.args[0][0] for call in launch.call_args_list] == [str(real), str(real)]
+    assert cleanup.call_args.args[0][0] == str(real)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="mise Unix shims are symlinks")
+def test_custom_symlink_shim_with_only_mise_falls_back_to_which(cli, tmp_path, monkeypatch):
+    mise = synthetic_executable(tmp_path / "installed-tools" / "mise")
+    shared = tmp_path / "custom-shim-bin"
+    shared.mkdir()
+    (shared / "opencode2").symlink_to(mise)
+    real = synthetic_executable(tmp_path / "installed" / "opencode2")
+    monkeypatch.setenv("PATH", str(shared))
+    monkeypatch.setenv("MISE_SYSTEM_SHIMS_DIR", str(shared))
+    monkeypatch.setattr(oc.shutil, "which", real_which)
+    _, launch, subprocess_run = cli
+
+    def fake_mise(command, **kwargs):
+        if command == ["mise", "which", "opencode2"]:
+            return subprocess.CompletedProcess(command, 0, stdout=f"{real}\n", stderr="")
+        return subprocess.CompletedProcess(command, 0)
+
+    subprocess_run.side_effect = fake_mise
+    result = oc.run_search("Find synthetic roles", SCHEMA, lambda _: None)
+
+    assert result["source_urls"] == {GOOD}
+    assert subprocess_run.call_args_list[0].args[0] == ["mise", "which", "opencode2"]
+    assert subprocess_run.call_args_list[0].kwargs["env"]["PATH"] == str(shared)
+    assert [call.args[0][0] for call in launch.call_args_list] == [str(real), str(real)]
+    assert launch.call_args.kwargs["env"]["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"

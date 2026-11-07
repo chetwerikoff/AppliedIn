@@ -19,7 +19,17 @@ _INSTALL_CLI_ERROR = "Install OpenCode CLI (opencode2) and sign in with your Cha
 
 def _is_mise_shim(path):
     # A mise shim may be first on PATH, but cannot run under the search sandbox.
-    for location in (Path(path), Path(path).resolve()):
+    candidate = Path(path)
+    if candidate.is_symlink():
+        # User/system shims_dir can be a shared bin dir: recognize Unix mise
+        # links by target, not by rejecting every executable in that directory.
+        target = candidate.resolve()
+        if target.name == "mise":
+            return True
+        mise = shutil.which("mise")
+        if mise and target == Path(mise).resolve():
+            return True
+    for location in (candidate, candidate.resolve()):
         parts = location.parts
         if any(part == "shims" and ("mise" in parts[:index] or ".mise" in parts[:index])
                for index, part in enumerate(parts)):

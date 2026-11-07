@@ -743,6 +743,7 @@ def auto_prepare(stores, since: str, companies: set[str] | None, *,
 
 
 def scheduled_tick() -> None:
+    global _RUNNING, _ACTIVE
     from core import flags
 
     if flags.paused() or not checkout().exists():
@@ -753,24 +754,28 @@ def scheduled_tick() -> None:
     current = datetime.fromisoformat(now())
     due = []
 
+    def finished(stamp: str) -> datetime:
+        value = datetime.fromisoformat(stamp)
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+
     def elapsed(stamp: str) -> bool:
-        return (current - datetime.fromisoformat(stamp)).total_seconds() >= 6 * 3600
+        return (current - finished(stamp)).total_seconds() >= 6 * 3600
 
     # Retain the existing first-run policies for interests and watchlist feeds.
     search_last = (data.get("last_search") or {}).get("finished_at")
     if settings.get("scheduled_interests") and search_last and elapsed(search_last):
-        due.append((search_last, 1, "interests"))
+        due.append((finished(search_last), 1, "interests"))
     if settings.get("scheduled"):
         feed_last = (data.get("last_scan") or {}).get("finished_at")
         if feed_last and elapsed(feed_last):
-            due.append((feed_last, 2, "feeds"))
+            due.append((finished(feed_last), 2, "feeds"))
         network_last = (data.get("last_network") or {}).get("finished_at")
         # Missing receipt or an unfinalized crash is immediately eligible. All
         # finalized outcomes, including STOP and errors, wait the full six hours.
         if not network_last:
-            due.append(("", 0, "network"))
+            due.append((datetime.min.replace(tzinfo=UTC), 0, "network"))
         elif elapsed(network_last):
-            due.append((network_last, 0, "network"))
+            due.append((finished(network_last), 0, "network"))
 
     # An available reservation services one oldest due item. No timestamp is
     # consumed when acquisition or thread start fails.
@@ -803,7 +808,6 @@ def scheduled_tick() -> None:
         except Exception:
             log.exception("Career Ops scheduled %s thread could not start", kind)
             with _LOCK:
-                global _RUNNING, _ACTIVE
                 _RUNNING = False
                 _ACTIVE = {}
             _SCAN.release()

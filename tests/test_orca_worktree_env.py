@@ -56,10 +56,35 @@ def _run_setup(tmp_path: Path, root: Path, worktree: Path) -> None:
     assert marker.read_bytes() == b"sync --all-groups\n"
 
 
-def _assert_port_only_env(worktree: Path) -> None:
+def _assert_isolated_env(worktree: Path) -> None:
     env_file = worktree / ".env"
     assert env_file.is_file() and not env_file.is_symlink()
-    assert env_file.read_bytes() == f"APPLIEDIN_WEB_PORT={_selected_port(worktree)}\n".encode()
+    from dotenv import dotenv_values
+    import cli
+    import pytest
+    from core.config import get_settings
+
+    port = _selected_port(worktree)
+    values = dotenv_values(env_file)
+    assert values == {
+        "APPLIEDIN_WEB_PORT": str(port),
+        "APPLIEDIN_LOCAL_DIR": str(worktree / f".local-{port}"),
+        "APPLIEDIN_REDIS_URL": f"redis://localhost:6379/{1 + port % 15}",
+    }
+    with pytest.MonkeyPatch.context() as private:
+        for key, value in values.items():
+            private.setenv(key, value)
+        private.setenv("ORCA_WORKTREE_PATH", str(worktree))
+        private.setattr(cli, "CONFIGURED_PORT", port)
+        try:
+            # This is the previously leaky configured-default CLI branch, not
+            # merely a check of the values emitted by the setup script.
+            instance = cli._apply_instance(None)
+            assert Path(instance["local_dir"]).parent == worktree
+            assert instance["redis"].rsplit("/", 1)[1] not in {"0", "14"}
+        finally:
+            get_settings.cache_clear()
+    assert not (worktree / ".local").exists()
 
 
 def test_replaces_stale_env_without_inheriting_root_and_is_repeatable(tmp_path: Path) -> None:
@@ -71,12 +96,12 @@ def test_replaces_stale_env_without_inheriting_root_and_is_repeatable(tmp_path: 
     (worktree / ".env").write_bytes(STALE_SENTINEL)
 
     _run_setup(tmp_path, root, worktree)
-    _assert_port_only_env(worktree)
+    _assert_isolated_env(worktree)
     assert root_env.read_bytes() == ROOT_SENTINEL
 
     # Another setup must not append a duplicate port or preserve stale assignments.
     _run_setup(tmp_path, root, worktree)
-    _assert_port_only_env(worktree)
+    _assert_isolated_env(worktree)
     assert root_env.read_bytes() == ROOT_SENTINEL
 
 
@@ -89,7 +114,7 @@ def test_replaces_symlink_without_writing_synthetic_root_env(tmp_path: Path) -> 
     (worktree / ".env").symlink_to(root_env)
 
     _run_setup(tmp_path, root, worktree)
-    _assert_port_only_env(worktree)
+    _assert_isolated_env(worktree)
     assert root_env.read_bytes() == ROOT_SENTINEL
 
 
@@ -100,7 +125,7 @@ def test_setup_needs_no_root_env(tmp_path: Path) -> None:
     assert not (root / ".env").exists()
 
     _run_setup(tmp_path, root, worktree)
-    _assert_port_only_env(worktree)
+    _assert_isolated_env(worktree)
     assert not (root / ".env").exists()
 
 
@@ -113,7 +138,7 @@ def test_reserved_redis_db_slot_is_skipped(tmp_path: Path) -> None:
     base = _base_port(worktree)
 
     _run_setup(tmp_path, root, worktree)
-    _assert_port_only_env(worktree)
+    _assert_isolated_env(worktree)
     assert _selected_port(worktree) == base + 1
     assert 1 + (_selected_port(worktree) % 15) != 14
 

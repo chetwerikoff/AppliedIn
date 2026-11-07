@@ -11,11 +11,13 @@ import os
 from functools import lru_cache
 
 from dotenv import load_dotenv
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Load .env into the environment so both APPLIEDIN_* settings and the raw
 # provider keys (read by LiteLLM) are available from one file.
-load_dotenv()
+if not os.environ.get("APPLIEDIN_OFFLINE_TEST_ROOT"):
+    load_dotenv()
 
 # This product runs on the owner's machine and says so. Any library that reads
 # this at import time gets the answer the product already gives: no phoning home.
@@ -67,8 +69,21 @@ class Settings(BaseSettings):
     mode: str = "local"  # local | cloud
 
     # Local-mode backends
-    redis_url: str = "redis://localhost:6379/0"
-    local_dir: str = ".local"  # artifacts on disk
+    redis_url: str = Field(default_factory=lambda: (
+        "redis://offline.invalid:1/0" if os.environ.get("APPLIEDIN_OFFLINE_TEST_ROOT")
+        else "redis://localhost:6379/0"
+    ))
+    local_dir: str = Field(default_factory=lambda: (
+        os.environ.get("APPLIEDIN_OFFLINE_TEST_ROOT") or ".local"
+    ))
+
+    @model_validator(mode="after")
+    def explicit_worktree_storage(self):
+        # Orca supplies the worktree identity; do not infer a primary checkout.
+        # A missing setup must fail before any filesystem store creates .local.
+        if self.mode == "local" and os.environ.get("ORCA_WORKTREE_PATH") and self.local_dir == ".local":
+            raise ValueError("Worktrees require an explicit APPLIEDIN_LOCAL_DIR; rerun Orca setup")
+        return self
 
     # Resource names / URLs (cloud mode; injected by CDK)
     applications_table: str = "applications"

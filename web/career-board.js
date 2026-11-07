@@ -19,7 +19,7 @@ class CareerBoard extends HTMLElement {
       <div class="cb-body">
         <aside class="cb-search-column" aria-label="Search preferences"><div class="cb-network"><h3 class="cb-search-title">Your search <span>Preferences</span></h3>
           <div class="cb-search-brief"><label for="cb-search-query">Interests <small>Optional</small></label><textarea id="cb-search-query" rows="2" maxlength="600" placeholder="AI infrastructure, developer tools, fintech…"></textarea></div>
-          <div class="cb-search-options"><label>Search with <select class="cb-client"><option value="claude">Claude</option><option value="codex">Codex</option></select></label><fieldset class="cb-board-picker"><legend>Job boards</legend><div class="cb-ats">${['greenhouse','lever','ashby','workday','icims'].map(name => `<label><input type="checkbox" value="${name}" ${name !== 'icims' ? 'checked' : ''}>${({greenhouse:'Greenhouse',lever:'Lever',ashby:'Ashby',workday:'Workday',icims:'iCIMS'})[name]}</label>`).join('')}</div></fieldset></div>
+          <div class="cb-search-options"><label>Search with <select class="cb-client"><option value="claude">Claude</option><option value="codex">Codex</option><option value="opencode">OpenCode</option></select></label><fieldset class="cb-board-picker"><legend>Job boards</legend><div class="cb-ats">${['greenhouse','lever','ashby','workday','icims'].map(name => `<label><input type="checkbox" value="${name}" ${name !== 'icims' ? 'checked' : ''}>${({greenhouse:'Greenhouse',lever:'Lever',ashby:'Ashby',workday:'Workday',icims:'iCIMS'})[name]}</label>`).join('')}</div></fieldset></div>
           <div class="cb-search-fields"><label>Roles to find<textarea class="cb-roles" rows="3" placeholder="Software Engineer, Platform Engineer" aria-describedby="cb-filter-help"></textarea></label><label>Locations<textarea class="cb-locations" rows="3" placeholder="Seattle, California, Remote (US)"></textarea></label></div>
 
           <div class="cb-toolbar"><label>Posted within <select class="cb-days"><option value="1">24 hours</option><option value="3">3 days</option><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option><option value="365">1 year</option></select></label><span class="cb-search-hint">Uses your selected client and preferences</span><button type="button" class="btn cb-network-start" disabled>Search jobs</button><button type="button" class="btn cb-network-continue" hidden>Continue scan</button><button type="button" class="btn cb-network-stop" hidden>Stop scan</button></div>
@@ -238,8 +238,8 @@ class CareerBoard extends HTMLElement {
     if (!this.data.running && receipt?.kind === 'network') {
       const failure = receipt.scan_error || errors.find(e => e.company === 'Scanner')?.error;
       if (failure) status = `${receipt.found || 0} matches saved. Scan failed: ${failure}`;
-      const clientFailure = errors.find(e => ['claude', 'codex'].includes(e.company));
-      if (clientFailure) status += ` ${clientFailure.company === 'claude' ? 'Claude' : 'Codex'} search: ${clientFailure.error}`;
+      const clientFailure = errors.find(e => ['claude', 'codex', 'opencode'].includes(e.company));
+      if (clientFailure) status += ` ${{claude:'Claude', codex:'Codex', opencode:'OpenCode'}[clientFailure.company]} search: ${clientFailure.error}`;
     }
     if (!this.data.running && this.data.error) status = this.data.error + (status ? ` ${status}` : '');
     if (errors.length && receipt?.kind !== 'network') status += ' ' + errors.slice(0, 3).map(e => `${e.company}: ${e.error}`).join(' ');

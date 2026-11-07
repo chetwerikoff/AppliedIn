@@ -1314,3 +1314,142 @@ def test_failed_queue_after_tracking_create_keeps_error_and_recovery_budget(
     assert co._read()["last_network"]["started_at"] == receipt["started_at"]
     assert co._read()["last_network"]["prepared"] == 2
     assert len(stores.tracking.all()) == 3
+
+
+@pytest.mark.parametrize("corruption", ["cursor", "cutoff", "filters"])
+def test_invalid_network_resume_keeps_original_batch_start_until_repaired(
+    board, monkeypatch, corruption,
+):
+    network, stores, clock, _ = _network_fixture(board, monkeypatch)
+    state, receipt = _saved_search(clock, count=1)
+    original_state = json.loads(json.dumps(state))
+    original_start = receipt["started_at"]
+    rows = _synthetic_rows(state["id"], original_start, 1)
+    if corruption == "cursor":
+        state["cursor"]["ashby"]["next"] = -1
+    elif corruption == "cutoff":
+        state["cutoff"] = "invalid-cutoff"
+    else:
+        state["filters"] = {**state["filters"], "positive": ["Engineer"] * 51}
+
+    data = co._read()
+    data["jobs"].update({row["id"]: row for row in rows})
+    data.update(network_search=state, last_network=receipt)
+    co._write(data)
+
+    scanned = Mock()
+    monkeypatch.setattr(network, "events", scanned)
+    co.scheduled_tick()
+    failed = co._read()
+    assert failed["network_search"] == state  # Preserve the invalid evidence.
+    assert failed["last_network"]["search_id"] == original_state["id"]
+    assert failed["last_network"]["started_at"] == original_start
+    assert failed["last_network"]["finished_at"] == clock["now"].isoformat()
+    assert failed["last_network"]["scan_error"]
+    scanned.assert_not_called()
+    assert not stores.tracking.all()
+
+    # A repair of the saved state must not lose rows saved before the failed tick.
+    data = co._read()
+    data["network_search"] = original_state
+    co._write(data)
+
+    def healthy(payload):
+        assert payload["cursor"] == original_state["cursor"]
+        assert payload["cutoff"] == original_state["cutoff"]
+        yield {
+            "kind": "source", "source": "ashby", "hash": "original-hash",
+            "next": 1, "total": 301, "status": "ok",
+        }
+        yield {"kind": "done", "stopped": False}
+
+    monkeypatch.setattr(network, "events", healthy)
+    clock["now"] += timedelta(hours=6)
+    co.scheduled_tick()
+    recovered = co._read()
+    assert recovered["network_search"]["id"] == original_state["id"]
+    assert recovered["last_network"]["started_at"] == original_start
+    assert recovered["last_network"]["batch_success"]
+    assert recovered["last_network"]["prepared"] == 1
+    assert len(stores.tracking.all()) == 1
+
+
+def test_public_network_stop_signals_while_tracking_create_holds_board_lock(
+    board, monkeypatch,
+):
+    # Capture the real Thread before the scheduled fixture replaces Thread with
+    # its synchronous fake. Two genuine threads exercise the public stop path.
+    from threading import Event, Thread
+
+    network, stores, clock, marked = _network_fixture(board, monkeypatch)
+    state, receipt = _saved_search(clock, count=3)
+    rows = _synthetic_rows(state["id"], receipt["started_at"], 3)
+    data = co._read()
+    data["jobs"].update({row["id"]: row for row in rows})
+    data.update(network_search=state, last_network=receipt)
+    co._write(data)
+
+    def healthy(payload):
+        yield {
+            "kind": "source", "source": "ashby", "hash": "original-hash",
+            "next": 3, "total": 301, "status": "ok",
+        }
+        yield {"kind": "done", "stopped": False}
+
+    monkeypatch.setattr(network, "events", healthy)
+    first_create_entered = Event()
+    unblock_first_create = Event()
+    stop_called = Event()
+    creates = []
+    results = []
+    original_put = stores.tracking.put_new
+
+    def blocked_put(job):
+        creates.append(job.pk)
+        if len(creates) == 1:
+            first_create_entered.set()
+            if not unblock_first_create.wait(10):
+                raise RuntimeError("synthetic tracking-create release missing")
+        return original_put(job)
+
+    monkeypatch.setattr(stores.tracking, "put_new", blocked_put)
+
+    def public_stop():
+        stop_called.set()
+        results.append(network.stop())
+
+    assert co.reserve_scan("network")
+    worker = Thread(target=network.run_reserved,
+                    args=(state["filters"],), kwargs={"resume": True})
+    stopper = Thread(target=public_stop)
+    worker.start()
+    try:
+        assert first_create_entered.wait(5), "Prepare never entered tracking create"
+        stopper.start()
+        assert stop_called.wait(5), "The public Stop caller did not run"
+        # This MUST become true while put_new still holds co._LOCK. Before the
+        # fix, stop() waits for that lock and cannot set STOP until all rows run.
+        assert network.STOP.wait(5), "Public Stop was blocked by board preparation"
+        assert len(creates) == 1
+    finally:
+        unblock_first_create.set()
+        worker.join(10)
+        if stopper.ident is not None:
+            stopper.join(10)
+
+    assert not worker.is_alive() and not stopper.is_alive()
+    assert results == [{"stopping": True}]
+    assert creates == [creates[0]]  # No second or third tracking create.
+    assert len(stores.tracking.all()) == 1
+    assert stores.queue.enqueue.call_count == 1
+    assert marked.call_count == 1
+    assert all(call.args[0] == "tailor"
+               for call in stores.queue.enqueue.call_args_list)
+    final = co._read()["last_network"]
+    assert final["stopped"] and not final["batch_success"]
+    assert final["prepared"] == 1
+    assert not co._SCAN.locked() and not co._RUNNING
+
+    network.STOP.clear()
+    assert network.stop() == {"stopping": False}
+    assert not network.STOP.is_set()

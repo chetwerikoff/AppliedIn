@@ -198,7 +198,7 @@ def run_reserved(filters: dict, resume: bool = False) -> None:
                     receipt,
                 )
                 receipt["queries"] = result["queries"]
-                receipt.update({"model": result["model"]} if "model" in result else {})
+                receipt.update({key: result[key] for key in ("model", "api_searches") if key in result})
             except Exception as exc:
                 if not STOP.is_set():
                     receipt["errors"].append({"company": filters["provider"], "error": str(exc)})

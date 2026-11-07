@@ -20,14 +20,9 @@ UNREAD = "https://jobs.example.com/postings/search-result"
 
 def stream():
     # Shape from the bare CLI capture, with public synthetic values and IDs.
-    # The success status for websearch is synthetic; live cancellation is
-    # separately replayed below and must never ground a successful search.
+    # Search results are separate API data, never model tool completions.
     return [
         {"type": "step_start", "part": {}},
-        {"type": "tool_use", "part": {"tool": "websearch", "state": {
-            "status": "completed", "input": {"query": "example-co engineering"},
-            "output": UNREAD,
-        }}},
         {"type": "tool_use", "part": {"tool": "webfetch", "state": {
             "status": "running", "input": {"url": UNREAD},
         }}},
@@ -44,8 +39,10 @@ def stream():
     ]
 
 
-def replay(events):
-    parser = oc.SearchEvents(lambda _: None, SCHEMA, "openai/test-model")
+def replay(events, api_searches=None):
+    parser = oc.SearchEvents(lambda _: None, SCHEMA, "openai/test-model",
+                             [{"query": "example-co engineering", "result_count": 2}]
+                             if api_searches is None else api_searches)
     for event in events:
         parser.accept(event)
     return parser.finish()
@@ -58,18 +55,22 @@ def test_only_completed_fetch_input_urls_ground_interest_results(monkeypatch):
     assert result["source_urls"] == {GOOD}
     assert result["queries"] == ["example-co engineering"]
     monkeypatch.setattr(interest_search, "_verify_lead", lambda row: row)
-    admitted = interest_search.search({}, provider="opencode", runner=lambda *a: result)
+    admitted = interest_search.search({}, provider="opencode", runner=lambda *a, **kw: result)
     assert [job["url"] for job in admitted["jobs"]] == [GOOD]
     assert admitted["model"] == "openai/test-model"
 
 
-@pytest.mark.parametrize("failure", ["searchless", "cancelled-search", "incomplete", "error", "text", "schema", "later-text"])
+@pytest.mark.parametrize("failure", ["searchless", "fetchless", "cancelled-search", "incomplete", "error", "text", "schema", "later-text"])
 def test_incomplete_or_invalid_final_answer_never_imports(failure):
     events = stream()
+    searches = None
     if failure == "searchless":
-        events.pop(1)
+        searches = []
+    elif failure == "fetchless":
+        events = [event for event in events if event["type"] != "tool_use"]
     elif failure == "cancelled-search":
-        events[1]["part"]["state"].update(status="error", error="Web search cancelled")
+        events.insert(1, {"type": "tool_use", "part": {"tool": "websearch", "state": {
+            "status": "error", "error": "Web search cancelled"}}})
     elif failure == "incomplete":
         events.pop()
     elif failure == "error":
@@ -82,7 +83,7 @@ def test_incomplete_or_invalid_final_answer_never_imports(failure):
         events.extend([{"type": "step_start"}, {"type": "text", "part": {"text": "done"}},
                        {"type": "step_finish", "part": {"reason": "stop"}}])
     with pytest.raises(ValueError, match="OpenCode did not complete"):
-        replay(events)
+        replay(events, searches)
 
 
 @pytest.fixture
@@ -96,7 +97,17 @@ def cli(monkeypatch):
     proc.__enter__.return_value = proc
     proc.stdout = io.StringIO("\n".join(json.dumps({**e, "sessionID": "ses_synthetic"}) for e in stream()))
     proc.wait.return_value = proc.poll.return_value = 0
-    launch = Mock(return_value=proc)
+    def start(command, **kwargs):
+        if command[1] == "api":
+            api = MagicMock()
+            api.__enter__.return_value = api
+            api.stdout = io.StringIO(json.dumps({"data": {"providerID": "exa", "results": [
+                {"url": GOOD, "content": "Public candidate"}, {"url": UNREAD},
+            ]}}))
+            api.wait.return_value = api.poll.return_value = 0
+            return api
+        return proc
+    launch = Mock(side_effect=start)
     cleanup = Mock(return_value=subprocess.CompletedProcess([], 0))
     monkeypatch.setattr(oc.subprocess, "Popen", launch)
     monkeypatch.setattr(oc.subprocess, "run", cleanup)
@@ -120,7 +131,7 @@ def test_standalone_model_key_scrub_config_isolation_and_own_session_cleanup(cli
                                     "AWS_SECRET_ACCESS_KEY", "OPENCODE_DB", "OPENCODE_CONFIG"))
     assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
     settings = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-    assert settings["permission"] == {"*": "deny", "websearch": "allow", "webfetch": "allow"}
+    assert settings["permission"] == {"*": "deny", "webfetch": "allow"}
     assert settings["plugin"] == [] and settings["mcp"] == {}
     assert settings["provider"] == {"openai": {
         "options": {"baseURL": "https://chatgpt.com/backend-api/codex"},
@@ -128,6 +139,12 @@ def test_standalone_model_key_scrub_config_isolation_and_own_session_cleanup(cli
     }}
     assert "apiKey" not in json.dumps(settings)
     assert result["model"] == "openai/test-model"
+    api_command = launch.call_args_list[0].args[0]
+    assert api_command[1:5] == ["api", "--standalone", "POST", "/api/websearch"]
+    assert json.loads(api_command[-1]) == {"query": "software engineering jobs", "providerID": "exa"}
+    assert result["api_searches"] == [{"query": "software engineering jobs", "result_count": 2}]
+    assert "UNTRUSTED CANDIDATE DATA" in command[-1]
+    assert UNREAD in command[-1]
     assert any("openai/test-model" in message for message in progress)
     cleanup.assert_called_once()
     assert cleanup.call_args.args[0] == ["/bin/opencode2", "session", "delete", "--standalone", "ses_synthetic"]
@@ -151,7 +168,10 @@ def test_search_failures_are_clear_and_still_delete_only_own_session(cli, monkey
         monkeypatch.setattr(oc.threading, "Timer", make_timer)
     with pytest.raises(ValueError, match="OpenCode"):
         oc.run_search("query", SCHEMA, lambda _: None, cancelled=lambda: failure == "cancel")
-    assert cleanup.call_args.args[0][-1] == "ses_synthetic"
+    if failure == "cancel":
+        cleanup.assert_not_called()
+    else:
+        assert cleanup.call_args.args[0][-1] == "ses_synthetic"
 
 
 def test_missing_binary_is_one_search_error(monkeypatch):
@@ -191,7 +211,8 @@ def test_model_reaches_both_search_receipts_and_dispatches_opencode(tmp_path, mo
     monkeypatch.setattr(career_fit, "classify_search", lambda *a: None)
     run = Mock(return_value={"parsed": {"jobs": [], "summary": "Synthetic empty search"},
                              "source_urls": set(), "queries": ["public example jobs"],
-                             "model": "openai/test-model"})
+                             "model": "openai/test-model",
+                             "api_searches": [{"query": "public example jobs", "result_count": 0}]})
     monkeypatch.setattr(oc, "run_search", run)
     assert co.reserve_scan("network" if network else "web")
     if network:
@@ -204,5 +225,39 @@ def test_model_reaches_both_search_receipts_and_dispatches_opencode(tmp_path, mo
     receipt = co._read()["last_network" if network else "last_search"]
     assert receipt["model"] == "openai/test-model"
     assert receipt["queries"] == ["public example jobs"]
+    assert receipt["api_searches"] == [{"query": "public example jobs", "result_count": 0}]
     assert not receipt["errors"]
     run.assert_called_once()
+
+
+def test_public_queries_are_bounded_and_do_not_use_personal_preferences():
+    assert oc.public_queries("public infrastructure jobs", ["Engineer", "engineer"]) == [
+        "public infrastructure jobs", "Engineer",
+    ]
+    assert len(oc.public_queries("interest", [f"Role {i}" for i in range(20)])) == 8
+
+
+def test_one_keyless_api_call_per_public_query_before_model(cli):
+    _, launch, _ = cli
+    result = oc.run_search("public prompt", SCHEMA, lambda _: None,
+                           interests="public systems", titles=[f"Role {i}" for i in range(10)])
+    api_calls = [call.args[0] for call in launch.call_args_list if call.args[0][1] == "api"]
+    assert len(api_calls) == 8
+    assert [json.loads(command[-1])["query"] for command in api_calls] == result["queries"]
+    assert all(json.loads(command[-1])["providerID"] == "exa" for command in api_calls)
+
+
+@pytest.mark.parametrize("response", ["not json", '{"data":{"providerID":"other","results":[]}}',
+                                     '{"data":{"providerID":"exa","results":null}}'])
+def test_invalid_api_result_never_starts_model_or_imports(cli, response):
+    _, launch, cleanup = cli
+    api = MagicMock()
+    api.__enter__.return_value = api
+    api.stdout = io.StringIO(response)
+    api.wait.return_value = api.poll.return_value = 0
+    launch.side_effect = None
+    launch.return_value = api
+    with pytest.raises(ValueError, match="API returned an invalid result"):
+        oc.run_search("public prompt", SCHEMA, lambda _: None)
+    launch.assert_called_once()
+    cleanup.assert_not_called()

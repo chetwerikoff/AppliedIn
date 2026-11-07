@@ -104,7 +104,6 @@ class Settings(BaseSettings):
     #   local -> Redis (tracking/queue) + filesystem (artifacts)
     #   cloud -> DynamoDB + SQS + S3
     mode: str = "local"  # local | cloud
-    search_model: str = "openai/gpt-6.1-sol"
 
     # Local-mode backends
     redis_url: str = Field(default_factory=lambda: (
@@ -160,6 +159,7 @@ class Settings(BaseSettings):
     # LiteLLM handles the provider prefix, so "anthropic/claude-…" or
     # "openrouter/…" work without code changes.
     openai_model: str = "openai/gpt-5-mini"
+    search_model: str = "openai/gpt-6.1-sol"
     # Cloud mode reaches the same class of model through Bedrock.
     bedrock_model: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 

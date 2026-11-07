@@ -257,7 +257,59 @@ def test_invalid_api_result_never_starts_model_or_imports(cli, response):
     api.wait.return_value = api.poll.return_value = 0
     launch.side_effect = None
     launch.return_value = api
-    with pytest.raises(ValueError, match="API returned an invalid result"):
+    with pytest.raises(ValueError, match="API completed no successful queries"):
         oc.run_search("public prompt", SCHEMA, lambda _: None)
     launch.assert_called_once()
     cleanup.assert_not_called()
+
+
+def test_failed_fetch_does_not_discard_other_grounded_postings():
+    events = stream()
+    events.insert(1, {"type": "tool_use", "part": {"tool": "webfetch", "state": {
+        "status": "error", "input": {"url": UNREAD}, "error": "HTTP 403"}}})
+    result = replay(events)
+    assert result["source_urls"] == {GOOD}
+    assert UNREAD not in result["source_urls"]
+
+
+@pytest.mark.parametrize("second_response", ["exit", "malformed"])
+def test_one_failed_api_query_preserves_successful_query_candidates(cli, second_response):
+    _, launch, _ = cli
+    start = launch.side_effect
+    api_calls = 0
+    def mixed(command, **kwargs):
+        nonlocal api_calls
+        proc = start(command, **kwargs)
+        if command[1] == "api":
+            api_calls += 1
+            if api_calls == 2:
+                if second_response == "exit":
+                    proc.wait.return_value = 1
+                else:
+                    proc.stdout = io.StringIO("invalid JSON")
+        return proc
+    launch.side_effect = mixed
+    progress = []
+    result = oc.run_search("prompt", SCHEMA, progress.append, interests="query one", titles=["query two"])
+    assert result["api_searches"] == [{"query": "query one", "result_count": 2}]
+    assert result["source_urls"] == {GOOD}
+    assert any("Search query failed: query two" in message for message in progress)
+    assert launch.call_args.args[0][1] == "run"
+
+
+def test_large_unicode_search_results_cannot_overflow_cli_argument(cli):
+    _, launch, _ = cli
+    start = launch.side_effect
+    def large(command, **kwargs):
+        proc = start(command, **kwargs)
+        if command[1] == "api":
+            proc.stdout = io.StringIO(json.dumps({"data": {"providerID": "exa", "results": [
+                {"url": GOOD, "title": "界" * 1000, "content": "界" * 22000}
+                for _ in range(20)
+            ]}}))
+        return proc
+    launch.side_effect = large
+    result = oc.run_search("prompt", SCHEMA, lambda _: None, titles=[f"Role {i}" for i in range(8)])
+    command = launch.call_args.args[0]
+    assert len(command[-1].encode()) < 64000
+    assert all(row["result_count"] == 20 for row in result["api_searches"])

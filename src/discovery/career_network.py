@@ -108,14 +108,21 @@ def scheduled_plan(data: dict) -> tuple[dict, bool]:
 
 
 def stop() -> dict:
+    # prepare() holds the board lock through tracking/queue/seen admissions.
+    # Signal first, while that lock may be held, so its next per-row
+    # continue_check can observe Stop. The scan reservation and active kind
+    # exclude unrelated Career Ops work without a second lock.
+    if not (co._SCAN.locked() and co._RUNNING
+            and co._ACTIVE.get("kind") == "network"):
+        return {"stopping": False}
+    STOP.set()
+    # Progress still uses the board lock; never block *signaling* on it.
     with co._LOCK:
         if co._RUNNING and co._ACTIVE.get("kind") == "network":
-            STOP.set()
             co.report_progress(
                 "Stopping scan; completed results are saved. You can continue later."
             )
-            return {"stopping": True}
-    return {"stopping": False}
+    return {"stopping": True}
 
 
 # A full directory scan including Workday (12,000+ tenants, one site each) runs
@@ -207,12 +214,25 @@ def run_reserved(filters: dict | None, resume: bool = False, *,
     try:
         with co._LOCK:
             data = co._read()
+            previous = data.get("network_search")
+            old = data.get("last_network") or {}
+            # Preserve the logical batch identity before validation: an invalid
+            # cursor, cutoff or saved filter can reject scheduled_plan/_saved_state.
+            # A failed receipt must not lose pre-crash row membership.
+            if scheduled or resume:
+                if isinstance(previous, dict) and previous.get("id"):
+                    receipt["search_id"] = previous["id"]
+                if old and not (
+                    old.get("finished_at") and old.get("batch_success")
+                    and not old.get("stopped") and not old.get("scan_error")
+                    and not old.get("prepare_error")
+                ):
+                    receipt["started_at"] = old.get("started_at") or started
             if scheduled:
                 filters, resume = scheduled_plan(data)
             if not isinstance(filters, dict):
                 raise ValueError("Network filters are missing.")
             receipt["filters"] = filters
-            previous = data.get("network_search")
             if resume:
                 previous = _saved_state(data)
                 if previous["filters"] != filters:
@@ -220,7 +240,6 @@ def run_reserved(filters: dict | None, resume: bool = False, *,
                         "Search filters changed. Start a new scan to use these filters."
                     )
                 state = previous
-                old = data.get("last_network") or {}
                 # A finalized successful partial starts a fresh logical batch.
                 # An unfinalized crash, STOP/error, or failed handoff retains it.
                 if not (

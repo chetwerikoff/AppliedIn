@@ -295,6 +295,43 @@ def test_explicit_sponsorship_refusal_stops_before_scorer(harness, monkeypatch, 
     assert h.stores.tracking.row["status"] == Status.SKIPPED.value
 
 
+@pytest.mark.parametrize("location,extra,private,eligible", [
+    ("Remote - Toronto, Canada", "", "residence: only in canada", True),
+    ("Remote - Hyderabad", "", "residence: only in india", True),
+    ("Remote - New York", "", "residence: only in united states", True),
+    ("Remote - Sydney", "", "residence: only in australia", True),
+    ("", "\nLocation: Remote - Canada", "residence: only in canada", True),
+    ("", "\nThis role is remote in Canada.", "residence: only in canada", True),
+    ("On-site - Sydney", "", "residence: only in canada", False),
+    ("Remote - Sydney", "", "residence: only in canada", False),
+    ("Remote", "", "residence: only in canada", False),
+    ("Remote - Toronto / Sydney", "", "residence: only in canada", False),
+    ("Remote - Canada", "", "residence: not resident in canada", False),
+    ("Remote - Canada", "", "residence: only in canada or australia", False),
+    ("Remote - Canada", "", "residence: only in canada\nresidence: only in australia", False),
+    ("Remote - Canada (hybrid)", "", "residence: only in canada", False),
+    ("", "\nThis role is not remote in Canada.", "residence: only in canada", False),
+    ("", "\nThis role may be remote in Canada.", "residence: only in canada", False),
+    ("", "\nRemote in Canada or Australia.", "residence: only in canada", False),
+])
+def test_remote_home_region_exception_before_tailoring(harness, monkeypatch, location, extra, private, eligible):
+    from core import steering
+    from tools import posting_guard as pg
+    h = harness
+    h.stores.tracking.row["location"] = location
+    monkeypatch.setattr(steering, "read", lambda: {"content": "sponsorship: required\n" + private})
+    async def read(_row):
+        return pg.analyze(JD + " No visa sponsorship is available." + extra)
+    monkeypatch.setattr(R, "_jd_meta", read)
+    h.fake.scripted = [_response(_payload(score=9))]
+    result = _run(h)
+    if eligible:
+        assert h.next.observed == [9]
+    else:
+        assert result["reason"] == "eligibility conflict: sponsorship"
+        assert h.next.observed == h.fake.requests == []
+
+
 @pytest.mark.parametrize("private", [
     "", "Please consider visa-friendly roles.", "sponsorship: not required",
     "not sponsorship: required", "sponsorship: maybe required",
@@ -389,6 +426,13 @@ def test_private_and_posting_constraint_pair_before_any_tailor(harness, monkeypa
     ("Canada", False, ["flexible", "Canada", "Example City", "Germany"], False),
     ("Example City", False, ["flexible", "Canada", "Germany"], False),
     ("Paris, France", False, ["flexible", "Canada", "Germany"], False),
+    ("Toronto", False, ["Germany"], True),
+    ("Hyderabad, India", False, ["Germany"], True),
+    ("New York, United States", False, ["Germany"], True),
+    ("Sydney", False, ["Germany"], True),
+    ("Toronto, Canada", False, ["Canada"], False),
+    ("Toronto / New York", False, ["Germany"], False),
+    ("Toronto, Example City", False, ["Germany"], False),
 ])
 def test_typed_location_evidence_is_independent_of_model_score(harness, monkeypatch, location, remote, locations, conflict):
     from discovery.watchlist import Preferences

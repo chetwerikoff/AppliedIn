@@ -114,10 +114,13 @@ def _sweep_found(stores) -> None:  # noqa: ANN001
     keeps getting scored + tailored 24/7 — the whole backlog gets assessed
     continuously and the good ones queue up to apply."""
     from core.models import Status
+    from core import flags
     from agent.run import _reader_eligible
 
+    skipped = flags.skipped_companies()
     waiting = [r for r in stores.tracking.query_status(Status.FOUND)
-               if not is_internal_pk(r.get("pk", "")) and _reader_eligible(r)]
+               if r.get("company", "").strip().lower() not in skipped
+               and not is_internal_pk(r.get("pk", "")) and _reader_eligible(r)]
     for row in waiting[:3]:  # small batches — pace the LLM spend
         stores.queue.enqueue(stores.tailor_queue, {"pk": row["pk"]})
         log.info("sweep: queued waiting job %s", row["pk"])
@@ -152,6 +155,11 @@ def _evaluate_one(pk: str) -> None:
         stores.queue.enqueue(stores.tailor_queue, {"pk": pk})
         return
     try:
+        # Re-read the skip for queued work too: a cap can be exhausted after sweep.
+        # Leave the row found so removing the lead's skip resumes normal evaluation.
+        row = stores.tracking.get(pk)
+        if row and row.get("company", "").strip().lower() in flags.skipped_companies():
+            return
         log.info("pipeline: %s", run_job(pk, stores))
     except Exception:
         # NEVER get stuck: mark the job errored so it leaves the `found`

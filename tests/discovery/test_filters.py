@@ -1,4 +1,5 @@
 from core.models import JobRecord
+import pytest
 from discovery.filters import stage1_match
 from discovery.watchlist import Preferences
 
@@ -232,3 +233,64 @@ def test_unknown_preference_keywords_do_not_erase_known_country_constraints():
     for location in ("Canada", "Germany", "Remote - Canada", "Example City",
                      "Paris, France", "Unknown", "Remote", ""):
         assert stage1_match(_job(loc=location), prefs)
+
+
+@pytest.mark.parametrize("location", [
+    "Toronto", "Toronto, Canada", "Canada (Toronto)", "Hyderabad, India",
+    "New York", "New York, USA", "Sydney - Australia", "Remote - Sydney",
+])
+def test_known_posting_cities_prove_country_conflicts(location):
+    assert not stage1_match(_job(loc=location), Preferences(locations=["Germany"]))
+
+
+@pytest.mark.parametrize("location", [
+    "Example City", "Toronto or Sydney", "Toronto / Hyderabad", "Toronto, New York",
+    "Toronto, Example City", "Toronto, India", "Canada, Germany", "Toronto and Toronto",
+])
+def test_unknown_or_multiple_posting_places_never_prove_disjointness(location):
+    assert stage1_match(_job(loc=location), Preferences(locations=["Germany"]))
+
+
+def test_city_table_does_not_reinterpret_allowed_preferences():
+    assert stage1_match(_job(loc="Sydney"), Preferences(locations=["Toronto"]))
+    assert stage1_match(_job(loc="Toronto, Canada"), Preferences(locations=["Canada"]))
+
+
+def test_skipped_company_stays_found_and_resumes_when_unskipped(monkeypatch):
+    """A lead's cap skip must gate both idle sweeps and already queued work."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    import daemon
+    from agent import run
+    from core import flags
+    from core.models import Status
+
+    skipped = {"example-co"}
+    rows = [{"pk": f"example-co#{i}", "company": "Example-Co", "status": "found"}
+            for i in range(3)]
+    eligible = {"pk": "other-co#1", "company": "Other-Co", "status": "found"}
+    tracking = Mock()
+    tracking.query_status.return_value = rows + [eligible]
+    tracking.get.side_effect = lambda pk: next(r for r in rows + [eligible] if r["pk"] == pk)
+    stores = SimpleNamespace(tracking=tracking, queue=Mock(), tailor_queue="synthetic")
+    monkeypatch.setattr(flags, "skipped_companies", lambda: skipped)
+    monkeypatch.setattr(flags, "paused", lambda: False)
+    monkeypatch.setattr(daemon, "make_stores", lambda: stores)
+    started = []
+    monkeypatch.setattr(run, "run_job", lambda pk, stores: started.append(pk))
+
+    daemon._sweep_found(stores)
+    stores.queue.enqueue.assert_called_once_with("synthetic", {"pk": eligible["pk"]})
+    daemon._evaluate_one(rows[0]["pk"])
+    assert started == []
+    assert all(r["status"] == Status.FOUND.value for r in rows)
+    tracking.set_status.assert_not_called()
+
+    daemon._evaluate_one(eligible["pk"])
+    assert started == [eligible["pk"]]
+    skipped.clear()
+    stores.queue.reset_mock()
+    daemon._sweep_found(stores)
+    assert [call.args[1]["pk"] for call in stores.queue.enqueue.call_args_list] == [r["pk"] for r in rows]
+    daemon._evaluate_one(rows[0]["pk"])
+    assert started == [eligible["pk"], rows[0]["pk"]]

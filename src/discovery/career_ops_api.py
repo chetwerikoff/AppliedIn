@@ -52,7 +52,7 @@ def provider(body: SearchProvider):
 class NetworkSearch(BaseModel):
     provider: Literal["claude", "codex", "opencode"] = "claude"
     interests: str = Field(default="", max_length=600)
-    positive: list[str] = Field(default_factory=list, max_length=50)
+    positive: list[str] = Field(default_factory=list, max_length=100)
     negative: list[str] = Field(default_factory=list, max_length=50)
     # Locations are matched as whole words, so a city and its country are separate
     # entries; a Europe + Asia + US search runs well past fifty.

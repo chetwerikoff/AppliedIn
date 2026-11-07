@@ -571,10 +571,12 @@ def _index_without_job_id(url: str) -> bool:
                               "job-boards.greenhouse.io"} and "/" not in path
 
 
-def prepare(ids: list[str], stores=None, *, apply_requested: bool = False) -> dict:
+def prepare(ids: list[str], stores=None, *, apply_requested: bool = False,
+            continue_check=None) -> dict:
     """Idempotent handoff; only an explicit Apply action authorizes submission."""
     stores = stores or make_stores()
     from core.events import emit
+    from core import flags
     from tools import seen
 
     with _LOCK:
@@ -615,6 +617,12 @@ def prepare(ids: list[str], stores=None, *, apply_requested: bool = False) -> di
                 discovery_source="career_ops",
                 apply_requested_at=now() if apply_requested else "",
             )
+            # Both manual and scheduled Career Ops honor the latest exclusion at
+            # the final per-row tracking-create boundary, not just at selection.
+            if continue_check is not None and not continue_check():
+                break
+            if row["company"].strip().lower() in flags.skipped_companies():
+                continue
             if stores.tracking.put_new(job):
                 # Resume preparation can now happen automatically, even after a
                 # restart. The source marker is persisted in the FIRST row write.
@@ -647,7 +655,25 @@ def dismiss(ids: list[str]) -> dict:
     return {"ok": True}
 
 
-def auto_prepare(stores, since: str, companies: set[str]) -> int:
+def _batch_tracked_urls(stores, search_id: str, since: str) -> set[str]:
+    """Existing canonical tracking admissions among persisted logical-batch rows.
+
+    The board can still say "new" after put_new succeeds but before its write.
+    Such rows count against the same batch's 50 slots on retry.
+    """
+    with _LOCK:
+        rows = [
+            r for r in _read()["jobs"].values()
+            if r.get("search_id") == search_id and r.get("last_seen", "") >= since
+        ]
+    tracked = {
+        canonical(r["jd_url"]) for r in stores.tracking.all() if r.get("jd_url")
+    }
+    return {canonical(r["url"]) for r in rows if canonical(r["url"]) in tracked}
+
+
+def auto_prepare(stores, since: str, companies: set[str] | None, *,
+                 search_id: str | None = None, continue_check=None) -> int:
     from core import flags
     from discovery.crawler import _age_limit
     from discovery.freshness import is_fresh
@@ -658,14 +684,32 @@ def auto_prepare(stores, since: str, companies: set[str]) -> int:
         return 0
     with _LOCK:
         data = _read()
-        rows = [
-            r
-            for r in data["jobs"].values()
-            if r["state"] == "new" and r["company"] in companies and r["last_seen"] >= since
+        batch_rows = [
+            r for r in data["jobs"].values()
+            if r.get("last_seen", "") >= since
+            and (
+                r.get("search_id") == search_id if search_id is not None
+                else r["company"] in companies
+            )
         ]
+    # Keep this check ahead of relevance, which may call a model. prepare()
+    # independently checks each company's current skip at conditional creation.
+    skipped = flags.skipped_companies()
+    rows = [
+        r for r in batch_rows
+        if r["state"] == "new" and r["company"].strip().lower() not in skipped
+    ]
+    allowance = 50
+    if search_id is not None:
+        allowance -= len(_batch_tracked_urls(stores, search_id, since))
+    if allowance <= 0:
+        return 0
+
     base = load_preferences(Path(get_settings().config_dir) / "preferences.yaml")
     ids = []
     for company in sorted({r["company"] for r in rows}):
+        if continue_check is not None and not continue_check():
+            return 0
         age_limit = _age_limit(company)
         keywords = flags.company_filter(company)
         candidates = [
@@ -690,32 +734,81 @@ def auto_prepare(stores, since: str, companies: set[str]) -> int:
         ]
         matches = relevant(jobs, prefs)
         ids.extend(j.job_id for j in matches[: prefs.max_new_per_run or 50])
-        if len(ids) >= 50:
+        if len(ids) >= allowance:
             break
-    return prepare(ids[:50], stores)["prepared"] if ids else 0
+    if not ids or (continue_check is not None and not continue_check()):
+        return 0
+    return prepare(
+        ids[:allowance], stores, apply_requested=False, continue_check=continue_check
+    )["prepared"]
 
 
 def scheduled_tick() -> None:
+    global _RUNNING, _ACTIVE
     from core import flags
 
     if flags.paused() or not checkout().exists():
         return
     with _LOCK:
         data = _read()
+    settings = data.get("settings") or {}
+    current = datetime.fromisoformat(now())
+    due = []
+
+    def finished(stamp: str) -> datetime:
+        value = datetime.fromisoformat(stamp)
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+    def elapsed(stamp: str) -> bool:
+        return (current - finished(stamp)).total_seconds() >= 6 * 3600
+
+    # Retain the existing first-run policies for interests and watchlist feeds.
     search_last = (data.get("last_search") or {}).get("finished_at")
-    if (
-        data["settings"].get("scheduled_interests")
-        and search_last
-        and (datetime.now(UTC) - datetime.fromisoformat(search_last)).total_seconds() >= 6 * 3600
-    ):
-        if reserve_scan("interests"):
-            threading.Thread(target=search_reserved, daemon=True, name="interest-search").start()
-        return
-    if not data["settings"]["scheduled"]:
-        return
-    last = (data.get("last_scan") or {}).get("finished_at")
-    # Like native discovery, the first automatic scan waits for its schedule.
-    if not last or (datetime.now(UTC) - datetime.fromisoformat(last)).total_seconds() < 6 * 3600:
-        return
-    if reserve_scan():
-        threading.Thread(target=scan_reserved, daemon=True, name="career-ops").start()
+    if settings.get("scheduled_interests") and search_last and elapsed(search_last):
+        due.append((finished(search_last), 1, "interests"))
+    if settings.get("scheduled"):
+        feed_last = (data.get("last_scan") or {}).get("finished_at")
+        if feed_last and elapsed(feed_last):
+            due.append((finished(feed_last), 2, "feeds"))
+        network_last = (data.get("last_network") or {}).get("finished_at")
+        # Missing receipt or an unfinalized crash is immediately eligible. All
+        # finalized outcomes, including STOP and errors, wait the full six hours.
+        if not network_last:
+            due.append((datetime.min.replace(tzinfo=UTC), 0, "network"))
+        elif elapsed(network_last):
+            due.append((finished(network_last), 0, "network"))
+
+    # An available reservation services one oldest due item. No timestamp is
+    # consumed when acquisition or thread start fails.
+    for _, _, kind in sorted(due):
+        if not reserve_scan(kind):
+            return
+        try:
+            if kind == "network":
+                from discovery import career_network
+
+                # STOP is process-local. A busy reservation must not clear it.
+                career_network.STOP.clear()
+                worker = threading.Thread(
+                    target=career_network.run_reserved,
+                    args=(None,),
+                    kwargs={"scheduled": True},
+                    daemon=True,
+                    name="career-network",
+                )
+            elif kind == "interests":
+                worker = threading.Thread(
+                    target=search_reserved, daemon=True, name="interest-search"
+                )
+            else:
+                worker = threading.Thread(
+                    target=scan_reserved, daemon=True, name="career-ops"
+                )
+            worker.start()
+            return
+        except Exception:
+            log.exception("Career Ops scheduled %s thread could not start", kind)
+            with _LOCK:
+                _RUNNING = False
+                _ACTIVE = {}
+            _SCAN.release()

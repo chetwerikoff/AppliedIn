@@ -81,7 +81,9 @@ class Settings(BaseSettings):
         _OFFLINE_TEST_ROOT or ".local"
     ))
     worktree_root: str = Field(default_factory=lambda: (
-        "" if _OFFLINE_TEST_ROOT else os.environ.get("ORCA_WORKTREE_PATH", "")
+        "" if (_OFFLINE_TEST_ROOT or os.environ.get("ORCA_WORKTREE_PATH")
+               == os.environ.get("ORCA_ROOT_PATH"))
+        else os.environ.get("ORCA_WORKTREE_PATH", "")
     ))
 
     @model_validator(mode="after")

@@ -65,6 +65,15 @@ def test_a_replaced_get_settings_does_not_break_the_fixture(monkeypatch, tmp_pat
     assert core.config.get_settings().local_dir == str(tmp_path)
 
 
+def test_orca_primary_context_does_not_become_a_disposable_worktree(monkeypatch, tmp_path):
+    monkeypatch.setenv("ORCA_ROOT_PATH", str(tmp_path))
+    monkeypatch.setenv("ORCA_WORKTREE_PATH", str(tmp_path))
+    monkeypatch.setattr("core.config._OFFLINE_TEST_ROOT", None)
+    settings = Settings(local_dir=str(tmp_path / "synthetic-primary"),
+                        redis_url="redis://offline.invalid:1/14")
+    assert settings.worktree_root == ""
+
+
 def test_make_stores_leaves_the_working_directory_empty(monkeypatch, tmp_path):
     work = tmp_path / "empty-cwd"
     work.mkdir()

@@ -212,14 +212,16 @@ def pytest_runtest_protocol(item, nextitem):
     A shared monkeypatch can be undone mid-test and can otherwise restore a
     stale APPLIEDIN_LOCAL_DIR at teardown. Preserve the pre-test environment.
     """
-    before = os.environ.get("APPLIEDIN_LOCAL_DIR")
+    before = {key: value for key, value in os.environ.items() if key.startswith("APPLIEDIN_")}
     try:
         return (yield)
     finally:
-        if before is None:
-            os.environ.pop("APPLIEDIN_LOCAL_DIR", None)
-        else:
-            os.environ["APPLIEDIN_LOCAL_DIR"] = before
+        # CLI calls and explicit dotenv loads can add keys that no fixture's
+        # MonkeyPatch recorded. Restore the session identity between tests too.
+        for key in list(os.environ):
+            if key.startswith("APPLIEDIN_"):
+                del os.environ[key]
+        os.environ.update(before)
         if item.config.getoption("redis_isolation_proof"):
             _prove_closed_session_boundary()
 

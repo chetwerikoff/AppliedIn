@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 from functools import lru_cache
+from pathlib import Path
 
 from dotenv import load_dotenv
 from pydantic import Field, model_validator
@@ -79,13 +80,27 @@ class Settings(BaseSettings):
     local_dir: str = Field(default_factory=lambda: (
         _OFFLINE_TEST_ROOT or ".local"
     ))
+    worktree_root: str = Field(default_factory=lambda: (
+        "" if _OFFLINE_TEST_ROOT else os.environ.get("ORCA_WORKTREE_PATH", "")
+    ))
 
     @model_validator(mode="after")
     def explicit_worktree_storage(self):
-        # Orca supplies the worktree identity; do not infer a primary checkout.
-        # A missing setup must fail before any filesystem store creates .local.
-        if self.mode == "local" and os.environ.get("ORCA_WORKTREE_PATH") and self.local_dir == ".local":
-            raise ValueError("Worktrees require an explicit APPLIEDIN_LOCAL_DIR; rerun Orca setup")
+        # Persisted by setup: later CLI shells need not retain Orca's own env.
+        # dotenv does not override inherited primary settings, and --port can
+        # select a reserved DB, so validate before stores or --fresh can act.
+        if self.mode == "local" and self.worktree_root:
+            from redis.connection import parse_url
+
+            root = Path(self.worktree_root).resolve()
+            local = Path(self.local_dir).resolve()
+            if self.local_dir == ".local" or local == root or not local.is_relative_to(root):
+                raise ValueError("Worktrees require an explicit APPLIEDIN_LOCAL_DIR inside "
+                                 "APPLIEDIN_WORKTREE_ROOT; rerun Orca setup")
+            # Use redis-py's parser: a query-string db overrides the URL path.
+            if parse_url(self.redis_url).get("db", 0) in {0, 14}:
+                raise ValueError("Worktrees cannot use reserved Redis databases 0 or 14; "
+                                 "rerun Orca setup or choose another --port")
         return self
 
     # Resource names / URLs (cloud mode; injected by CDK)

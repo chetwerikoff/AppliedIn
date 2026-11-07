@@ -17,7 +17,7 @@ scripts:
 
     # Never copy primary-checkout settings or follow a stale worktree .env symlink.
     env_tmp=$(mktemp .env.XXXXXXXX) || exit 1
-    if ! printf 'APPLIEDIN_WEB_PORT=%s\nAPPLIEDIN_LOCAL_DIR="%s/.local-%s"\nAPPLIEDIN_REDIS_URL=redis://localhost:6379/%s\n' "$port" "$ORCA_WORKTREE_PATH" "$port" "$((1 + port % 15))" > "$env_tmp" ||
+    if ! printf 'APPLIEDIN_WORKTREE_ROOT="%s"\nAPPLIEDIN_WEB_PORT=%s\nAPPLIEDIN_LOCAL_DIR="%s/.local-%s"\nAPPLIEDIN_REDIS_URL=redis://localhost:6379/%s\n' "$ORCA_WORKTREE_PATH" "$port" "$ORCA_WORKTREE_PATH" "$port" "$((1 + port % 15))" > "$env_tmp" ||
        ! mv -fT -- "$env_tmp" .env; then
       rm -f -- "$env_tmp"
       exit 1

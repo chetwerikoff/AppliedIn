@@ -54,7 +54,8 @@ def test_worktree_requires_explicit_storage_but_accepts_disposable_path(monkeypa
     with pytest.raises(ValueError, match="explicit APPLIEDIN_LOCAL_DIR"):
         Settings()
     assert not (tmp_path / ".local").exists()
-    assert Settings(local_dir=str(tmp_path / "scratch")).local_dir == str(tmp_path / "scratch")
+    assert Settings(local_dir=str(tmp_path / "scratch"),
+                    redis_url="redis://offline.invalid:1/7").local_dir == str(tmp_path / "scratch")
 
 
 def test_a_replaced_get_settings_does_not_break_the_fixture(monkeypatch, tmp_path):

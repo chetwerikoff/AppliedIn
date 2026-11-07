@@ -147,18 +147,19 @@ def _evaluate_one(pk: str) -> None:
     if _flags.paused():
         return
 
-    from agent.run import run_job
+    from agent.run import _reader_patch, run_job
     from core import flags
 
     stores = make_stores()
     if flags.paused():  # pause must interrupt a long batch, not just start one
         stores.queue.enqueue(stores.tailor_queue, {"pk": pk})
         return
+    admitted = None
     try:
+        admitted = stores.tracking.get(pk)
         # Re-read the skip for queued work too: a cap can be exhausted after sweep.
         # Leave the row found so removing the lead's skip resumes normal evaluation.
-        row = stores.tracking.get(pk)
-        if row and row.get("company", "").strip().lower() in flags.skipped_companies():
+        if admitted and admitted.get("company", "").strip().lower() in flags.skipped_companies():
             return
         log.info("pipeline: %s", run_job(pk, stores))
     except Exception:
@@ -167,8 +168,9 @@ def _evaluate_one(pk: str) -> None:
         log.exception("pipeline failed for %s", pk)
         try:
             from core.models import Status
-            stores.tracking.set_status(pk, Status.ERROR,
-                                       error="pipeline error — see logs")
+            if admitted is not None:
+                _reader_patch(pk, admitted, stores, {
+                    "status": Status.ERROR, "error": "pipeline error — see logs"})
         except Exception:
             log.exception("could not mark %s errored", pk)
 
@@ -505,7 +507,7 @@ def process_backlog_once(companies: list | None = None,
     loops are running. Blocking — run it in a background thread."""
     import asyncio
 
-    from agent.run import _apply_direct, _reader_eligible, prefetch_browser_jds, run_job
+    from agent.run import _apply_direct, _reader_eligible, _reader_patch, prefetch_browser_jds, run_job
     from core import flags as _flags
     from core.config import get_settings
     from core.models import Status
@@ -523,7 +525,8 @@ def process_backlog_once(companies: list | None = None,
     # 1) EVALUATE — score + tailor every waiting `found` job. Qualifying jobs are
     #    enqueued to the apply queue by run_job; low scorers are skipped there.
     found = [r for r in stores.tracking.query_status(Status.FOUND)
-             if not is_internal_pk(r.get("pk", "")) and _reader_eligible(r)]
+             if not r.get("rescore_requested")
+             and not is_internal_pk(r.get("pk", "")) and _reader_eligible(r)]
     if sel or skipped:
         found = [r for r in found if _in_scope(r.get("company"))]
     from core import preparation
@@ -553,8 +556,8 @@ def process_backlog_once(companies: list | None = None,
             except Exception:
                 log.exception("process: evaluate failed for %s", row.get("pk"))
                 try:
-                    stores.tracking.set_status(row["pk"], Status.ERROR,
-                                               error="pipeline error — see logs")
+                    _reader_patch(row["pk"], row, stores, {
+                        "status": Status.ERROR, "error": "pipeline error — see logs"})
                 except Exception:
                     log.exception("could not mark %s errored", row.get("pk"))
 

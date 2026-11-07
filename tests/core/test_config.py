@@ -8,6 +8,21 @@ deliberate rather than incidental.
 from core.config import Settings
 
 
+def test_all_litellm_requests_have_a_finite_provider_budget():
+    """Use LiteLLM's own resolver: merely setting an unused attribute is no cap.
+
+    Five LiteLLM attempts, each with up to three OpenAI SDK attempts, allow
+    1800 seconds in HTTP requests. Shared throttling and backoff are additional.
+    """
+    import litellm
+    import openai
+    from litellm.litellm_core_utils.request_timeout_resolver import get_configured_request_timeout
+
+    assert get_configured_request_timeout() == 120
+    assert litellm.num_retries == 4
+    assert openai.DEFAULT_MAX_RETRIES == 2
+
+
 def test_shipped_defaults():
     s = Settings()
     assert s.mode == "local"                    # runs on your machine, not a cloud

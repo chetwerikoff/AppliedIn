@@ -737,11 +737,13 @@ async def test_manual_confirmation_during_fill_keeps_the_applied_ledger(monkeypa
     assert tracking.get(pk)['confirmation_id'] == 'owner-confirmed'
 
 
-def test_background_prepare_failure_does_not_leave_an_unclaimed_working_card(monkeypatch):
+@pytest.mark.parametrize('skip', [False, True])
+def test_background_prepare_failure_does_not_leave_an_unclaimed_working_card(monkeypatch, skip):
     import fakeredis
     from fastapi import BackgroundTasks
 
     import server
+    from agent import run
     from core.models import Status
     from core.storage.local import RedisTracking
 
@@ -749,19 +751,27 @@ def test_background_prepare_failure_does_not_leave_an_unclaimed_working_card(mon
     tracking.set_status('acme#1', Status.FOUND, company='Acme')
     stores = SimpleNamespace(tracking=tracking)
     monkeypatch.setattr(server, 'make_stores', lambda *args: stores)
-    def bad_score(pk, stores, *, prepare_only):
+    async def bad_score(pk, admitted, stores, *, prepare_only):
         assert prepare_only
-        tracking.set_status(pk, Status.TAILORING)
+        # Admission and its generation belong to run_job, not the server's
+        # pre-run snapshot. Exercise that owner instead of bypassing its catch.
+        assert admitted['status'] == 'tailoring'
+        if skip:
+            tracking.set_status(pk, Status.SKIPPED, skip_reason='user_skipped')
         raise ValueError('Malformed structured score')
-    monkeypatch.setattr('agent.run.run_job', bad_score)
+    monkeypatch.setattr(run, '_run_job_async', bad_score)
     endpoints = {r.path: r.endpoint for r in server.create_app().routes
                  if hasattr(r, 'endpoint')}
     background = BackgroundTasks()
     endpoints['/actions/run-job/{pk}']('acme#1', background)
     background.tasks[0].func()
     row = tracking.get('acme#1')
-    assert row['status'] == 'error'
-    assert row['error'] == 'Preparation failed: ValueError'
+    assert row['status'] == ('skipped' if skip else 'error')
+    if skip:
+        assert row['skip_reason'] == 'user_skipped'
+    else:
+        assert row['error'] == 'Preparation failed — see Logs and retry.'
+    assert not run._claimed('acme#1', stores)
 
 
 @pytest.mark.parametrize('destination', [

@@ -422,7 +422,7 @@ def _scorer_after_model(callback_context, llm_response):
     try:
         MatchScore.model_validate_json(text)
     except ValueError as exc:
-        raise _ScorerBadContent("Scorer returned no valid terminal score") from exc
+        raise _ScorerBadContent("schema_invalid" if text.strip() else "no_terminal_output") from exc
     return None
 
 
@@ -480,11 +480,11 @@ class _SafeScorer(LlmAgent):
                                         score = MatchScore.model_validate_json(terminal_text)
                                         if MatchScore.model_validate(delta) != score:
                                             raise _ScorerBadContent(
-                                                "Terminal score does not match ADK state"
+                                                "state_mismatch"
                                             )
                                     except ValueError as exc:
                                         raise _ScorerBadContent(
-                                            "Terminal scorer event is not schema-valid"
+                                            "schema_invalid"
                                         ) from exc
                                     witness = score
                                     witness_event = event
@@ -505,13 +505,16 @@ class _SafeScorer(LlmAgent):
                         for event in events:
                             yield event
                         return
-                except _ScorerBadContent:
+                    log.warning("scorer_output_rejected class=no_terminal_output")
+                except _ScorerBadContent as exc:
                     # Exactly one same-agent, same-context correction; the
                     # invalid generation is never exposed to the next agent.
-                    pass
+                    log.warning("scorer_output_rejected class=%s", str(exc))
                 except ScorerModelError:
+                    log.warning("scorer_output_rejected class=model_error")
                     raise
                 except Exception as exc:
+                    log.warning("scorer_output_rejected class=model_error")
                     # Never turn a provider/transport failure into bad content.
                     raise ScorerModelError(
                         "The scorer invocation failed; no score was accepted."

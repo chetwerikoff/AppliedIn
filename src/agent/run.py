@@ -505,17 +505,21 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
         emit("running", pk=pk, detail=f"{row.get('title','')} @ {row.get('company','')}",
              url=row.get("jd_url"))
         try:
+            if admitted.get("rescore_requested"):
+                _run(_reset_session(pk, strict=True))
             result = _run(_run_job_async(pk, admitted, stores, prepare_only=prepare_only))
         except Exception as exc:
             from .graph import ScorerModelError
-            if not isinstance(exc, ScorerModelError):
-                raise
             # Preserve the distinct scorer fault behavior; this is not a
             # reader-storage exception and is NOT masked by reader containment.
-            detail = ("Scorer model/request failed; no valid score was received. "
-                      "Check the error log, then Reopen & re-score.")
-            stores.tracking.set_status(pk, Status.ERROR, match_score=None, error=detail)
-            emit("error", pk=pk, detail=detail, url=row.get("jd_url"))
+            detail = (("Scorer model/request failed; no valid score was received. "
+                       "Check the error log, then Reopen & re-score.")
+                      if isinstance(exc, ScorerModelError)
+                      else "Preparation failed — see Logs and retry.")
+            committed, _ = _reader_patch(pk, admitted, stores, {
+                "status": Status.ERROR, "match_score": None, "error": detail})
+            if committed:
+                emit("error", pk=pk, detail=detail, url=row.get("jd_url"))
             raise
         # Existing explicit Apply request is NOT created by prepare-only Retry.
         # Re-fetch within the guarded enqueue path; never trust this old row.
@@ -545,6 +549,9 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     and nothing is enqueued.
     """
     from tools.jd import PostingReadUnavailable
+    # Keep the caller's failure witness current only after our own successful
+    # commits. A late exception must never rebase onto a row changed by Skip.
+    admitted = row
 
     # Original relative URLs can only be processed by the review agent, even
     # after a verified operational read and an earlier application request.
@@ -663,6 +670,7 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
         if committed_guard is None:
             return {"result": "conflict", "pk": pk, "reason": "posting_guard_state_changed"}
         row = committed_guard
+        admitted.update(row)
         if guard_recovery is not None:
             problem = _guard_recovery_generation_problem(
                 guard_recovery, row, row.get("posting_guard"))
@@ -670,6 +678,7 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
                 return _guard_recovery_refused(
                     pk, row, guard_recovery, stores, *problem)
         committed, settled = _reader_patch(pk, row, stores, {
+            "rescore_requested": False,
             "jd_read_attempts": 0,
             "jd_read_retry_at": None, "jd_read_error": "",
             # The refusal itself is settled only once the new generation is bound.
@@ -680,6 +689,7 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     if not committed:
         return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
     row = settled
+    admitted.update(row)
     jd_text = row.get("jd_text") or ""
 
     # Distinguish a known infrastructure outage from a successfully returned
@@ -757,7 +767,7 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     try:
         extra = {"no_enqueue": True} if guard_recovery is not None or _board_preparation(row) else {}
         result = await _drive_async(runner, pk, msg, stores,
-                                    prepare_only=prepare_only, **extra)
+                                    prepare_only=prepare_only, observed=row, **extra)
     except ScorerInvalidOutput:
         # No new diagnostics or artifacts: a stale score/PDF must not appear
         # as evidence of this evaluation or enable a downstream approval.
@@ -765,8 +775,11 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
 
         detail = ("The scorer did not return a valid score after one correction. "
                   "Nothing was tailored or queued; use Reopen & re-score to retry.")
-        stores.tracking.set_status(pk, Status.SKIPPED, skip_reason="scorer_invalid_output",
-                                   match_score=None, fail_reason=detail)
+        committed, _ = _reader_patch(pk, row, stores, {
+            "status": Status.SKIPPED, "skip_reason": "scorer_invalid_output",
+            "match_score": None, "fail_reason": detail})
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
         emit("skipped", pk=pk, detail=detail, url=row.get("jd_url"))
         return {"result": "skipped", "pk": pk, "reason": "scorer_invalid_output"}
 
@@ -2885,12 +2898,14 @@ def retry_job(pk: str, stores: Any = None, *,
                 pk, admitted, stores, prepare_only=prepare_only, **extra))
         except Exception as exc:
             from .graph import ScorerModelError
-            if not isinstance(exc, ScorerModelError):
-                raise
-            detail = ("Scorer model/request failed; no valid score was received. "
-                      "Check the error log, then Reopen & re-score.")
-            stores.tracking.set_status(pk, Status.ERROR, match_score=None, error=detail)
-            emit("error", pk=pk, detail=detail, url=row.get("jd_url"))
+            detail = (("Scorer model/request failed; no valid score was received. "
+                       "Check the error log, then Reopen & re-score.")
+                      if isinstance(exc, ScorerModelError)
+                      else "Preparation failed — see Logs and retry.")
+            committed, _ = _reader_patch(pk, admitted, stores, {
+                "status": Status.ERROR, "match_score": None, "error": detail})
+            if committed:
+                emit("error", pk=pk, detail=detail, url=row.get("jd_url"))
             raise
         if (result or {}).get("result") == "prepared" and not posting_retry:
             try:
@@ -2929,13 +2944,18 @@ def _stale_posting(session: Any, current: dict, jd_text: str) -> bool:
         return True
 
 
-async def _reset_session(pk: str) -> None:
+async def _reset_session(pk: str, *, strict: bool = False) -> None:
     """Delete the ADK session for a pk so run_job re-creates it fresh."""
     sessions = _session_service()
     try:
         await sessions.delete_session(app_name=_APP, user_id=_USER, session_id=pk)
-    except Exception:  # no session yet, or already gone — fine
-        pass
+    except Exception:
+        # Reopen promises fresh preferences even when seed/JD are unchanged.
+        # A genuinely absent session needs no deletion; a failed delete of a
+        # still-readable session must not silently reuse yesterday's state.
+        if strict and await sessions.get_session(
+                app_name=_APP, user_id=_USER, session_id=pk) is not None:
+            raise
 
 
 def _short(obj: Any, n: int = 600) -> str:
@@ -2958,6 +2978,13 @@ def _score_gate(pk: str, score_result: Any, stores: Any) -> dict | None:
     """Only an ADK-validated terminal MatchScore may pass the score gate."""
     from core.events import emit
     from tools.schema import MatchScore
+    from .graph import _PDF_INVOCATION
+
+    invocation = _PDF_INVOCATION.get()
+    row = invocation["row"] if invocation is not None else stores.tracking.get(pk) or {}
+    check = _reader_check(pk, row, stores)
+    if check or row.get("status") not in ("found", "tailoring"):
+        return check or {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
 
     # Legacy direct callers pass a complete JSON string; validate it through
     # the same schema, never by extracting a substring. The live runner passes
@@ -2974,21 +3001,29 @@ def _score_gate(pk: str, score_result: Any, stores: Any) -> dict | None:
             r"i'?m an ai|as an ai|i cannot|i can'?t|unable to (access|assist)"
             r"|don'?t have (a|any) (resume|r\u00e9sum\u00e9|personal)",
             reasoning, re.I):
-        stores.tracking.set_status(pk, Status.ERROR, match_score=None,
-                                   error="the scorer model refused the task instead of "
-                                         "scoring — hit Retry (or switch the scorer model)")
+        committed, _ = _reader_patch(pk, row, stores, {
+            "status": Status.ERROR, "match_score": None,
+            "error": "the scorer model refused the task instead of "
+                     "scoring — hit Retry (or switch the scorer model)"})
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
         emit("error", pk=pk, detail="scorer refused instead of scoring — retry the job")
         log.warning("scorer refusal for pk=%s", pk)
         return {"result": "error", "pk": pk, "reason": "scorer_refused"}
 
-    row = stores.tracking.get(pk) or {}
-    stores.tracking.set_status(pk, Status.TAILORING, match_score=score)
     threshold = _min_score()
+    low = score < threshold and row.get("score_override") is not True
+    committed, updated = _reader_patch(pk, row, stores, {
+        "status": Status.SKIPPED if low else Status.TAILORING,
+        "match_score": score, **({"skip_reason": "low_score"} if low else {})})
+    if not committed:
+        return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+    if invocation is not None:
+        invocation["row"] = updated
     if score < threshold and row.get("score_override") is True:
         emit("response", pk=pk, detail=f"match {score}/10 < {threshold} — owner overrode the score; tailoring for review")
         return None
     if score < threshold:
-        stores.tracking.set_status(pk, Status.SKIPPED, skip_reason="low_score", match_score=score)
         emit("skipped", pk=pk, detail=f"match {score}/10 < {threshold} — skipped before tailoring")
         log.info("skipped pk=%s: score %s < %s", pk, score, threshold)
         return {"result": "skipped", "pk": pk, "score": score}
@@ -3152,15 +3187,35 @@ def _pdf_patch(pk: str, stores: Any, changes: dict) -> dict | None:
 
 
 async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
-                       prepare_only: bool = False, no_enqueue: bool = False) -> dict:
+                       prepare_only: bool = False, no_enqueue: bool = False,
+                       observed: dict | None = None) -> dict:
     from .graph import _PDF_INVOCATION
-    row = stores.tracking.get(pk) or {}
+    row = observed if observed is not None else stores.tracking.get(pk) or {}
+    if observed is not None:
+        check = _reader_check(pk, row, stores)
+        if check or row.get("status") != "tailoring":
+            return check or {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
     if _board_preparation(row):
         prepare_only = no_enqueue = True
     token = _PDF_INVOCATION.set({"row": row, "stores": stores})
     try:
         return await _drive_preparation(runner, pk, message, stores,
                                         prepare_only=prepare_only, no_enqueue=no_enqueue)
+    except Exception as exc:
+        from .graph import ScorerInvalidOutput, ScorerModelError
+
+        current = _PDF_INVOCATION.get()["row"]
+        if (observed is not None and not isinstance(exc, ScorerInvalidOutput)
+                and current.get("status") == "tailoring"):
+            # Tool/PDF commits advance the witness. Use this invocation's latest
+            # witness, never a fresh row that might belong to Skip or Reopen.
+            detail = ("Scorer model/request failed; no valid score was received. "
+                      "Check the error log, then Reopen & re-score."
+                      if isinstance(exc, ScorerModelError)
+                      else "Preparation failed — see Logs and retry.")
+            _reader_patch(pk, current, stores, {
+                "status": Status.ERROR, "match_score": None, "error": detail})
+        raise
     finally:
         _PDF_INVOCATION.reset(token)
 
@@ -3359,8 +3414,17 @@ async def _drive_preparation(runner: Runner, pk: str, message: Any, stores: Any,
     if outcome.get("reason") == "posting_guard_review_required":
         return _guard_refusal(pk, stores)
     reason = _fail_reason(outcome)
-    stores.tracking.set_status(pk, Status.FAILED, fail_reason=reason,
-                               fail_kind=outcome.get("reason") or "")
+    from .graph import _PDF_INVOCATION
+    invocation = _PDF_INVOCATION.get()
+    if apply_result is None and invocation is not None:
+        committed, _ = _reader_patch(pk, invocation["row"], stores, {
+            "status": Status.FAILED, "fail_reason": reason,
+            "fail_kind": outcome.get("reason") or ""})
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+    else:
+        stores.tracking.set_status(pk, Status.FAILED, fail_reason=reason,
+                                   fail_kind=outcome.get("reason") or "")
     emit("error", pk=pk, agent="applier", detail=reason, url=final.get("jd_url"),
          screenshot=_art_url(final.get("screenshot_s3_key")))
     log.info("failed pk=%s: %s", pk, reason)

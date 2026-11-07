@@ -1633,15 +1633,16 @@ def create_app() -> FastAPI:
         def _run() -> None:
             import logging
 
-            from agent.run import run_job
+            from agent.run import _reader_patch, run_job
             stores = make_stores(settings)
+            admitted = stores.tracking.get(pk) or {}
             try:
                 run_job(pk, stores, prepare_only=True)
             except Exception as exc:
                 # The claim is released on failure; the card must not stay WORKING.
-                if (stores.tracking.get(pk) or {}).get("status") in ("found", "tailoring"):
-                    stores.tracking.set_status(pk, Status.ERROR,
-                                               error=f"Preparation failed: {type(exc).__name__}")
+                _reader_patch(pk, admitted, stores, {
+                    "status": Status.ERROR,
+                    "error": f"Preparation failed: {type(exc).__name__}"})
                 logging.getLogger("server").exception("run-job failed for %s", pk)
 
         background.add_task(_run)
@@ -1667,8 +1668,9 @@ def create_app() -> FastAPI:
                                    skip_reason="", fail_reason="", fail_kind="", error="")
 
         def prepare() -> None:
-            from agent.run import run_job
+            from agent.run import _reader_patch, run_job
 
+            admitted = stores.tracking.get(pk) or {}
             try:
                 # Explicitly preparation-only even when automatic applying is on.
                 run_job(pk, stores, prepare_only=True)
@@ -1676,7 +1678,8 @@ def create_app() -> FastAPI:
                 import logging
 
                 logging.getLogger("server").exception("forced preparation failed for %s", pk)
-                stores.tracking.set_status(pk, Status.ERROR, error="Preparation failed — see Logs and retry.")
+                _reader_patch(pk, admitted, stores, {
+                    "status": Status.ERROR, "error": "Preparation failed — see Logs and retry."})
 
         background.add_task(prepare)
         return {"ok": True, "pk": pk, "status": "preparing", "next": "review"}
@@ -1735,6 +1738,7 @@ def create_app() -> FastAPI:
                 "status": Status.FOUND, "skip_reason": "", "fail_reason": "",
                 "fail_kind": "", "error": "", "match_score": None,
                 "gate_reason": "", "gate_pending": None, "gate_call_id": None,
+                "rescore_requested": True,
             })
         except Exception:
             return {"ok": False, "error": "Tracking/claim/lease inspection failed; "
@@ -1748,17 +1752,10 @@ def create_app() -> FastAPI:
              detail=f"reopened · {row.get('title','')} @ {row.get('company','')} "
                     f"(was {status}) — scoring again")
 
-        def _run() -> None:
-            import logging
-
-            from agent.run import run_job
-            try:
-                run_job(pk, stores)
-            except Exception:  # noqa: BLE001
-                logging.getLogger("server").exception("reopen run failed for %s", pk)
-
-        background.add_task(_run)
-        return {"ok": True, "pk": pk, "was": status, "status": "running"}
+        # Reopen shares discovery's bounded evaluate lanes. The admitted worker
+        # resets its session under its existing claim before scoring again.
+        stores.queue.enqueue(stores.tailor_queue, {"pk": pk})
+        return {"ok": True, "pk": pk, "was": status, "status": "queued"}
 
     @app.post("/actions/tailor-text")
     def tailor_text(body: dict, background: BackgroundTasks):

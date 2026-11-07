@@ -193,6 +193,190 @@ def _run(h):
     return R.run_job(h.pk, h.stores, prepare_only=h.prep)
 
 
+@pytest.mark.parametrize("score", [2, 9])
+def test_skip_before_score_gate_cannot_be_revived(harness, monkeypatch, score):
+    h = harness
+    gate = R._score_gate
+
+    def skip_then_score(*args):
+        h.stores.tracking.set_status(h.pk, Status.SKIPPED, skip_reason="user_skipped")
+        return gate(*args)
+
+    monkeypatch.setattr(R, "_score_gate", skip_then_score)
+    h.fake.scripted = [_response(f'{{"score":{score},"reasoning":"fit"}}')]
+    assert _run(h)["result"] == "conflict"
+    assert h.stores.tracking.row["status"] == "skipped"
+    assert h.stores.tracking.row["skip_reason"] == "user_skipped"
+    assert h.stores.tracking.row["resume_s3_key"] == "resumes/historical.pdf"
+    assert h.next.observed == []
+
+
+@pytest.mark.parametrize("failure", [G.ScorerModelError("synthetic failure"),
+                                   RuntimeError("synthetic failure"),
+                                   G.ScorerInvalidOutput("synthetic invalid")])
+def test_skip_before_scorer_error_preserves_intent_and_releases_claim(
+        harness, monkeypatch, failure):
+    h = harness
+    released = []
+    monkeypatch.setattr(R, "_release", lambda *args: released.append(True))
+
+    async def fail(*args, **kwargs):
+        h.stores.tracking.set_status(h.pk, Status.SKIPPED, skip_reason="user_skipped")
+        raise failure
+
+    monkeypatch.setattr(R, "_drive_preparation", fail)
+    if isinstance(failure, G.ScorerInvalidOutput):
+        assert _run(h)["result"] == "conflict"
+    else:
+        with pytest.raises(type(failure)):
+            _run(h)
+    assert released == [True]
+    assert h.stores.tracking.row["status"] == "skipped"
+    assert h.stores.tracking.row["skip_reason"] == "user_skipped"
+    assert h.stores.tracking.row["resume_s3_key"] == "resumes/historical.pdf"
+
+
+@pytest.mark.parametrize("content,token", [("private fake model text", "schema_invalid"),
+                                        ("", "no_terminal_output")])
+def test_rejected_attempt_logs_only_diagnostic_class(harness, caplog, content, token):
+    h = harness
+    h.fake.scripted = [_response(content), _response(content)]
+    _run(h)
+    messages = [r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("scorer_output_rejected")]
+    assert messages == [f"scorer_output_rejected class={token}"] * 2
+    assert "private fake model text" not in caplog.text
+
+
+def test_reopen_resets_same_seed_session_before_rescoring(harness, monkeypatch):
+    h = harness
+    sessions = R._session_service()
+    deleted = []
+    delete = sessions.delete_session
+
+    async def record_delete(**kwargs):
+        deleted.append(kwargs["session_id"])
+        await delete(**kwargs)
+
+    monkeypatch.setattr(sessions, "delete_session", record_delete)
+    h.stores.tracking.row["rescore_requested"] = True
+    h.fake.scripted = [_response('{"score":2,"reasoning":"fit"}')]
+    _run(h)
+    assert deleted == [h.pk]
+    assert h.stores.tracking.row["rescore_requested"] is False
+    assert len(h.fake.requests) == 1
+
+
+@pytest.mark.parametrize("skip", [False, True])
+def test_unsent_root_fallthrough_preserves_accepted_skip(harness, monkeypatch, skip):
+    h = harness
+    if h.prep:
+        # Exercise the unsent branch using this fixture's fully offline graph;
+        # the normal root singleton is not patched by the review-shell fixture.
+        monkeypatch.setattr(R, "root_agent", G.review_agent)
+    h.prep = False
+
+    async def no_tool(self, ctx):
+        if skip:
+            h.stores.tracking.set_status(h.pk, Status.SKIPPED, skip_reason="user_skipped")
+        if False:
+            yield
+
+    monkeypatch.setattr(_NextAgent, "_run_async_impl", no_tool)
+    h.fake.scripted = [_response('{"score":9,"reasoning":"fit"}')]
+    result = _run(h)
+    assert result["result"] == ("conflict" if skip else "failed")
+    row = h.stores.tracking.row
+    assert row["status"] == ("skipped" if skip else "failed")
+    if skip:
+        assert row["skip_reason"] == "user_skipped"
+    assert row["resume_s3_key"] == "resumes/historical.pdf"
+    assert len(h.fake.requests) == 1
+
+
+def test_reopen_session_delete_failure_never_reuses_stale_preferences(harness, monkeypatch):
+    h = harness
+    sessions = R._session_service()
+    reads, released = [], []
+    h.stores.tracking.row["rescore_requested"] = True
+
+    async def cannot_delete(**kwargs):
+        raise RuntimeError("synthetic session deletion failure")
+
+    async def stale_but_readable(**kwargs):
+        reads.append(kwargs["session_id"])
+        return SimpleNamespace(state={
+            **SYNTHETIC_STATE, "prefs_brief": "synthetic old preferences",
+            "posting_guard_generation": h.stores.tracking.row["posting_guard"]["generation"]})
+
+    monkeypatch.setattr(sessions, "delete_session", cannot_delete)
+    monkeypatch.setattr(sessions, "get_session", stale_but_readable)
+    monkeypatch.setattr(R, "_release", lambda *args: released.append(True))
+    with pytest.raises(RuntimeError, match="synthetic session deletion failure"):
+        _run(h)
+    assert reads == [h.pk]
+    assert released == [True]
+    assert h.stores.tracking.row["status"] == "error"
+    assert h.fake.requests == h.next.observed == []
+
+
+def test_reopen_can_reset_a_genuinely_absent_session(harness, monkeypatch):
+    sessions = R._session_service()
+
+    async def missing(**kwargs):
+        raise KeyError("synthetic absent session")
+
+    async def absent(**kwargs):
+        return None
+
+    monkeypatch.setattr(sessions, "delete_session", missing)
+    monkeypatch.setattr(sessions, "get_session", absent)
+    R._run(R._reset_session(harness.pk, strict=True))
+
+
+@pytest.mark.parametrize("kind", ["state_mismatch", "no_terminal_output", "model_error"])
+def test_event_rejections_log_one_safe_token_per_attempt(monkeypatch, caplog, kind):
+    """Cover ADK state drift and empty streams, not only malformed model text."""
+    from google.adk.agents import LlmAgent
+    from google.adk.events import Event, EventActions
+
+    async def events(self, ctx):
+        if kind == "model_error":
+            raise RuntimeError("private fake model text")
+        if kind == "state_mismatch":
+            yield Event(author="scorer", content=types.Content(role="model", parts=[
+                types.Part(text='{"score":8,"reasoning":"private fake model text"}')]),
+                actions=EventActions(state_delta={"match_score": {"score":2,"reasoning":"fit"}}))
+
+    monkeypatch.setattr(LlmAgent, "_run_async_impl", events)
+    monkeypatch.setattr(G._steering, "instructions", lambda: "")
+
+    async def collect():
+        return [event async for event in G.scorer._run_async_impl(
+            SimpleNamespace(session=SimpleNamespace(state={}))) ]
+
+    with pytest.raises(G.ScorerModelError if kind == "model_error" else G.ScorerInvalidOutput):
+        R._run(collect())
+    messages = [r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("scorer_output_rejected")]
+    assert messages == [f"scorer_output_rejected class={kind}"] * (1 if kind == "model_error" else 2)
+    assert "private fake model text" not in caplog.text
+
+
+@pytest.mark.parametrize("failure", [TimeoutError("synthetic timeout"),
+                                   RuntimeError("synthetic transport error")])
+def test_model_timeout_or_exception_exits_error_and_releases_claim(harness, monkeypatch, failure):
+    h = harness
+    released = []
+    monkeypatch.setattr(R, "_release", lambda *args: released.append(True))
+    h.fake.scripted = [failure]
+    with pytest.raises(G.ScorerModelError):
+        _run(h)
+    assert h.stores.tracking.row["status"] == "error"
+    assert h.stores.tracking.row["match_score"] is None
+    assert released == [True]
+
+
 def _assert_same_context(h):
     assert len(h.fake.requests) == 2
     left, right = map(_material, h.fake.requests)

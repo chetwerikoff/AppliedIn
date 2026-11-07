@@ -386,6 +386,40 @@ def test_shim_only_uses_mise_with_caller_env_before_child_sandbox(cli, tmp_path,
     assert subprocess_run.call_args_list[1].args[0][0] == str(real)
 
 
+def test_shim_only_unconfigured_mise_uses_explicit_tool_lookup(cli, tmp_path, monkeypatch):
+    shim = synthetic_executable(tmp_path / "mise" / "shims" / "opencode2")
+    real = synthetic_executable(tmp_path / "installed" / "opencode2")
+    monkeypatch.setenv("PATH", str(shim.parent))
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-caller-only")
+    monkeypatch.setattr(oc.shutil, "which", real_which)
+    _, launch, subprocess_run = cli
+
+    def fake_mise_and_cleanup(command, **kwargs):
+        if command == ["mise", "which", "opencode2"]:
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="not activated")
+        if command == ["mise", "which", "opencode2", "--tool", "opencode@latest"]:
+            return subprocess.CompletedProcess(command, 0, stdout=f"{real}\n", stderr="")
+        assert command == [str(real), "session", "delete", "--standalone", "ses_synthetic"]
+        return subprocess.CompletedProcess(command, 0)
+
+    subprocess_run.side_effect = fake_mise_and_cleanup
+    result = oc.run_search("Find synthetic roles", SCHEMA, lambda _: None)
+
+    assert result["source_urls"] == {GOOD}
+    assert [call.args[0] for call in subprocess_run.call_args_list[:2]] == [
+        ["mise", "which", "opencode2"],
+        ["mise", "which", "opencode2", "--tool", "opencode@latest"],
+    ]
+    for call in subprocess_run.call_args_list[:2]:
+        assert call.kwargs["env"]["OPENAI_API_KEY"] == "synthetic-caller-only"
+        assert "cwd" not in call.kwargs
+    assert [call.args[0][0] for call in launch.call_args_list] == [str(real), str(real)]
+    assert "OPENAI_API_KEY" not in launch.call_args.kwargs["env"]
+    assert subprocess_run.call_args_list[2].args[0] == [
+        str(real), "session", "delete", "--standalone", "ses_synthetic",
+    ]
+
+
 @pytest.mark.parametrize("failure", [
     "mise_missing", "mise_failed", "mise_timeout", "relative_path", "non_executable", "shim_path",
 ])
@@ -399,7 +433,10 @@ def test_shim_only_resolution_failure_keeps_install_cli_error(cli, tmp_path, mon
     _, launch, subprocess_run = cli
 
     def fake_mise(command, **kwargs):
-        assert command == ["mise", "which", "opencode2"]
+        assert command in (
+            ["mise", "which", "opencode2"],
+            ["mise", "which", "opencode2", "--tool", "opencode@latest"],
+        )
         if failure == "mise_missing":
             raise FileNotFoundError("synthetic missing mise")
         if failure == "mise_timeout":
@@ -416,7 +453,10 @@ def test_shim_only_resolution_failure_keeps_install_cli_error(cli, tmp_path, mon
     subprocess_run.side_effect = fake_mise
     with pytest.raises(ValueError, match=r"Install OpenCode CLI \(opencode2\)"):
         oc.run_search("Synthetic query", SCHEMA, lambda _: None)
-    subprocess_run.assert_called_once()
+    assert [call.args[0] for call in subprocess_run.call_args_list] == [
+        ["mise", "which", "opencode2"],
+        ["mise", "which", "opencode2", "--tool", "opencode@latest"],
+    ]
     launch.assert_not_called()
 
 

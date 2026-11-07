@@ -370,6 +370,8 @@ from core.config import get_settings
 s = get_settings()
 assert Path(s.local_dir) == Path(sys.argv[1])
 assert s.redis_url == "redis://offline.invalid:1/0"
+if len(sys.argv) > 2:
+    assert os.environ["SYNTHETIC_CHILD_STARTUP"] == "loaded"
 try:
     redis.Redis(host="127.0.0.1", port=1).ping()
 except RuntimeError as exc:
@@ -377,9 +379,14 @@ except RuntimeError as exc:
 else:
     raise AssertionError("child connected to real Redis")
 '''
-    for child_env in (None, {"APPLIEDIN_LOCAL_DIR": settings.local_dir}):
+    (tmp_path / "sitecustomize.py").write_text(
+        'import os\nos.environ["SYNTHETIC_CHILD_STARTUP"] = "loaded"\n'
+    )
+    for child_env in (None, {"APPLIEDIN_LOCAL_DIR": settings.local_dir,
+                             "PYTHONPATH": str(tmp_path)}):
         child = subprocess.run(
-            [sys.executable, "-c", child_source, settings.local_dir],
+            [sys.executable, "-c", child_source, settings.local_dir,
+             *(["custom-startup"] if child_env is not None else [])],
             env=child_env, capture_output=True, text=True, timeout=30,
         )
         assert child.returncode == 0, child.stderr

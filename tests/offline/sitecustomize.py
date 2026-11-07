@@ -5,8 +5,10 @@ transports. Unlike a monkeypatch, test teardown cannot accidentally undo one.
 """
 
 import os
+import runpy
 import subprocess
 import sys
+from importlib.machinery import PathFinder
 from pathlib import Path
 
 
@@ -40,3 +42,10 @@ def _offline_popen_init(self, *args, **kwargs):
 
 
 subprocess.Popen.__init__ = _offline_popen_init
+
+# Synthetic subprocess harnesses install their own sitecustomize to stub the
+# daemon before import. Preserve that hook: shadowing it would run real startup.
+_other_paths = [p for p in sys.path if str(Path(p).resolve()) != _startup]
+_next_startup = PathFinder.find_spec("sitecustomize", _other_paths)
+if _next_startup is not None and _next_startup.origin:
+    runpy.run_path(_next_startup.origin)

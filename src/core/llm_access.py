@@ -160,7 +160,10 @@ def _fetch_access_token() -> str:
     path = chatgpt_token_path()
     staged = path.with_name(f"{path.name}.login-{uuid4().hex}")
     try:
-        auth = Authenticator(auth_file=str(staged))
+        # LiteLLM 1.92.0 has a no-argument constructor; its auth-file path
+        # is a mutable instance attribute read by the device-code methods.
+        auth = Authenticator()
+        auth.auth_file = str(staged)
         token = auth._login_device_code()["access_token"]
         # LiteLLM's credential writer may fail without raising. Do not claim
         # success unless the new token was persisted before installing it.

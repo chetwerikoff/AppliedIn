@@ -19,8 +19,8 @@ from __future__ import annotations
 import json
 import os
 import sys
-from uuid import uuid4
 from pathlib import Path
+from uuid import uuid4
 
 from core.config import Settings, get_settings
 

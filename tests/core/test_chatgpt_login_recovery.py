@@ -48,8 +48,9 @@ def test_revoked_cache_is_verified_once_moved_and_device_flow_starts(monkeypatch
     backups = list(tmp_path.glob("auth.json.recovery-*"))
     assert len(backups) == 1
     assert json.loads(backups[0].read_text())["access_token"] == secret
-    assert "succeeded" in capsys.readouterr().out.lower()
-    assert secret not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "succeeded" in out.lower()
+    assert secret not in out
 
 
 def test_healthy_cached_token_verifies_without_device_flow(monkeypatch, tmp_path, capsys):
@@ -113,6 +114,7 @@ def test_verification_is_one_minimal_authenticated_call(monkeypatch):
     assert url.endswith("/models")
     assert kwargs["headers"]["Authorization"] == "Bearer synthetic-bearer"
     assert kwargs["follow_redirects"] is False
+    assert kwargs["params"] == {"client_version": "1.0.0"}
     assert kwargs["timeout"] == 15
 
 

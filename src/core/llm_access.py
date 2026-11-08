@@ -152,12 +152,25 @@ def _verify_cached_token(token: str, account_id: str | None) -> bool:
 
 def _fetch_access_token() -> str:
     from litellm.llms.chatgpt.authenticator import Authenticator
-    from core.chatgpt_stream import interactive_login
 
-    # Only this explicit owner command is allowed to start a device-code flow.
-    # Every daemon/provider call uses the noninteractive Authenticator guard.
-    with interactive_login():
-        return Authenticator().get_access_token()
+    # A daemon refresh can repopulate auth.json after _move_cache_aside().
+    # get_access_token() would then trust that still-revoked cached token and
+    # skip the owner's required device flow. Use an isolated, empty auth path
+    # so neither the cache nor a daemon-era cooldown can short-circuit login.
+    path = chatgpt_token_path()
+    staged = path.with_name(f"{path.name}.login-{uuid4().hex}")
+    try:
+        auth = Authenticator(auth_file=str(staged))
+        token = auth._login_device_code()["access_token"]
+        # LiteLLM's credential writer may fail without raising. Do not claim
+        # success unless the new token was persisted before installing it.
+        if not token or not staged.is_file():
+            raise RuntimeError("ChatGPT device login did not save credentials")
+        staged.replace(path)
+        return token
+    finally:
+        # An interrupted/failed login may leave a temporary cooldown record.
+        staged.unlink(missing_ok=True)
 
 
 def _login(*, force: bool = False) -> int:

@@ -61,7 +61,7 @@ case "${1:-}" in
   browser-setup) ensure_env ;;
   start) ensure_env; preflight; ensure_career_ops --tools-only ;;
   update) exec ./scripts/update-from-upstream.sh ;;
-  login-chatgpt) exec uv run python -m core.llm_access login ;;
+  login-chatgpt) shift; exec uv run python -m core.llm_access login "$@" ;;
 esac
 
 exec uv run python -m cli "$@"

@@ -131,16 +131,14 @@ def _verify_cached_token(token: str, account_id: str | None) -> bool:
     """
     import httpx
     from litellm.llms.chatgpt.authenticator import Authenticator
-    from litellm.llms.chatgpt.common_utils import (
-        extract_chatgpt_account_id,
-        get_chatgpt_default_headers,
-    )
+    from litellm.llms.chatgpt.common_utils import get_chatgpt_default_headers
 
+    authenticator = Authenticator()
     headers = get_chatgpt_default_headers(
-        token, account_id or extract_chatgpt_account_id(token))
+        token, account_id or authenticator.get_account_id())
     headers["accept"] = "application/json"
     response = httpx.get(
-        Authenticator().get_api_base().rstrip("/") + "/models",
+        authenticator.get_api_base().rstrip("/") + "/models",
         headers=headers, params={"client_version": "1.0.0"},
         timeout=15, follow_redirects=False,
     )

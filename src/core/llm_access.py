@@ -141,7 +141,8 @@ def _verify_cached_token(token: str, account_id: str | None) -> bool:
     headers["accept"] = "application/json"
     response = httpx.get(
         Authenticator().get_api_base().rstrip("/") + "/models",
-        headers=headers, timeout=15, follow_redirects=False,
+        headers=headers, params={"client_version": "1.0.0"},
+        timeout=15, follow_redirects=False,
     )
     # The backend sometimes supplies token_expired in a structured response
     # instead of using an HTTP 401. Never print either response.

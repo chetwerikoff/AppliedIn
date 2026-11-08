@@ -16,9 +16,11 @@ The provider is read off the model string. Do not ask LiteLLM to classify a
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 from core.config import Settings, get_settings
 
@@ -104,19 +106,103 @@ def missing_access(settings: Settings) -> list[str]:
     return problems
 
 
+def _cached_auth() -> dict:
+    """Read the local cache without ever exposing its contents to diagnostics."""
+    try:
+        with chatgpt_token_path().open(encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _move_cache_aside() -> None:
+    """Preserve the private credential file while removing it from LiteLLM's path."""
+    path = chatgpt_token_path()
+    if path.exists() or path.is_symlink():
+        path.replace(path.with_name(f"{path.name}.recovery-{uuid4().hex}"))
+
+
+def _verify_cached_token(token: str, account_id: str | None) -> bool:
+    """One lightweight authenticated Codex API request; never infer health from JWT expiry.
+
+    A network/endpoint failure is not evidence of revocation and must not
+    discard credentials. No response body or authentication header is logged.
+    """
+    import httpx
+    from litellm.llms.chatgpt.authenticator import Authenticator
+    from litellm.llms.chatgpt.common_utils import get_chatgpt_default_headers
+
+    authenticator = Authenticator()
+    headers = get_chatgpt_default_headers(
+        token, account_id or authenticator.get_account_id())
+    headers["accept"] = "application/json"
+    response = httpx.get(
+        authenticator.get_api_base().rstrip("/") + "/models",
+        headers=headers, params={"client_version": "1.0.0"},
+        timeout=15, follow_redirects=False,
+    )
+    # The backend sometimes supplies token_expired in a structured response
+    # instead of using an HTTP 401. Never print either response.
+    if response.status_code == 401 or "token_expired" in response.text.lower():
+        return False
+    response.raise_for_status()
+    return True
+
+
 def _fetch_access_token() -> str:
     from litellm.llms.chatgpt.authenticator import Authenticator
 
-    # Prints the device code itself and blocks until it is approved. The return
-    # value is the access token; callers must not print it.
-    return Authenticator().get_access_token()
-
-
-def _login() -> int:
+    # A daemon refresh can repopulate auth.json after _move_cache_aside().
+    # get_access_token() would then trust that still-revoked cached token and
+    # skip the owner's required device flow. Use an isolated, empty auth path
+    # so neither the cache nor a daemon-era cooldown can short-circuit login.
+    path = chatgpt_token_path()
+    staged = path.with_name(f"{path.name}.login-{uuid4().hex}")
     try:
+        # LiteLLM 1.92.0 has a no-argument constructor; its auth-file path
+        # is a mutable instance attribute read by the device-code methods.
+        auth = Authenticator()
+        auth.auth_file = str(staged)
+        token = auth._login_device_code()["access_token"]
+        # LiteLLM's credential writer may fail without raising. Do not claim
+        # success unless the new token was persisted before installing it.
+        if not token or not staged.is_file():
+            raise RuntimeError("ChatGPT device login did not save credentials")
+        staged.replace(path)
+        return token
+    finally:
+        # An interrupted/failed login may leave a temporary cooldown record.
+        staged.unlink(missing_ok=True)
+
+
+def _login(*, force: bool = False) -> int:
+    try:
+        data = _cached_auth()
+        token = data.get("access_token")
+        if force:
+            _move_cache_aside()
+        elif isinstance(token, str) and token:
+            account_id = data.get("account_id")
+            if _verify_cached_token(
+                token, account_id if isinstance(account_id, str) else None,
+            ):
+                print("ChatGPT login succeeded.")
+                return 0
+            # The server rejected a still-cached token. Keep a private backup
+            # but make the interactive Authenticator ignore the dead record.
+            _move_cache_aside()
+        elif (data.get("device_code_requested_at") is not None
+              and not data.get("access_token") and not data.get("refresh_token")):
+            # An older daemon may have left only a device-code cooldown stub.
+            # Otherwise LiteLLM waits five minutes without displaying a code.
+            _move_cache_aside()
+
         token = _fetch_access_token()
-    except Exception as exc:
-        print(f"ChatGPT login failed: {exc}")
+    except Exception:
+        # HTTP exceptions may carry request headers or server response data.
+        # Never stringify them, and never print the cached token or its path.
+        print("ChatGPT login failed. Check connectivity and retry ./appliedin login-chatgpt.")
         return 1
     if not token:
         print("ChatGPT login failed.")
@@ -134,7 +220,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if problems else 0
     if args == ["login"]:
         return _login()
-    print("usage: python -m core.llm_access check|login", file=sys.stderr)
+    if args == ["login", "--force"]:
+        return _login(force=True)
+    print("usage: python -m core.llm_access check|login [--force]", file=sys.stderr)
     return 2
 
 

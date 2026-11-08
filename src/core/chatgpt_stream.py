@@ -11,9 +11,11 @@ so those calls are streamed here and handed back as a normal ``ModelResponse``.
 
 from __future__ import annotations
 
+import json
 import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
 _MARKER = "_appliedin_chatgpt_stream"
@@ -76,7 +78,14 @@ def _report_login_required() -> None:
 def _noninteractive_access(auth: Any) -> str:
     from litellm.llms.chatgpt.common_utils import GetAccessTokenError
 
-    record = auth._read_auth_file() or {}
+    # The upstream _read_auth_file may log a validation error containing the
+    # supplied JSON. A corrupt credential must never appear in daemon logs.
+    try:
+        record = json.loads(Path(auth.auth_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        record = {}
+    if not isinstance(record, dict):
+        record = {}
     token = record.get("access_token")
     if isinstance(token, str) and token and not auth._is_token_expired(record, token):
         return token

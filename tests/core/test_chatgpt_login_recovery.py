@@ -208,3 +208,27 @@ def test_only_explicit_login_context_permits_interactive_auth(monkeypatch):
     with chatgpt_stream.interactive_login():
         assert Authenticator().get_access_token() == "synthetic-fresh"
     assert entered == [True]
+
+
+def test_daemon_model_boundary_fails_closed_and_records_banner(monkeypatch):
+    """A real authenticator call through the completion wrapper must never prompt."""
+    from litellm.llms.chatgpt.authenticator import Authenticator
+
+    recorded = []
+    monkeypatch.setattr(
+        Authenticator, "_login_device_code",
+        lambda _self: pytest.fail("model call opened an interactive login"))
+    monkeypatch.setattr(
+        chatgpt_stream, "_report_login_required",
+        lambda: recorded.append(("ChatGPT authentication", chatgpt_stream._LOGIN_PROBLEM)))
+
+    def fake_provider(*_args, **_kwargs):
+        # No network: this simulates where the real provider asks LiteLLM for auth.
+        Authenticator().get_access_token()
+
+    model_call = chatgpt_stream._wrap_completion(fake_provider)
+    with pytest.raises(litellm.AuthenticationError) as exc:
+        model_call(model="chatgpt/gpt-5.4", messages=[{"role": "user", "content": "test"}])
+    assert "login-chatgpt" in str(exc.value)
+    assert recorded
+    assert all("login-chatgpt" in message for _, message in recorded)

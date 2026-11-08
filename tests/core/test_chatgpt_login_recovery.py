@@ -232,3 +232,61 @@ def test_daemon_model_boundary_fails_closed_and_records_banner(monkeypatch):
     assert "login-chatgpt" in str(exc.value)
     assert recorded
     assert all("login-chatgpt" in message for _, message in recorded)
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_daemon_repopulates_cache_during_mandatory_login(monkeypatch, tmp_path, capsys, force):
+    """A daemon refresh may rewrite auth.json after login moved the revoked cache aside.
+
+    The owner must still see a fresh device flow, even if the new cache contains
+    an unexpired (but server-revoked) token and a stale device-code cooldown.
+    Neither branch may claim success by reading that repopulated cache.
+    """
+    from pathlib import Path
+
+    from litellm.llms.chatgpt.authenticator import Authenticator
+
+    revoked = "synthetic-revoked-token"
+    new = "synthetic-device-flow-token"
+    path = _cache(tmp_path, access_token=revoked, expires_at=9999999999)
+    verification = []
+
+    def verify(token, account_id):
+        verification.append((token, account_id))
+        return False
+
+    monkeypatch.setattr(llm_access, "_verify_cached_token", verify)
+    actual_move = llm_access._move_cache_aside
+
+    def move_then_daemon_rewrites():
+        actual_move()
+        assert not path.exists()
+        # Simulate an in-flight LiteLLM metadata write or refresh committing
+        # the old credential and cooldown after the owner has moved it aside.
+        _cache(tmp_path, access_token=revoked, expires_at=9999999999,
+               device_code_requested_at=9999999999)
+
+    monkeypatch.setattr(llm_access, "_move_cache_aside", move_then_daemon_rewrites)
+    device_flows = []
+
+    def fake_device_flow(auth):
+        auth_file = Path(auth.auth_file)
+        device_flows.append(auth_file)
+        assert auth_file != path
+        assert not auth_file.exists()
+        assert json.loads(path.read_text())["access_token"] == revoked
+        # The real LiteLLM device flow saves its new credentials to auth_file.
+        auth._write_auth_file({"access_token": new, "refresh_token": "synthetic-refresh",
+                               "expires_at": 9999999999})
+        return {"access_token": new}
+
+    monkeypatch.setattr(Authenticator, "_login_device_code", fake_device_flow)
+    assert llm_access.main(["login", "--force"] if force else ["login"]) == 0
+    assert verification == ([] if force else [(revoked, None)])
+    assert len(device_flows) == 1
+    assert json.loads(path.read_text())["access_token"] == new
+    assert len(list(tmp_path.glob("auth.json.recovery-*"))) == 1
+    assert not list(tmp_path.glob("auth.json.login-*"))
+    output = capsys.readouterr().out
+    assert "succeeded" in output.lower()
+    assert revoked not in output and new not in output

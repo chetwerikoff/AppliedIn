@@ -5,6 +5,7 @@ different stage must survive even when the clearing stage saw the old value.
 """
 
 import json
+
 import litellm
 import pytest
 
@@ -67,7 +68,7 @@ def career(monkeypatch):
 
 
 def test_error_then_success_clears_same_where(screen, career):
-    """Both screens recover their own transient errors after real model work."""
+    """Both screens recover their own transient errors after mocked completions."""
     flags.note_llm_error("relevance screen", "temporary outage")
     assert flags.llm_error()["where"] == "relevance screen"
     assert [job.title for job in screen()] == ["Platform Engineer"]

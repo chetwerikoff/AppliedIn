@@ -5,8 +5,6 @@ different stage must survive even when the clearing stage saw the old value.
 """
 
 import json
-from types import SimpleNamespace
-
 import litellm
 import pytest
 
@@ -20,10 +18,6 @@ from discovery.watchlist import Preferences
 def screen(monkeypatch):
     """Synthetic relevance responses: no provider, browser or runtime data."""
     monkeypatch.setattr(relevance, "messages", lambda _: [])
-    monkeypatch.setattr(
-        "core.config.get_settings",
-        lambda: SimpleNamespace(agent_model=lambda _: "test/relevance"),
-    )
     jobs = [
         JobRecord(company="example-co", job_id="role-1",
                   title="Platform Engineer", jd_url="https://example.com/1",
@@ -41,7 +35,7 @@ def screen(monkeypatch):
             return {"choices": [{"message": {"content": payload}}]}
 
         monkeypatch.setattr(litellm, "completion", complete)
-        return relevance.relevant([] if empty else jobs, prefs)
+        return relevance.relevant([] if empty else jobs, prefs, model="test/relevance")
 
     return run
 

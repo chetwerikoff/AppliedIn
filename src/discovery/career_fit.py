@@ -119,6 +119,9 @@ def classify_search(search_id: str) -> dict:
             return {"classified": classified, "batches": index, "failed": True}
         classified += _store(search_id, labels)
     co.report_progress(f"Domain tiers saved for {classified} roles")
+    from core import flags
+
+    flags.clear_llm_error("career domain")
     return {"classified": classified, "batches": len(batches), "failed": False}
 
 

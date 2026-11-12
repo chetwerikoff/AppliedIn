@@ -125,6 +125,35 @@ def note_llm_error(where: str, msg: str) -> None:
         "at": datetime.now(UTC).isoformat()}))
 
 
+def clear_llm_error(where: str) -> bool:
+    """Clear only a matching stage's error, without erasing a newer failure.
+
+    WATCH covers the raw hash field between inspection and deletion: another
+    writer can replace it at any time, and a conflict leaves that error visible.
+    """
+    import json
+
+    try:
+        with _redis().pipeline() as pipe:
+            pipe.watch(_KEY)
+            raw = pipe.hget(_KEY, "llm_error")
+            if not raw:
+                return False
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError):
+                return False
+            if not isinstance(payload, dict) or payload.get("where") != where:
+                return False
+            pipe.multi()
+            pipe.hdel(_KEY, "llm_error")
+            pipe.execute()
+            return True
+    except Exception:  # includes Redis WATCH conflicts: keep the newer error
+        log.debug("clear_llm_error did not clear", exc_info=True)
+    return False
+
+
 def llm_error() -> dict | None:
     import json
 

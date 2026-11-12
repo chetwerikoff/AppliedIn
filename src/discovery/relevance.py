@@ -120,6 +120,9 @@ def relevant(
                     exc)
         from .filters import stage1_match
         return [j for j in jobs if stage1_match(j, prefs)]
+    from core import flags as _flags
+
+    _flags.clear_llm_error("relevance screen")
     return [j for i, j in enumerate(jobs) if i in keep]
 
 

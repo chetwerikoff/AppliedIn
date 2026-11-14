@@ -133,9 +133,9 @@ def test_standalone_model_key_scrub_config_isolation_and_own_session_cleanup(cli
     assert settings["permission"] == {"*": "deny", "webfetch": "allow"}
     assert settings["plugin"] == [] and settings["mcp"] == {}
     assert settings["provider"] == {"openai": {
-        "options": {"baseURL": "https://chatgpt.com/backend-api/codex"},
         "models": {"test-model": {"limit": {"context": 272000, "input": 272000, "output": 128000}}},
     }}
+    assert "baseURL" not in settings["provider"]["openai"]
     assert "apiKey" not in json.dumps(settings)
     assert result["model"] == "openai/test-model"
     api_command = launch.call_args_list[0].args[0]

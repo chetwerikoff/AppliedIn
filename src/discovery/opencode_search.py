@@ -97,7 +97,6 @@ def search_env(cwd, model):
             "plugin": [],
             "mcp": {},
             "provider": {"openai": {
-                "options": {"baseURL": "https://chatgpt.com/backend-api/codex"},
                 "models": {name: {"limit": {
                     "context": 272000, "input": 272000, "output": 128000,
                 }}},

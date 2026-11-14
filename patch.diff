@@ -1,0 +1,25 @@
+diff --git a/src/discovery/opencode_search.py b/src/discovery/opencode_search.py
+--- a/src/discovery/opencode_search.py
++++ b/src/discovery/opencode_search.py
+@@ -97,7 +97,6 @@
+             "plugin": [],
+             "mcp": {},
+             "provider": {"openai": {
+-                "options": {"baseURL": "https://chatgpt.com/backend-api/codex"},
+                 "models": {name: {"limit": {
+                     "context": 272000, "input": 272000, "output": 128000,
+                 }}},
+diff --git a/tests/discovery/test_opencode_search.py b/tests/discovery/test_opencode_search.py
+--- a/tests/discovery/test_opencode_search.py
++++ b/tests/discovery/test_opencode_search.py
+@@ -133,9 +133,9 @@
+     assert settings["permission"] == {"*": "deny", "webfetch": "allow"}
+     assert settings["plugin"] == [] and settings["mcp"] == {}
+     assert settings["provider"] == {"openai": {
+-        "options": {"baseURL": "https://chatgpt.com/backend-api/codex"},
+         "models": {"test-model": {"limit": {"context": 272000, "input": 272000, "output": 128000}}},
+     }}
++    assert "baseURL" not in settings["provider"]["openai"]
+     assert "apiKey" not in json.dumps(settings)
+     assert result["model"] == "openai/test-model"
+     api_command = launch.call_args_list[0].args[0]

@@ -255,7 +255,8 @@ def _validate_state(data: object) -> dict:
         raise FundingRefusal("state_capacity")
     for entry in data["active"].values():
         _auto_record(entry)
-    for k in ("day_calls", "day_http", "day_relevance", "day_added", "week_tokens"):
+    for k in ("day_calls", "day_http", "day_admission_http", "day_relevance",
+              "day_added", "week_tokens"):
         v = data["budgets"].get(k, 0)
         if type(v) is not int or v < 0:
             raise FundingRefusal("corrupt_budget")
@@ -323,6 +324,9 @@ class State:
         if b.get("day") != day:
             for name in ("day_calls", "day_http", "day_relevance", "day_added"):
                 b[name] = 0
+            if "day_admission_http" in b:
+                # Admission-only counter; scheduled state never grows this key.
+                b["day_admission_http"] = 0
             b["day"] = day
         if b.get("week") != week:
             b["week_tokens"] = 0
@@ -331,7 +335,8 @@ class State:
     def reserve(self, now, field: str, amount: int, limit: int) -> bool:
         self._period(now)
         if amount < 0 or limit < 0 or field not in {
-            "day_calls", "day_http", "day_relevance", "day_added", "week_tokens"
+            "day_calls", "day_http", "day_admission_http", "day_relevance",
+            "day_added", "week_tokens"
         }:
             raise FundingRefusal("invalid_budget")
         b = self.data["budgets"]
@@ -513,6 +518,9 @@ class _SafeTLS(http.client.HTTPSConnection):
         raise FundingRefusal("tls_or_connect_failed")
 
 
+_ADMISSION_HOMEPAGE_BYTES = 2_000_000
+
+
 class GuardedClient:
     """Minimal httpx-compatible GET surface for unchanged resolver and ATS adapters.
 
@@ -521,9 +529,13 @@ class GuardedClient:
     and TLS continues to verify the original DNS hostname.
     """
 
-    def __init__(self, *, state: State, settings, now=None, max_bytes=256_000):
+    def __init__(self, *, state: State, settings, now=None, max_bytes=256_000,
+                 http_field: str = "day_http"):
         self.state, self.settings, self.now = state, settings, now
         self.max_bytes = min(max_bytes, 512_000)
+        # Agent admission passes "day_admission_http" so it never spends the
+        # scheduled poller's day_http budget.
+        self.http_field = http_field
         self.requests = 0
         self._sec_last = 0.0
 
@@ -534,7 +546,11 @@ class GuardedClient:
         return False
 
     def get(self, url, *, params=None, headers=None, timeout=12,
-            follow_redirects=False):
+            follow_redirects=False, max_bytes=None):
+        # ``max_bytes`` is a per-call override used only by agent admission's
+        # homepage fetch; it can raise the cap to _ADMISSION_HOMEPAGE_BYTES.
+        cap = self.max_bytes if max_bytes is None else min(
+            max(max_bytes, 0), _ADMISSION_HOMEPAGE_BYTES)
         if params:
             p = urlsplit(url)
             query = p.query + ("&" if p.query else "") + urlencode(params)
@@ -551,7 +567,7 @@ class GuardedClient:
             if self.requests > self.settings.funding_max_http_per_pass:
                 raise FundingRefusal("http_pass_budget")
             now = self.now or _utc()
-            if not self.state.reserve(now, "day_http", 1,
+            if not self.state.reserve(now, self.http_field, 1,
                                       self.settings.funding_daily_http):
                 raise FundingRefusal("http_day_budget")
             if host == "www.sec.gov":
@@ -577,8 +593,8 @@ class GuardedClient:
                              headers=h)
                 response = conn.getresponse()
                 status = response.status
-                data = response.read(self.max_bytes + 1)
-                if len(data) > self.max_bytes:
+                data = response.read(cap + 1)
+                if len(data) > cap:
                     raise FundingRefusal("response_too_large")
                 out_headers = {k.lower(): v for k, v in response.getheaders()
                                if k.lower() in {"location", "etag", "last-modified", "content-type"}}
@@ -645,9 +661,9 @@ class _ArticleHTML(HTMLParser):
         return " ".join(self.parts)
 
 
-def _article(body: str) -> _ArticleHTML:
+def _article(body: str, limit: int = 120_000) -> _ArticleHTML:
     p = _ArticleHTML()
-    p.feed(body[:120_000])
+    p.feed(body[:limit])
     return p
 
 
@@ -1074,8 +1090,24 @@ def _employer_owner_proved(issuer: str, homepage: str, html: _ArticleHTML,
     )
 
 
+def _board_candidates(homepage: str, html: _ArticleHTML) -> list[tuple[str, str]]:
+    """Every homepage link that names a supported ATS board (admission only)."""
+    found = []
+    for _, link in html.links:
+        try:
+            host, path = _safe_url(urljoin(homepage, link))
+        except (FundingRefusal, ValueError):
+            continue
+        ats = next((a for a, value in _BOARD_HOST.items() if value == host), "")
+        board = path.strip("/")
+        if ats and _TENANT.fullmatch(board):
+            found.append((ats, board))
+    return found
+
+
 def _board_from_employer(homepage: str, issuer: str, client: GuardedClient,
-                         employer_page=None, aliases=()) -> tuple[str, str, str] | None:
+                         employer_page=None, aliases=(),
+                         admission: bool = False) -> tuple[str, str, str] | None:
     from .resolver import resolve
 
     seen = set()
@@ -1086,9 +1118,12 @@ def _board_from_employer(homepage: str, issuer: str, client: GuardedClient,
         page = employer_page if employer_page is not None else client.get(
             url, follow_redirects=True)
         page.raise_for_status()
-        html = _article(page.text)
+        # Admission proves ownership by the final registrable domain alone and
+        # parses the larger admission homepage; the poller path is unchanged.
+        html = _article(page.text, _ADMISSION_HOMEPAGE_BYTES) if admission else _article(page.text)
         if (registrable(str(page.request.url)) != registrable(homepage)
-                or not _employer_owner_proved(issuer, homepage, html, aliases)):
+                or (not admission
+                    and not _employer_owner_proved(issuer, homepage, html, aliases))):
             return None
         possible = [urljoin(url, link) for _, link in html.links[:150]]
         for board_url in possible:
@@ -1113,7 +1148,9 @@ def _board_from_employer(homepage: str, issuer: str, client: GuardedClient,
                 if issuer.casefold() not in board_page.text[:12000].casefold():
                     continue
                 return ats, board, native
-            except (FundingRefusal, httpx.HTTPError, ValueError):
+            except (FundingRefusal, httpx.HTTPError, ValueError) as exc:
+                if admission and str(exc) in {"http_day_budget", "http_pass_budget"}:
+                    raise  # an exhausted budget is not "no board"
                 continue
     return None
 
@@ -1159,13 +1196,19 @@ def _preview_verified(issuer: str, homepage: str, source_id: str,
                       state: State, settings, client: GuardedClient, now,
                       *, relevance_fn=None, employer_page=None,
                       aliases=(), existing_key=None,
-                      complete_negative: bool = False) -> tuple[str, dict | None]:
+                      complete_negative: bool = False,
+                      admission: bool = False) -> tuple[str, dict | None]:
     """Re-prove the employer, tenant, producer AND consumer, without stores.
 
     ``complete_negative`` is for initial agent admission only. It additionally
     refuses any feed that is malformed, truncated by the postings limit, partly
     refused by the consumer guard, or not fully covered by the relevance sample.
     Scheduled polls and rechecks never set it, so their behavior is unchanged.
+
+    ``admission`` is likewise agent-admission only. Ownership is the final
+    registrable domain alone (no name-label or heading test), and a homepage
+    that links no ATS board at all is the "no openings" case. A linked board
+    that cannot be proved stays ``guard_not_proven``.
     """
     from .adapters import ADAPTERS
     from .canonical_job_url import admit_feed, source_bound
@@ -1189,13 +1232,20 @@ def _preview_verified(issuer: str, homepage: str, source_id: str,
     page = employer_page if employer_page is not None else client.get(
         homepage, follow_redirects=True)
     page.raise_for_status()
-    if (registrable(str(page.request.url)) != domain
+    if admission:
+        if registrable(str(page.request.url)) != domain:
+            return "employer_homepage_owner_unproved", None
+    elif (registrable(str(page.request.url)) != domain
             or not _employer_owner_proved(
                 issuer, homepage, _article(page.text), aliases)):
         return "employer_homepage_owner_unproved", None
     board = _board_from_employer(
-        homepage, issuer, client, employer_page=page, aliases=aliases)
+        homepage, issuer, client, employer_page=page, aliases=aliases,
+        admission=admission)
     if not board:
+        if admission and not _board_candidates(
+                homepage, _article(page.text, _ADMISSION_HOMEPAGE_BYTES)):
+            return "no_openings", None
         return "guard_not_proven", None
     ats, token, native_url = board
     if any((c.ats == ats and c.board == token)

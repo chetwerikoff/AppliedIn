@@ -1923,3 +1923,50 @@ def test_homepage_tcp_refusal_defers_one_child_and_continues_next_candidate(
     assert len(state.data["active"]) == 1
     assert sum(row["reason"] == "probe_retryable"
                for row in state.data["deals"].values()) == 1
+
+
+def test_scheduled_preview_without_board_still_returns_guard_not_proven(tmp_path):
+    # #424: admission-only relaxations never leak into the poller/recheck path.
+    cfg = settings(tmp_path)
+    state = funding.State(tmp_path / "local" / "funded-watchlist.yaml")
+    no_board = "<html><body><h1>example-co</h1><p>example-co builds fintech.</p></body></html>"
+    mapping = {**routes(), HOME: no_board}
+    assert funding._preview_verified(
+        "example-co", HOME, "uk_feed", state, cfg, OfflineClient(mapping), NOW,
+        relevance_fn=lambda jobs, prefs: jobs) == ("guard_not_proven", None)
+    # The name/heading proof is still required on the scheduled path.
+    other = no_board.replace("<h1>example-co</h1>", "<h1>Somebody</h1>")
+    assert funding._preview_verified(
+        "example-co", HOME, "uk_feed", state, cfg,
+        OfflineClient({**mapping, HOME: other}), NOW,
+        relevance_fn=lambda jobs, prefs: jobs) == ("employer_homepage_owner_unproved", None)
+
+
+def test_guarded_client_keeps_poller_cap_and_day_http_by_default(tmp_path, monkeypatch):
+    cfg = settings(tmp_path)
+    ledger = funding.State(tmp_path / "funded-watchlist.yaml")
+    body = b"x" * 300_000
+
+    class Big:
+        def __init__(self, host, _port, **_kwargs):
+            pass
+        def request(self, method, path, *, headers):
+            pass
+        def getresponse(self):
+            return SimpleNamespace(status=200, getheaders=lambda: [],
+                                   read=lambda n=None: body[:n])
+        def close(self):
+            pass
+
+    monkeypatch.setattr(funding, "_SafeTLS", Big)
+    client = funding.GuardedClient(state=ledger, settings=cfg, now=NOW)
+    with pytest.raises(funding.FundingRefusal, match="response_too_large"):
+        client.get(HOME, follow_redirects=True)
+    assert ledger.data["budgets"]["day_http"] == 1
+    assert "day_admission_http" not in ledger.data["budgets"]
+    # Only an explicit per-call override reads the larger admission body, and it
+    # is clamped to the admission hard max.
+    assert client.get(HOME, max_bytes=funding._ADMISSION_HOMEPAGE_BYTES).content == body
+    body = b"x" * (funding._ADMISSION_HOMEPAGE_BYTES + 1)
+    with pytest.raises(funding.FundingRefusal, match="response_too_large"):
+        client.get(HOME, max_bytes=10**9)

@@ -1118,11 +1118,55 @@ def _board_from_employer(homepage: str, issuer: str, client: GuardedClient,
     return None
 
 
+class _FeedWitness:
+    """Pass-through GET surface that remembers the native board feed body.
+
+    Used only by admission's complete-negative proof. It adds no request, so
+    budgets are unchanged; it lets the caller tell an explicit empty feed from a
+    body the adapter silently read as empty (e.g. an Ashby body without ``jobs``).
+    """
+
+    _API_HOSTS = frozenset({"api.ashbyhq.com", "api.lever.co"})
+
+    def __init__(self, client):
+        self._client = client
+        self.feeds: list = []
+
+    def get(self, url, **kwargs):
+        response = self._client.get(url, **kwargs)
+        if urlsplit(str(url)).hostname in self._API_HOSTS:
+            self.feeds.append(response)
+        return response
+
+    def complete(self, ats: str, fetched: int) -> bool:
+        """True only for exactly one structurally valid feed matching the adapter."""
+        if len(self.feeds) != 1:
+            return False
+        try:
+            body = self.feeds[0].json()
+        except ValueError:
+            return False
+        if ats == "ashby":
+            items = body.get("jobs") if isinstance(body, dict) else None
+        elif ats == "lever":
+            items = body
+        else:
+            return False
+        return isinstance(items, list) and len(items) == fetched
+
+
 def _preview_verified(issuer: str, homepage: str, source_id: str,
                       state: State, settings, client: GuardedClient, now,
                       *, relevance_fn=None, employer_page=None,
-                      aliases=(), existing_key=None) -> tuple[str, dict | None]:
-    """Re-prove the employer, tenant, producer AND consumer, without stores."""
+                      aliases=(), existing_key=None,
+                      complete_negative: bool = False) -> tuple[str, dict | None]:
+    """Re-prove the employer, tenant, producer AND consumer, without stores.
+
+    ``complete_negative`` is for initial agent admission only. It additionally
+    refuses any feed that is malformed, truncated by the postings limit, partly
+    refused by the consumer guard, or not fully covered by the relevance sample.
+    Scheduled polls and rechecks never set it, so their behavior is unchanged.
+    """
     from .adapters import ADAPTERS
     from .canonical_job_url import admit_feed, source_bound
     from .watchlist import CompanyConfig, load_watchlist, load_preferences
@@ -1163,7 +1207,13 @@ def _preview_verified(issuer: str, homepage: str, source_id: str,
     cfg = CompanyConfig(name=issuer, careers_url=native_url, ats=ats, board=token)
     if not source_bound(cfg, cfg):
         return "source_bound_refused", None
-    jobs = ADAPTERS[ats].fetch(cfg, client)
+    witness = _FeedWitness(client) if complete_negative else None
+    jobs = ADAPTERS[ats].fetch(cfg, witness or client)
+    if witness is not None:
+        if not witness.complete(ats, len(jobs)):
+            return "feed_incomplete", None
+        if len(jobs) > settings.funding_max_postings_per_pass:
+            return "postings_limit", None
     # The guarded body already bounds the adapter. Sample only N postings,
     # but retain full-feed uniqueness evidence: duplicates after the sample
     # must never make a sampled job's canonical identity look unique.
@@ -1172,18 +1222,27 @@ def _preview_verified(issuer: str, homepage: str, source_id: str,
         jobs = [j for j in jobs[:settings.funding_max_postings_per_pass]
                 if ids[j.job_id] == 1]
     approved, refused = admit_feed(cfg, cfg, jobs)
-    if refused and not approved:
+    if refused and (not approved or complete_negative):
         return "consumer_guard_refused", None
     if not approved:
         return "no_openings", None
+    if complete_negative and any(
+            not isinstance(j.title, str) or not j.title.strip() for j in approved):
+        # Relevance screens titles; a blank one is no evidence of "no match".
+        return "posting_title_missing", None
     state.count(source_id, "source_and_consumer_proved", now)
+    sample = min(5, settings.funding_max_postings_per_pass)
+    if complete_negative and len(approved) > sample:
+        # An unscreened approved posting could be a match; never spend more
+        # relevance calls or enlarge the sample to force a negative.
+        return "relevance_sample_incomplete", None
     if not state.reserve(now, "day_relevance", 1, settings.funding_daily_relevance_calls):
         return "relevance_budget", None
     if relevance_fn is None:
         from .relevance import relevant
         relevance_fn = relevant
     prefs = load_preferences(Path(settings.config_dir) / "preferences.yaml")
-    if not relevance_fn(approved[:min(5, settings.funding_max_postings_per_pass)], prefs):
+    if not relevance_fn(approved[:sample], prefs):
         return "no_relevant_openings", None
     return "admissible", {
         "name": issuer, "careers_url": native_url, "ats": ats, "board": token,

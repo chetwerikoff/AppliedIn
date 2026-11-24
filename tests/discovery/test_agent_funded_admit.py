@@ -571,3 +571,45 @@ def test_module_never_enqueues_or_sends_and_changes_no_out_of_scope_file():
     src = Path(admit_mod.__file__).read_text()
     assert "enqueue_first" not in src.replace("never enqueues", "")
     assert "smtplib" not in src
+
+
+# --- review round 1 regressions ---------------------------------------------
+
+def _untitled(n, title):
+    j = job(n)
+    if title is None:
+        del j["title"]
+    else:
+        j["title"] = title
+    return j
+
+
+@pytest.mark.parametrize("title", [None, "", "   "])
+def test_blank_or_missing_title_is_not_a_complete_negative(tmp_path, title):
+    cfg = settings(tmp_path)
+    seed(cfg, pending={"a" * 32: other_pending()})
+    before = buckets(cfg)
+    screened = []
+    api = feed(_untitled(1, title))
+    result, _ = run(cfg, routes(api=api),
+                    relevance=lambda jobs, prefs: screened.append(jobs) or [])
+    assert_refused(result, "posting_title_missing")
+    assert screened == []  # refused before relevance, no relevance spend
+    assert buckets(cfg) == before
+    with pytest.raises(SourceHold):
+        read_no_opening(cfg, COMPANY_ID, now=NOW)
+    # Scheduled/default proof semantics are untouched.
+    assert _preview(cfg, routes(api=api))[0] == "no_relevant_openings"
+
+
+def test_non_string_alias_in_existing_row_collides_like_the_reader(tmp_path):
+    cfg = settings(tmp_path)
+    seed(cfg, pending={"a" * 32: other_pending(aliases=[123, None])})
+    before, raw = buckets(cfg), state_path(cfg).read_bytes()
+    for name in ("123", "None"):
+        client = OfflineClient(routes(api=b'{"jobs":[]}'))
+        result = admit(name, "https://fresh-co.com/", CONTACT, NOTE, settings=cfg, now=NOW,
+                       client_factory=lambda *_, c=client: c, relevance_fn=lambda j, p: [])
+        assert_refused(result, "identity_collision")
+        assert client.calls == []
+    assert buckets(cfg) == before and state_path(cfg).read_bytes() == raw

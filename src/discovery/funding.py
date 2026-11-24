@@ -1226,6 +1226,10 @@ def _preview_verified(issuer: str, homepage: str, source_id: str,
         return "consumer_guard_refused", None
     if not approved:
         return "no_openings", None
+    if complete_negative and any(
+            not isinstance(j.title, str) or not j.title.strip() for j in approved):
+        # Relevance screens titles; a blank one is no evidence of "no match".
+        return "posting_title_missing", None
     state.count(source_id, "source_and_consumer_proved", now)
     sample = min(5, settings.funding_max_postings_per_pass)
     if complete_negative and len(approved) > sample:

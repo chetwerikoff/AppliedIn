@@ -73,8 +73,13 @@ def _collision(data: dict, key: str, domain: str, names: set[str]) -> str | None
         return "company_key_occupied"
     for bucket in ("pending", "active"):
         for other in data[bucket].values():
-            theirs = {_norm(other.get("name"))} | {
-                _norm(a) for a in other.get("aliases", []) if isinstance(a, str)}
+            # Same stringification as read_no_opening, so nothing the reader
+            # would count as a collision can pass here; malformed evidence fails closed.
+            try:
+                theirs = {str(other.get("name", "")).strip().casefold()} | {
+                    str(a).strip().casefold() for a in other.get("aliases", [])}
+            except TypeError:
+                return "identity_collision"
             if other.get("employer_domain") == domain or not names.isdisjoint(theirs):
                 return "identity_collision"
     return None

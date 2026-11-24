@@ -155,7 +155,8 @@ def test_explicit_empty_feed_is_accepted_by_unchanged_reader(tmp_path):
         assert datetime.fromisoformat(row[field]).tzinfo is not None
     assert datetime.fromisoformat(row["next_check"]) - NOW == timedelta(days=7)
     assert datetime.fromisoformat(row["expires"]) - NOW == timedelta(days=60)
-    assert CONTACT not in json.dumps(data) and NOTE not in json.dumps(data)
+    assert CONTACT not in json.dumps(data)
+    assert row["agent_note"] == NOTE and NOTE not in json.dumps(data["deals"])
     assert not any("contact" in c for c in client.calls)
     assert data["active"] == {}
 
@@ -264,10 +265,6 @@ def test_off_tenant_posting_refuses_even_beside_a_good_one(tmp_path):
 
 @pytest.mark.parametrize("override,reason", [
     ({ASHBY_API: (500, b"boom")}, "proof_failed"),
-    ({HOME: HOME_HTML.replace('<a href="https://jobs.ashbyhq.com/example-co">Open jobs</a>',
-                              "")}, "guard_not_proven"),
-    ({HOME: HOME_HTML.replace("<h1>example-co</h1>", "<h1>Somebody</h1>")},
-     "employer_homepage_owner_unproved"),
     ({HOME: (404, b"missing")}, "proof_failed"),
 ])
 def test_failed_or_unproved_pages_refuse(tmp_path, override, reason):
@@ -430,7 +427,7 @@ class _Conn:
         if isinstance(item, Exception):
             raise item
         data = item if isinstance(item, bytes) else item.encode()
-        return SimpleNamespace(status=200, read=lambda n=None: data,
+        return SimpleNamespace(status=200, read=lambda n=None: data if n is None else data[:n],
                                getheaders=lambda: [("Content-Type", "text/html")])
 
     def close(self):
@@ -452,7 +449,8 @@ def test_guarded_http_and_relevance_accounting_persists_on_refusal(tmp_path, mon
     assert_refused(result, "relevant_opening_found")
     data = State(state_path(cfg)).data
     assert len(_Conn.seen) == 3  # homepage (reused as employer page), board, feed
-    assert data["budgets"]["day_http"] == 3
+    assert data["budgets"]["day_admission_http"] == 3
+    assert data["budgets"].get("day_http", 0) == 0
     assert data["budgets"]["day_relevance"] == 1
     assert data["report"]["counts"]["source_and_consumer_proved"] == 1
     assert {b: data[b] for b in before} == before
@@ -465,7 +463,8 @@ def test_guarded_failure_still_consumes_reservation(tmp_path, monkeypatch):
                    relevance_fn=lambda jobs, prefs: [])
     assert_refused(result, "tls_or_connect_failed")
     data = State(state_path(cfg)).data
-    assert data["budgets"]["day_http"] == 1
+    assert data["budgets"]["day_admission_http"] == 1
+    assert data["budgets"].get("day_http", 0) == 0
     assert (data["pending"], data["deals"], data["active"]) == ({}, {}, {})
 
 
@@ -475,8 +474,8 @@ def test_http_budget_exhaustion_refuses_without_admission(tmp_path, monkeypatch)
     result = admit(NAME, HOME, CONTACT, NOTE, settings=cfg, now=NOW,
                    relevance_fn=lambda jobs, prefs: [])
     assert result["admitted"] is False
-    assert result["reason"] in {"http_day_budget", "guard_not_proven"}
-    assert State(state_path(cfg)).data["budgets"]["day_http"] == 1
+    assert result["reason"] == "http_day_budget"
+    assert State(state_path(cfg)).data["budgets"]["day_admission_http"] == 1
     assert buckets(cfg)["pending"] == {}
 
 
@@ -486,7 +485,117 @@ def test_real_guarded_client_happy_path_is_accepted_by_reader(tmp_path, monkeypa
     result = admit(NAME, HOME, CONTACT, NOTE, settings=cfg, now=NOW)
     assert result["admitted"] and result["reason"] == "no_openings"
     assert read_no_opening(cfg, result["company_id"], now=NOW).reason == "no_openings"
-    assert State(state_path(cfg)).data["budgets"]["day_http"] == 3
+    assert State(state_path(cfg)).data["budgets"]["day_admission_http"] == 3
+
+
+# --- admission mode, #424 -----------------------------------------------------
+
+def _sub(tmp_path) -> Path:
+    path = tmp_path / "second"
+    path.mkdir()
+    return path
+
+
+NO_BOARD_HTML = ("<!doctype html><html><body><h1>example-co</h1>"
+                 "<p>example-co builds fintech systems.</p></body></html>")
+
+
+def test_homepage_without_ats_board_is_admitted_as_no_openings_with_note(tmp_path):
+    cfg = settings(tmp_path)
+    result, client = run(cfg, {HOME: NO_BOARD_HTML})
+    assert result == {"admitted": True, "company_id": COMPANY_ID, "reason": "no_openings"}
+    assert client.calls == [HOME]  # no board, no feed, no relevance call
+    row = State(state_path(cfg)).data["pending"][COMPANY_ID]
+    assert row["agent_note"] == NOTE and row["reason"] == "no_openings"
+    assert read_no_opening(cfg, COMPANY_ID, now=NOW).reason == "no_openings"
+
+
+def test_linked_but_unproved_board_still_refuses(tmp_path):
+    cfg = settings(tmp_path)
+    # The board link exists but its page is unreachable: not "no board".
+    result, _ = run(cfg, {HOME: HOME_HTML})
+    assert_refused(result, "guard_not_proven")
+    assert buckets(cfg) == {"pending": {}, "deals": {}, "active": {}}
+    # A link past the first 150 links is still a link, never silently "no board".
+    many = ("<h1>example-co</h1>" + "".join(f'<a href="/p{i}">x</a>' for i in range(200))
+            + '<a href="https://jobs.lever.co/example-co">jobs</a>')
+    result, _ = run(cfg, {HOME: many})
+    assert_refused(result, "guard_not_proven")
+
+
+def test_found_board_with_relevant_opening_still_refuses(tmp_path):
+    cfg = settings(tmp_path)
+    result, _ = run(cfg, routes(api=feed(job(1))), relevance=lambda jobs, prefs: jobs)
+    assert_refused(result, "relevant_opening_found")
+    assert buckets(cfg) == {"pending": {}, "deals": {}, "active": {}}
+
+
+def test_owner_proof_is_the_final_registrable_domain_only(tmp_path):
+    cfg = settings(tmp_path)
+    # Neither the domain label nor any heading names the company.
+    page = "<html><body><h1>Welcome</h1><p>We make payments.</p></body></html>"
+    result = admit("Totally Different Name", HOME, CONTACT, NOTE, settings=cfg, now=NOW,
+                   client_factory=lambda *_: OfflineClient({HOME: page}),
+                   relevance_fn=lambda j, p: [])
+    assert result["admitted"] is True and result["reason"] == "no_openings"
+    # A redirect to another registrable domain is still refused.
+    cfg2 = settings(_sub(tmp_path))
+    result2, _ = run(cfg2, {HOME: page}, final_url={HOME: "https://elsewhere.example.com/"})
+    assert_refused(result2, "homepage_domain_mismatch")
+
+
+def test_homepage_over_poller_cap_is_read_up_to_2mb(tmp_path, monkeypatch):
+    cfg = settings(tmp_path)
+    pad = "<!-- " + "x" * 400_000 + " -->"
+    _real_client(monkeypatch, {HOME: NO_BOARD_HTML + pad})
+    result = admit(NAME, HOME, CONTACT, NOTE, settings=cfg, now=NOW)
+    assert result["admitted"] and result["reason"] == "no_openings"
+    # Past the 2 MB admission cap it still refuses, never half-reads.
+    cfg2 = settings(_sub(tmp_path))
+    _real_client(monkeypatch, {HOME: NO_BOARD_HTML + "<!-- " + "x" * 2_100_000 + " -->"})
+    assert_refused(admit(NAME, HOME, CONTACT, NOTE, settings=cfg2, now=NOW),
+                   "response_too_large")
+    assert buckets(cfg2)["pending"] == {}
+
+
+def test_admission_spends_its_own_day_http_counter(tmp_path, monkeypatch):
+    cfg = settings(tmp_path, funding_daily_http=5)
+    state = State(state_path(cfg))
+    assert all(state.reserve(NOW, "day_http", 1, 5) for _ in range(5))
+    assert not state.reserve(NOW, "day_http", 1, 5)  # the poller's budget is spent
+    _real_client(monkeypatch, {HOME: NO_BOARD_HTML})
+    result = admit(NAME, HOME, CONTACT, NOTE, settings=cfg, now=NOW)
+    assert result["admitted"] is True
+    budgets = State(state_path(cfg)).data["budgets"]
+    assert budgets["day_http"] == 5 and budgets["day_admission_http"] == 1
+    # The admission counter has its own limit and day rollover.
+    cfg2 = settings(_sub(tmp_path), funding_daily_http=1)
+    seed_state = State(state_path(cfg2))
+    assert seed_state.reserve(NOW, "day_admission_http", 1, 1)
+    assert_refused(admit(NAME, HOME, CONTACT, NOTE, settings=cfg2, now=NOW),
+                   "http_day_budget")
+    assert State(state_path(cfg2)).reserve(NOW + timedelta(days=1), "day_admission_http", 1, 1)
+
+
+def test_exhausted_admission_budget_is_not_read_as_no_board(tmp_path, monkeypatch):
+    cfg = settings(tmp_path, funding_daily_http=1)
+    _real_client(monkeypatch, routes(api=b'{"jobs":[]}'))
+    assert_refused(admit(NAME, HOME, CONTACT, NOTE, settings=cfg, now=NOW),
+                   "http_day_budget")
+    assert buckets(cfg)["pending"] == {}
+
+
+@pytest.mark.parametrize("reason", [
+    "http_day_budget", "guard_not_proven", "response_too_large",
+    "employer_homepage_owner_unproved", "tls_or_connect_failed"])
+def test_next_action_is_specific_for_recoverable_refusals(reason):
+    nxt = admit_mod._refuse(reason)["next_action"]
+    assert nxt != admit_mod._DEFAULT_NEXT and "drop" not in nxt.casefold()
+    assert "manual watchlist" not in nxt or reason == "guard_not_proven"
+
+
+def test_default_next_action_stays_for_identity_failures():
+    assert admit_mod._refuse("consumer_guard_refused")["next_action"] == admit_mod._DEFAULT_NEXT
 
 
 # --- shared proof defaults are unchanged ------------------------------------

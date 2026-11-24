@@ -24,6 +24,7 @@ from pathlib import Path
 import httpx
 
 from discovery.funding import (
+    _ADMISSION_HOMEPAGE_BYTES,
     FundingRefusal,
     GuardedClient,
     State,
@@ -50,6 +51,17 @@ _NEXT = {
     "relevant_opening_found": "A matching opening exists; apply through the normal route.",
     "state_changed_during_admission": "Another writer changed the state. Stop writers; rerun.",
     "state_write_failed": "Check disk space and permissions of the local dir, then rerun.",
+    "http_day_budget": ("The admission day HTTP budget is spent. Rerun after the UTC day "
+                        "rolls over; this counter is separate from the poller's."),
+    "guard_not_proven": ("The homepage links an ATS board that could not be proved. "
+                         "Check the board link by hand, then rerun or use the manual watchlist."),
+    "response_too_large": ("A page or feed exceeded its size cap (homepage cap 2 MB). "
+                           "Give a lighter homepage URL for the same domain, then rerun."),
+    "employer_homepage_owner_unproved": (
+        "The homepage did not end on the given registrable domain. Give the company's "
+        "own https homepage, then rerun."),
+    "tls_or_connect_failed": ("The site refused or failed the guarded TLS connection. "
+                              "Retry later or give a working https homepage."),
 }
 _DEFAULT_NEXT = ("The employer or native board could not be proved. Do not admit by hand; "
                  "add the company to the manual watchlist or drop it.")
@@ -128,9 +140,11 @@ def admit(name: str, homepage: str, contact_url: str, note: str, *, aliases=(),
             return _refuse(reason)
         before = {b: copy.deepcopy(state.data[b]) for b in _BUCKETS}
         client = (client_factory(state, settings, now) if client_factory
-                  else GuardedClient(state=state, settings=settings, now=now))
+                  else GuardedClient(state=state, settings=settings, now=now,
+                                     http_field="day_admission_http"))
 
-        page = client.get(homepage, follow_redirects=True)
+        page = client.get(homepage, follow_redirects=True,
+                          max_bytes=_ADMISSION_HOMEPAGE_BYTES)
         page.raise_for_status()
         final_domain = registrable(str(page.request.url))
         if not final_domain or final_domain != domain:
@@ -143,7 +157,7 @@ def admit(name: str, homepage: str, contact_url: str, note: str, *, aliases=(),
         reason, _ = _preview_verified(
             name, homepage, SOURCE_ID, state, settings, client, now,
             relevance_fn=relevance_fn, employer_page=page, aliases=aliases,
-            complete_negative=True)
+            complete_negative=True, admission=True)
         if reason == "admissible":
             return _refuse("relevant_opening_found")
         if reason not in _NEGATIVE_REASONS:
@@ -163,7 +177,7 @@ def admit(name: str, homepage: str, contact_url: str, note: str, *, aliases=(),
         proposed["pending"][company_id] = {
             "name": name, "homepage": homepage, "employer_domain": domain,
             "source": SOURCE_ID, "aliases": aliases, "reason": reason,
-            "seen_at": seen,
+            "agent_note": note.strip(), "seen_at": seen,
             "next_check": (now + timedelta(days=settings.funding_recheck_days)).isoformat(),
             "expires": (now + timedelta(days=settings.funding_pending_days)).isoformat(),
             "last_successful_no_opening_recheck_at": seen,

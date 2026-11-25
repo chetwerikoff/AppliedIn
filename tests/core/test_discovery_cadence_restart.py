@@ -129,3 +129,14 @@ def test_a_failed_persistence_write_does_not_repeat_the_cycle_every_tick(monkeyp
 def test_paused_runs_nothing_and_persists_nothing(monkeypatch):
     h = Harness(monkeypatch, persisted=str(NOW - 10 * INTERVAL), paused=True).go(4)
     assert h.runs == [] and h.writes == []
+
+
+def test_schedule_check_runs_at_most_once_a_minute(monkeypatch):
+    h = Harness(monkeypatch, persisted=str(NOW + 5 * INTERVAL))
+    calls = []
+    monkeypatch.setattr("discovery.career_ops.scheduled_tick", lambda: calls.append(h.clock))
+    h.go(60, step=5)  # 59 polls, 295 s
+    assert calls[0] == NOW
+    gaps = [b - a for a, b in zip(calls, calls[1:])]
+    assert gaps and all(g >= daemon.SCHEDULE_CHECK_INTERVAL for g in gaps)
+    assert len(calls) <= 5

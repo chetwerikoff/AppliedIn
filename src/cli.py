@@ -54,7 +54,7 @@ import time
 from pathlib import Path
 from typing import cast
 
-from core.config import get_settings
+from core.config import _declared_worktree_root, get_settings
 from core.logging import get_logger
 from core.models import Status
 from core.stores import make_stores
@@ -233,7 +233,20 @@ def _render_unit() -> str:
             .replace("@PORT@", str(CONFIGURED_PORT)))
 
 
+def _declared_worktree() -> bool:
+    """True inside an Orca worktree. An unreadable declaration counts as one."""
+    try:
+        return _declared_worktree_root() is not None
+    except ValueError:
+        return True
+
+
 def _default_instance() -> bool:
+    # A worktree is never the primary instance, even though its setup gives it
+    # a configured port of its own. Without this, service-install run from a
+    # worktree would write and start the one shared user unit against it.
+    if _declared_worktree():
+        return False
     # The default instance is the configured port, not literally 8787: a host
     # where 8787 is taken configures another port and still needs a login service.
     selected = int(os.environ.get("APPLIEDIN_WEB_PORT") or CONFIGURED_PORT)

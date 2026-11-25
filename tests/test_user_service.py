@@ -218,3 +218,31 @@ def test_daemon_identity_missing_port_means_configured_port(world, monkeypatch, 
     assert cli._daemon_identity(4242) is not None
     monkeypatch.setenv("APPLIEDIN_WEB_PORT", "8787")
     assert cli._daemon_identity(4242) is None
+
+
+def test_declared_worktree_never_installs_the_shared_unit(world, monkeypatch, tmp_path):
+    """A worktree has its own configured port, so the port check alone would let
+    it write and start the single shared user unit. It must refuse before any
+    ownership check, unit write or systemctl call."""
+    monkeypatch.setattr(cli, "CONFIGURED_PORT", 8791)
+    monkeypatch.setenv("APPLIEDIN_WEB_PORT", "8791")
+    monkeypatch.setattr(cli, "_declared_worktree_root", lambda: tmp_path / "synthetic-worktree")
+    monkeypatch.setattr(cli, "_systemctl", lambda *a: pytest.fail("unexpected systemctl"))
+    assert not cli._default_instance()
+    assert cli._unit_owner() == "absent"
+    assert cli.install_service()["status"] == "refused"
+    assert not cli._service_unit().exists()
+    # The primary checkout (no declaration) still installs on its configured port.
+    monkeypatch.setattr(cli, "_declared_worktree_root", lambda: None)
+    assert cli._default_instance()
+    assert "APPLIEDIN_WEB_PORT=8791\n" in cli._render_unit()
+
+
+def test_unreadable_worktree_declaration_refuses_install(world, monkeypatch):
+    def broken():
+        raise ValueError("Invalid worktree setup declaration; rerun Orca setup")
+
+    monkeypatch.setattr(cli, "_declared_worktree_root", broken)
+    monkeypatch.setattr(cli, "_systemctl", lambda *a: pytest.fail("unexpected systemctl"))
+    assert cli.install_service()["status"] == "refused"
+    assert not cli._service_unit().exists()

@@ -27,6 +27,7 @@ from core.config import get_settings
 from core.models import Status
 from core.stores import make_stores
 from core.ids import is_internal_pk
+from core.thread_sampler import HotThreadSampler
 from tools import submit_hold
 
 _WEB = Path(__file__).resolve().parents[1] / "web"
@@ -47,6 +48,9 @@ _wall_clock = time.perf_counter
 _request_cpu: contextvars.ContextVar[list | None] = contextvars.ContextVar(
     "_request_cpu", default=None)
 _timing_log = logging.getLogger("server.timing")
+# #427: after a slow request, name the busiest non-request thread (at most one
+# line a minute) so GIL starvation can be traced to a function.
+_hot_sampler = HotThreadSampler()
 
 # Freed-heap release. Sync endpoints run on worker threads, and glibc gives
 # each thread its own malloc arena. A burst of concurrent full-store requests
@@ -131,6 +135,12 @@ def _install_request_timing(app: FastAPI) -> None:
                 cpu = f"{sum(sink):.3f}s" if sink else "n/a"
                 _timing_log.warning("slow request: %s %s wall=%.3fs thread_cpu=%s",
                                     request.method, request.url.path, wall, cpu)
+                try:
+                    hot = _hot_sampler.sample()
+                except Exception:  # noqa: BLE001 - a measurement must never break a request
+                    hot = None
+                if hot:
+                    _timing_log.warning("%s", hot)
                 if _heap_trim_due(end):
                     from starlette.concurrency import run_in_threadpool
 

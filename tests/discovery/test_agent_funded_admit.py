@@ -590,8 +590,16 @@ def test_exhausted_admission_budget_is_not_read_as_no_board(tmp_path, monkeypatc
     "employer_homepage_owner_unproved", "tls_or_connect_failed"])
 def test_next_action_is_specific_for_recoverable_refusals(reason):
     nxt = admit_mod._refuse(reason)["next_action"]
-    assert nxt != admit_mod._DEFAULT_NEXT and "drop" not in nxt.casefold()
+    assert nxt != admit_mod._DEFAULT_NEXT
+    assert "drop" not in nxt.casefold().replace("do not drop", "")
     assert "manual watchlist" not in nxt or reason == "guard_not_proven"
+
+
+def test_http_day_budget_next_action_says_retry_after_utc_reset_not_drop():
+    nxt = admit_mod._refuse("http_day_budget")["next_action"]
+    assert "retry" in nxt.casefold() and "UTC day reset" in nxt
+    assert "do not drop" in nxt.casefold()
+    assert "could not be proved" not in nxt
 
 
 def test_default_next_action_stays_for_identity_failures():

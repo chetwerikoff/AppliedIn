@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from types import SimpleNamespace
@@ -109,6 +110,84 @@ def test_no_reportable_thread_returns_none_and_does_not_burn_the_minute():
 
     threads.append(_thread("evaluate", 3))
     assert sampler.sample() is not None
+
+
+def test_parse_task_cpu_handles_names_with_spaces_and_parens():
+    stat = "42 (my (odd) name) S " + " ".join(["0"] * 10) + " 300 50 " + "0 " * 5
+    assert thread_sampler.parse_task_cpu_seconds(stat) == (
+        350 / thread_sampler._CLOCK_TICKS)
+    assert thread_sampler.parse_task_cpu_seconds("garbage") is None
+    assert thread_sampler.parse_task_cpu_seconds("1 (x) S 1 2") is None
+
+
+def test_cpu_of_a_task_that_exited_is_unavailable_not_a_crash():
+    if not os.path.isdir("/proc/self/task"):
+        pytest.skip("platform has no /proc task files")
+    worker = threading.Thread(target=lambda: None)
+    worker.start()
+    worker.join(timeout=2)
+
+    assert thread_sampler.thread_cpu_seconds(worker) is None
+    assert thread_sampler.thread_cpu_seconds(SimpleNamespace(native_id=None)) is None
+
+
+def test_task_vanishing_mid_sample_is_skipped_even_if_reader_raises():
+    threads = [_thread("gone", 3), _thread("evaluate", 4)]
+
+    def cpu(thread):
+        if thread.ident == 3:
+            raise FileNotFoundError("task exited during the sample")
+        return 5.0
+
+    sampler = HotThreadSampler(
+        clock=lambda: 0.0, threads=lambda: threads,
+        frames=lambda: {4: _frame_chain(1)}, cpu=cpu, current_ident=lambda: 1)
+
+    line = sampler.sample()
+
+    assert line.startswith("hot thread: evaluate")
+    assert "gone" not in line
+
+
+def test_replacement_thread_with_a_recycled_ident_starts_a_fresh_baseline():
+    first, second = _thread("old-worker", 3), _thread("new-worker", 3)
+    live, cpu, now = [first], {3: 500.0}, [0.0]
+    sampler = HotThreadSampler(
+        clock=lambda: now[0], threads=lambda: list(live),
+        frames=lambda: {3: _frame_chain(1)}, cpu=lambda t: cpu[t.ident],
+        current_ident=lambda: 1)
+    sampler.sample()
+
+    now[0], live[:], cpu[3] = 61.0, [second], 7.0
+    line = sampler.sample()
+
+    assert line.startswith("hot thread: new-worker cpu_since_last=7.00s cpu_total=7.0s")
+
+
+def test_stack_is_omitted_when_the_ident_changed_owner_during_the_sample():
+    first, second = _thread("old-worker", 3), _thread("new-worker", 3)
+    enumerations = iter([[first], [second]])
+    sampler = HotThreadSampler(
+        clock=lambda: 0.0, threads=lambda: next(enumerations),
+        frames=lambda: {3: _frame_chain(2)}, cpu=lambda t: 4.0,
+        current_ident=lambda: 1)
+
+    line = sampler.sample()
+
+    assert line.startswith("hot thread: old-worker")
+    assert "frames=unavailable" in line
+    assert "mod0.py" not in line
+
+
+def test_stack_is_omitted_when_the_sampled_thread_is_gone():
+    gone = _thread("worker", 3)
+    enumerations = iter([[gone], []])
+    sampler = HotThreadSampler(
+        clock=lambda: 0.0, threads=lambda: next(enumerations),
+        frames=lambda: {3: _frame_chain(2)}, cpu=lambda t: 4.0,
+        current_ident=lambda: 1)
+
+    assert "frames=unavailable" in sampler.sample()
 
 
 def test_real_interpreter_names_a_busy_thread():

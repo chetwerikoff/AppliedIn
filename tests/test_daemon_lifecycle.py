@@ -255,6 +255,9 @@ def test_proc_identity_rejects_wrong_module_checkout_port_and_reused_pid(tmp_pat
                         lambda value: proc if str(value) == "/proc" else real_path(value))
     monkeypatch.setattr(cli, "_repo_root", lambda: root)
     monkeypatch.delenv("APPLIEDIN_WEB_PORT", raising=False)
+    # A missing port variable means the configured port; pin it so the test
+    # does not depend on the per-worktree port.
+    monkeypatch.setattr(cli, "CONFIGURED_PORT", 8787)
     assert cli._daemon_identity(91) == "567"
     (target / "cmdline").write_bytes(b"/fake/python\0-m\0server\0")
     assert cli._daemon_identity(91) is None

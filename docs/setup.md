@@ -97,6 +97,8 @@ perfect. It does need at least one company, or discovery has nothing to scan.
 Installs anything missing, brings up Redis, checks the config, then launches the
 daemon in the background. Dashboard on `http://127.0.0.1:8787`.
 
+After setup, run `./appliedin service-install` once so the daemon also starts at login, on the configured port.
+
 Verify it is really up before reporting success:
 
 ```bash

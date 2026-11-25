@@ -54,7 +54,7 @@ import time
 from pathlib import Path
 from typing import cast
 
-from core.config import get_settings
+from core.config import _declared_worktree_root, get_settings
 from core.logging import get_logger
 from core.models import Status
 from core.stores import make_stores
@@ -226,11 +226,31 @@ def _render_unit() -> str:
     root = _repo_root()
     template = (root / "systemd/appliedin.service.in").read_text()
     return (template.replace("@WORKDIR@", _unit_path(root, word=False))
-            .replace("@PYTHON@", _unit_path(root / ".venv/bin/python", word=True)))
+            .replace("@PYTHON@", _unit_path(root / ".venv/bin/python", word=True))
+            # The unit must bind the port the default instance is configured on.
+            # A hard-coded 8787 started the daemon on a port another local
+            # program can hold, so it never came up after a reboot.
+            .replace("@PORT@", str(CONFIGURED_PORT)))
+
+
+def _declared_worktree() -> bool:
+    """True inside an Orca worktree. An unreadable declaration counts as one."""
+    try:
+        return _declared_worktree_root() is not None
+    except ValueError:
+        return True
 
 
 def _default_instance() -> bool:
-    return int(os.environ.get("APPLIEDIN_WEB_PORT") or DEFAULT_PORT) == DEFAULT_PORT
+    # A worktree is never the primary instance, even though its setup gives it
+    # a configured port of its own. Without this, service-install run from a
+    # worktree would write and start the one shared user unit against it.
+    if _declared_worktree():
+        return False
+    # The default instance is the configured port, not literally 8787: a host
+    # where 8787 is taken configures another port and still needs a login service.
+    selected = int(os.environ.get("APPLIEDIN_WEB_PORT") or CONFIGURED_PORT)
+    return selected == CONFIGURED_PORT
 
 
 def _unit_owner() -> str:
@@ -273,8 +293,8 @@ def _daemon_identity(pid: int) -> str | None:
                  if v.startswith(b"APPLIEDIN_WEB_PORT=")]
         if len(ports) > 1:
             return None
-        observed = ports[0] if ports else str(DEFAULT_PORT)
-        selected = str(int(os.environ.get("APPLIEDIN_WEB_PORT") or DEFAULT_PORT))
+        observed = ports[0] if ports else str(CONFIGURED_PORT)
+        selected = str(int(os.environ.get("APPLIEDIN_WEB_PORT") or CONFIGURED_PORT))
         if observed != selected:
             return None
         # /proc/stat comm may itself contain parentheses and spaces.

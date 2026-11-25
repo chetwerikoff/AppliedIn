@@ -1,5 +1,6 @@
 """Synthetic login-service tests: no systemd, daemon, browser or network."""
 from pathlib import Path
+import os
 import subprocess
 
 import pytest
@@ -22,7 +23,8 @@ def world(tmp_path, monkeypatch):
     return root
 
 
-def test_installed_unit_starts_real_module_at_login_not_setup(world):
+def test_installed_unit_starts_real_module_at_login_not_setup(world, monkeypatch):
+    monkeypatch.setattr(cli, "CONFIGURED_PORT", 8787)
     template = (world / "systemd/appliedin.service.in").read_text()
     assert "WantedBy=default.target" in template
     assert "ExecStart=@PYTHON@ -m daemon" in template
@@ -30,7 +32,7 @@ def test_installed_unit_starts_real_module_at_login_not_setup(world):
     assert "KillMode=process" in template
     assert "Restart=on-failure" in template
     assert "APPLIEDIN_USER_SERVICE=1" in template
-    assert "Environment=APPLIEDIN_WEB_PORT=8787" in template
+    assert "Environment=APPLIEDIN_WEB_PORT=@PORT@" in template
     assert "Environment=PATH=%h/.local/bin:" in template
     assert "ExecStartPre" not in template
     assert "systemd-run" not in template
@@ -39,6 +41,8 @@ def test_installed_unit_starts_real_module_at_login_not_setup(world):
     assert "checkout with spaces" in rendered
     assert "checkout\\x20with\\x20spaces" in rendered
     assert "@WORKDIR@" not in rendered and "@PYTHON@" not in rendered
+    assert "@PORT@" not in rendered
+    assert "Environment=APPLIEDIN_WEB_PORT=8787\n" in rendered
     assert '$$' in cli._unit_path(Path("/tmp/check$one"), word=True)
     assert '%%' in cli._unit_path(Path("/tmp/check%one"), word=True)
 
@@ -153,3 +157,92 @@ def test_install_enables_without_competing_with_manual_daemon(world, monkeypatch
     assert calls == [("cat", "appliedin.service"), ("daemon-reload",),
                      ("enable", "appliedin.service")]
     assert cli._service_unit().read_text() == cli._render_unit()
+
+
+def test_service_installs_on_configured_port_other_than_8787(world, monkeypatch):
+    """8787 can be taken by another local program, so the default instance may
+    be configured elsewhere. Refusing there left the daemon down after a reboot."""
+    monkeypatch.setattr(cli, "CONFIGURED_PORT", 8788)
+    monkeypatch.setenv("APPLIEDIN_WEB_PORT", "8788")
+    calls = []
+
+    def systemctl(*args):
+        calls.append(args)
+        code = 1 if args == ("cat", cli._SERVICE) else 0
+        return subprocess.CompletedProcess(args, code, "0\n", "")
+
+    monkeypatch.setattr(cli, "_systemctl", systemctl)
+    monkeypatch.setattr(cli, "_live_pid", lambda: None)
+    monkeypatch.setattr(cli, "_service_pid", lambda: None)
+    assert cli._default_instance()
+    result = cli.install_service()
+    assert result["status"] != "refused"
+    text = cli._service_unit().read_text()
+    assert "Environment=APPLIEDIN_WEB_PORT=8788\n" in text
+    assert "8787" not in text and "@PORT@" not in text
+    assert cli._unit_owner() == "ours"
+
+
+def test_other_port_is_still_isolated_when_configured_port_is_8787(world, monkeypatch):
+    """Isolation rule unchanged: only the configured port is the default instance."""
+    monkeypatch.setattr(cli, "CONFIGURED_PORT", 8787)
+    # Registered so teardown restores the variables _apply_instance sets.
+    monkeypatch.setenv("APPLIEDIN_WEB_PORT", "8787")
+    monkeypatch.setenv("APPLIEDIN_LOCAL_DIR", "x")
+    monkeypatch.setenv("APPLIEDIN_REDIS_URL", "x")
+    # Offline settings refuse a relative local_dir outside a test root; only the
+    # environment decision is under test here, so stub the settings read.
+    stub = type("S", (), {"local_dir": ".local-8788", "redis_url": "stub"})()
+    monkeypatch.setattr(cli, "get_settings", lambda: stub)
+    monkeypatch.setattr(cli.get_settings, "cache_clear", lambda: None, raising=False)
+    out = cli._apply_instance(8788)
+    assert out["instance"] == "port-8788"
+    assert os.environ["APPLIEDIN_LOCAL_DIR"] == ".local-8788"
+    assert os.environ["APPLIEDIN_REDIS_URL"].endswith(f"/{cli._instance_db(8788)}")
+    assert not cli._default_instance()
+    assert cli.install_service()["status"] == "refused"
+
+
+def test_daemon_identity_missing_port_means_configured_port(world, monkeypatch, tmp_path):
+    """A daemon started without the variable runs on the configured port."""
+    monkeypatch.setattr(cli, "CONFIGURED_PORT", 8788)
+    proc = tmp_path / "proc"
+    monkeypatch.setattr(cli, "Path", lambda p="": proc if p == "/proc" else Path(p))
+    pid = proc / "4242"
+    pid.mkdir(parents=True)
+    (pid / "cmdline").write_bytes(b"python\0-m\0daemon\0")
+    (pid / "cwd").symlink_to(world)
+    (pid / "environ").write_bytes(b"HOME=/x\0")
+    (pid / "stat").write_text("4242 (python) S " + " ".join(["0"] * 30))
+    monkeypatch.setenv("APPLIEDIN_WEB_PORT", "8788")
+    assert cli._daemon_identity(4242) is not None
+    monkeypatch.setenv("APPLIEDIN_WEB_PORT", "8787")
+    assert cli._daemon_identity(4242) is None
+
+
+def test_declared_worktree_never_installs_the_shared_unit(world, monkeypatch, tmp_path):
+    """A worktree has its own configured port, so the port check alone would let
+    it write and start the single shared user unit. It must refuse before any
+    ownership check, unit write or systemctl call."""
+    monkeypatch.setattr(cli, "CONFIGURED_PORT", 8791)
+    monkeypatch.setenv("APPLIEDIN_WEB_PORT", "8791")
+    monkeypatch.setattr(cli, "_declared_worktree_root", lambda: tmp_path / "synthetic-worktree")
+    monkeypatch.setattr(cli, "_systemctl", lambda *a: pytest.fail("unexpected systemctl"))
+    assert not cli._default_instance()
+    assert cli._unit_owner() == "absent"
+    assert cli.install_service()["status"] == "refused"
+    assert not cli._service_unit().exists()
+    # The primary checkout (no declaration) still installs on its configured port.
+    monkeypatch.setattr(cli, "_declared_worktree_root", lambda: None)
+    assert cli._default_instance()
+    assert "APPLIEDIN_WEB_PORT=8791\n" in cli._render_unit()
+
+
+def test_unreadable_worktree_declaration_refuses_install(world, monkeypatch):
+    def broken():
+        raise ValueError("Invalid worktree setup declaration; rerun Orca setup")
+
+    monkeypatch.setattr(cli, "_declared_worktree_root", broken)
+    monkeypatch.setattr(cli, "_systemctl", lambda *a: pytest.fail("unexpected systemctl"))
+    assert cli.install_service()["status"] == "refused"
+    assert not cli._service_unit().exists()

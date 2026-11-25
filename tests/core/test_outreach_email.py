@@ -59,6 +59,7 @@ def _mail_fake_setup(tmp_path, monkeypatch, *, collision_after_lookup=False,
     contact = VerifiedRecipient("test@example-co.com", "name:test user", "Test User",
                                 "person", "https://example-co.com/team")
     s = SimpleNamespace(mode="local", outreach_enabled=True, local_dir=str(tmp_path),
+                        outreach_linkedin_path="linkedin.json", outreach_linkedin_fields="{}",
                         outreach_timezone="UTC", outreach_sender="sender@example-co.com",
                         outreach_smtp_host="smtp.example-co.com", outreach_smtp_port=587,
                         outreach_smtp_username="synthetic", outreach_smtp_password="synthetic",
@@ -141,6 +142,59 @@ def test_fake_smtp_uses_persisted_message_id_and_zero_pixel(tmp_path, monkeypatc
     assert message["Message-ID"].startswith("<")
     assert message["In-Reply-To"] is None
     assert "http" not in message.get_body(preferencelist=("plain",)).get_content().lower()
+
+
+@pytest.mark.parametrize("unset", ["outreach_linkedin_path", "outreach_linkedin_fields"])
+def test_enqueue_first_refuses_early_when_linkedin_mapping_unset(
+        tmp_path, monkeypatch, unset):
+    from core import outreach_email as mail
+    s, now, _factory, calls = _mail_fake_setup(tmp_path, monkeypatch)
+    setattr(s, unset, "")
+    def no_io(*args, **kwargs):
+        raise AssertionError("refusal must come before any source or page read")
+    monkeypatch.setattr(mail, "read_no_opening", no_io)
+    monkeypatch.setattr(mail, "_official_page", no_io)
+    with pytest.raises(OutreachHold) as raised:
+        mail.enqueue_first(
+            settings=s, company_id="a"*32,
+            contact_page_url="https://example-co.com/team",
+            exact_address="test@example-co.com", person_name="Test User",
+            variant_id="synthetic-v1", now=now)
+    text = str(raised.value)
+    assert text.startswith("linkedin_reader_requires_private_schema_mapping")
+    assert "outreach_linkedin_path" in text and "outreach_linkedin_fields" in text
+    assert "empty JSON list" in text
+    from core.outreach_ledger import Ledger
+    with Ledger(s)._tx() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM email_queue").fetchone()[0] == 0
+    assert calls == []
+
+
+def test_sender_hold_reason_carries_underlying_contact_hold_code(tmp_path, monkeypatch):
+    """A ContactHold from the sender must not collapse into a generic recheck reason."""
+    from core import outreach_email as mail
+    from core.outreach_contacts import ContactHold
+    from core.outreach_ledger import Ledger
+    s, now, factory, calls = _mail_fake_setup(tmp_path, monkeypatch)
+    intent = mail.enqueue_first(
+        settings=s, company_id="a"*32, contact_page_url="https://example-co.com/team",
+        exact_address="test@example-co.com", person_name="Test User",
+        variant_id="synthetic-v1", now=now)
+    def unmapped(*args, **kwargs):
+        raise ContactHold("linkedin_reader_requires_private_schema_mapping")
+    monkeypatch.setattr(mail, "read_linkedin", unmapped)
+    ledger = Ledger(s)
+    claim = ledger.claim_queue(now=now)
+    assert claim is not None and claim["id"] == intent["queue_id"]
+    with pytest.raises(ContactHold):
+        mail.send_approved(settings=s, queue_id=claim["id"],
+                           owner_token=claim["owner_token"], stores=object(),
+                           now=now, smtp_factory=factory)
+    row = ledger.queue_intent(claim["id"])
+    assert row["state"] == "held"
+    assert row["reason"] == "linkedin_reader_requires_private_schema_mapping"
+    assert row["reason"] != "verified_contact_recheck_required"
+    assert not [item for item in calls if item[0] in {"constructed", "message"}]
 
 
 def test_changed_funding_identity_blocks_fake_smtp_before_wire(tmp_path, monkeypatch):
@@ -309,7 +363,8 @@ def test_unnamed_official_organization_mailbox_requires_no_name_template(tmp_pat
     now=datetime(2026,11,20,10,tzinfo=UTC)
     lead=FundedNoOpening("a"*32,"Example Co","example-co.com",
                          "https://example-co.com",(),"synthetic",now,"no_openings")
-    s=SimpleNamespace(mode="local",outreach_enabled=True,local_dir=str(tmp_path))
+    s=SimpleNamespace(mode="local",outreach_enabled=True,local_dir=str(tmp_path),
+                      outreach_linkedin_path="linkedin.json",outreach_linkedin_fields="{}")
     page="https://example-co.com/contact"
     markup='<a href="mailto:hello@example-co.com">Contact</a>'
     monkeypatch.setattr(mail,"read_no_opening",lambda *args,**kwargs: lead)

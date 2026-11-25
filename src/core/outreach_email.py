@@ -268,6 +268,14 @@ def enqueue_first(*, settings, company_id, contact_page_url, exact_address,
                   person_name, variant_id, now=None):
     """Protected local producer: proves contact/approval then only enqueues."""
     now = now or datetime.now(UTC)
+    # The sender needs the LinkedIn mapping for every email; refuse before
+    # queueing something it can only hold later under another name.
+    if not (getattr(settings,"outreach_linkedin_path","")
+            and getattr(settings,"outreach_linkedin_fields","")):
+        raise OutreachHold(
+            "linkedin_reader_requires_private_schema_mapping: set both "
+            "outreach_linkedin_path and outreach_linkedin_fields "
+            "(the file may be an empty JSON list)")
     lead = read_no_opening(settings,company_id,now=now)
     url,markup = _official_page(settings,contact_page_url,now)
     contact = verify_published_contact(company_domain=lead.domain,source_url=url,
@@ -335,7 +343,8 @@ def _safe_recheck_reason(exc):
     if isinstance(exc,OutreachHold):
         return str(exc)
     if isinstance(exc,ContactHold):
-        return "verified_contact_recheck_required"
+        # Keep the real cause; every ContactHold message is a fixed code.
+        return str(exc)
     return "source_or_preflight_recheck_required"
 
 

@@ -51,8 +51,9 @@ _NEXT = {
     "relevant_opening_found": "A matching opening exists; apply through the normal route.",
     "state_changed_during_admission": "Another writer changed the state. Stop writers; rerun.",
     "state_write_failed": "Check disk space and permissions of the local dir, then rerun.",
-    "http_day_budget": ("The admission day HTTP budget is spent. Rerun after the UTC day "
-                        "rolls over; this counter is separate from the poller's."),
+    "http_day_budget": ("The admission day HTTP budget is spent. The lead is valid: retry "
+                        "it after the UTC day reset and do not drop it; this counter is "
+                        "separate from the poller's."),
     "guard_not_proven": ("The homepage links an ATS board that could not be proved. "
                          "Check the board link by hand, then rerun or use the manual watchlist."),
     "response_too_large": ("A page or feed exceeded its size cap (homepage cap 2 MB). "

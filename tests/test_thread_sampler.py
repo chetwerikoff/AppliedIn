@@ -123,11 +123,12 @@ def test_parse_task_cpu_handles_names_with_spaces_and_parens():
 def test_cpu_of_a_task_that_exited_is_unavailable_not_a_crash():
     if not os.path.isdir("/proc/self/task"):
         pytest.skip("platform has no /proc task files")
-    worker = threading.Thread(target=lambda: None)
-    worker.start()
-    worker.join(timeout=2)
+    # Kernel task ids are below pid_max, so this task never exists. A joined
+    # thread's real id is not used: the kernel may hand it to a new thread.
+    with open("/proc/sys/kernel/pid_max", encoding="ascii") as handle:
+        absent = SimpleNamespace(native_id=int(handle.read()))
 
-    assert thread_sampler.thread_cpu_seconds(worker) is None
+    assert thread_sampler.thread_cpu_seconds(absent) is None
     assert thread_sampler.thread_cpu_seconds(SimpleNamespace(native_id=None)) is None
 
 

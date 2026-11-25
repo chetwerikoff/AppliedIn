@@ -514,17 +514,37 @@ def short_url(url: str) -> str:
 
 # ---------------------------------------------------------------- guard
 
-def guard(url: str, has_password: bool) -> None:
+INHERITED_FRAME_URLS = ("about:blank", "about:srcdoc")
+
+
+def frame_label(url: str) -> str:
+    """Scheme and host only: no path, query or fragment reaches an output."""
     parts = urlsplit(url or "")
     host = (parts.hostname or "").lower()
-    if not host or parts.scheme not in ("http", "https"):
-        raise CaptchaError(EXIT_REFUSED, f"not a web page: {url!r}")
-    if any(host == h or host.endswith("." + h) for h in BLOCKED_HOSTS):
-        raise CaptchaError(EXIT_REFUSED, f"blocked host {host}: LinkedIn CAPTCHA is never solved")
-    if BLOCKED_URL.search(parts.path + "?" + parts.query):
-        raise CaptchaError(EXIT_REFUSED, "login / sign-up / password page: human gate")
+    if parts.scheme and host:
+        return f"{parts.scheme}://{host}"
+    return parts.scheme or "unknown"
+
+
+def guard(url: str, has_password: bool, child: bool = False) -> None:
+    """Refuse protected pages. The reason is the rule name only.
+
+    A child frame at about:blank or about:srcdoc inherits its parent's origin.
+    It is not a separate web page, so the host/scheme, blocked-host and login
+    path rules do not apply to it. The password-field rule always applies.
+    """
+    parts = urlsplit(url or "")
+    inherited = child and (parts.scheme + ":" + parts.path).lower() in INHERITED_FRAME_URLS
+    if not inherited:
+        host = (parts.hostname or "").lower()
+        if not host or parts.scheme not in ("http", "https"):
+            raise CaptchaError(EXIT_REFUSED, "not a web page")
+        if any(host == h or host.endswith("." + h) for h in BLOCKED_HOSTS):
+            raise CaptchaError(EXIT_REFUSED, "blocked host")
+        if BLOCKED_URL.search(parts.path + "?" + parts.query):
+            raise CaptchaError(EXIT_REFUSED, "login / sign-up path")
     if has_password:
-        raise CaptchaError(EXIT_REFUSED, "page has a password field: human gate")
+        raise CaptchaError(EXIT_REFUSED, "password field")
 
 
 def pick_challenge(found: list[dict]) -> dict:
@@ -726,11 +746,15 @@ def run(session: str, tab: str | None, dry_run: bool, base: Path) -> tuple[int, 
         frames = page.get("frames")
         if not isinstance(frames, list) or not frames or frames[0].get("url") != url:
             raise CaptchaError(EXIT_UNSUPPORTED, "unsupported_widget")
-        for frame in frames:
+        for index, frame in enumerate(frames):
+            furl = frame.get("url", "")
             try:
-                guard(frame.get("url", ""), bool(frame.get("password")))
-            except CaptchaError:
-                raise CaptchaError(EXIT_REFUSED, "protected_page") from None
+                guard(furl, bool(frame.get("password")), child=index > 0)
+            except CaptchaError as exc:
+                # Name the rule and the frame scheme and host only.
+                raise CaptchaError(
+                    EXIT_REFUSED, f"protected_page: {exc.reason} in frame {frame_label(furl)}"
+                ) from None
         if page.get("opaque"):
             raise CaptchaError(EXIT_UNSUPPORTED, "unsupported_widget")
         challenge = pick_challenge(page.get("found") or [])

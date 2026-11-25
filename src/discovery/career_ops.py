@@ -6,6 +6,7 @@ its prompts, title preferences and submission workflow never own AppliedIn state
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -32,6 +33,9 @@ _SCAN = threading.Lock()
 _RUNNING = False
 _ACTIVE = {}
 _PROGRESS = {"run_id": "", "events": []}
+_SCHEDULE_LOCK = threading.Lock()
+_SCHEDULE_CACHE: dict = {}
+_SCHEDULE_FIELDS = ("settings", "last_search", "last_scan", "last_network")
 log = logging.getLogger(__name__)
 
 
@@ -64,6 +68,35 @@ def _write(data: dict) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False))
     tmp.replace(path)
+    with _SCHEDULE_LOCK:
+        _SCHEDULE_CACHE.clear()
+
+
+def _schedule_view() -> dict:
+    """The few schedule fields of the board, without re-parsing an unchanged file.
+
+    The board grows to tens of MB. Parsing it every poll held the GIL for a few
+    hundred ms at a time and starved the HTTP threads (#427). The cache holds only
+    the small schedule fields, keyed on the file's identity, and `_write` drops it.
+    A copy is returned, so a caller cannot change the cached values.
+    """
+    path = _path()
+    try:
+        info = path.stat()
+        key = (str(path), info.st_mtime_ns, info.st_size, info.st_ino)
+    except OSError:
+        key = None
+    if key is not None:
+        with _SCHEDULE_LOCK:
+            if _SCHEDULE_CACHE.get("key") == key:
+                return copy.deepcopy(_SCHEDULE_CACHE["view"])
+    data = _read()
+    view = {name: data.get(name) for name in _SCHEDULE_FIELDS}
+    if key is not None:
+        with _SCHEDULE_LOCK:
+            _SCHEDULE_CACHE.clear()
+            _SCHEDULE_CACHE.update(key=key, view=copy.deepcopy(view))
+    return view
 
 
 def _bridge(payload: dict, timeout: int = 600) -> list:
@@ -792,7 +825,7 @@ def scheduled_tick() -> None:
     if flags.paused() or not checkout().exists():
         return
     with _LOCK:
-        data = _read()
+        data = _schedule_view()
     settings = data.get("settings") or {}
     current = datetime.fromisoformat(now())
     due = []

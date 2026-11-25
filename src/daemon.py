@@ -60,6 +60,9 @@ log = get_logger(__name__)
 
 DISCOVER_INTERVAL = int(os.environ.get("APPLIEDIN_DISCOVER_INTERVAL_SEC", str(6 * 3600)))
 POLL_INTERVAL = int(os.environ.get("APPLIEDIN_POLL_INTERVAL_SEC", "5"))
+# The Career Ops schedule has a six hour granularity; checking it every poll only
+# burned CPU under the GIL (#427).
+SCHEDULE_CHECK_INTERVAL = 60
 WEB_PORT = int(os.environ.get("APPLIEDIN_WEB_PORT", "8787"))
 
 
@@ -97,13 +100,16 @@ def _discovery_loop(stop_event: threading.Event | None = None) -> None:
     next_due = _discovery_due(flags.get_flag("last_discovery_at"), time.time())
     log.info("next scheduled discovery in %dm — use Discover to run one now",
              max(0, int(next_due - time.time())) // 60)
+    schedule_next = 0.0
     while not stop_event.is_set():
         now = time.time()
-        try:
-            from discovery.career_ops import scheduled_tick
-            scheduled_tick()
-        except Exception:
-            log.exception("Career Ops schedule check failed")
+        if time.monotonic() >= schedule_next:
+            schedule_next = time.monotonic() + SCHEDULE_CHECK_INTERVAL
+            try:
+                from discovery.career_ops import scheduled_tick
+                scheduled_tick()
+            except Exception:
+                log.exception("Career Ops schedule check failed")
         if not flags.paused() and now >= next_due:
             next_due = now + DISCOVER_INTERVAL
             flags.set_flag("last_discovery_at", repr(now))

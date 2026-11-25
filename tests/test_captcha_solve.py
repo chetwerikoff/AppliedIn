@@ -592,7 +592,62 @@ def test_run_guards_nested_frame_before_provider(tmp_path, monkeypatch):
     monkeypatch.setattr(cs, "evaluate", lambda *a, **kw: detected)
     monkeypatch.setattr(cs, "solve", lambda *a, **kw: pytest.fail("paid task must not run"))
     code, log = cs.run("S", None, False, tmp_path)
-    assert (code, log["reason"]) == (2, "protected_page")
+    assert code == 2
+    assert log["reason"] == "protected_page: login / sign-up path in frame https://example.test"
+
+
+def _with_blank_child(**child):
+    detected = _node(_widget())["detection"]
+    detected["frames"].append({"path": "top/iframe:9::|src:", "url": "about:blank",
+                               "password": False, **child})
+    return detected
+
+
+def test_guard_child_blank_frame_skips_host_rule_only():
+    cs.guard("about:blank", False, child=True)
+    cs.guard("about:srcdoc", False, child=True)
+    for url in ("about:blank", "about:srcdoc"):
+        with pytest.raises(cs.CaptchaError):
+            cs.guard(url, False)  # top frame keeps the full rule
+    with pytest.raises(cs.CaptchaError):
+        cs.guard("about:blank", True, child=True)
+    with pytest.raises(cs.CaptchaError):
+        cs.guard("data:text/html,x", False, child=True)
+    with pytest.raises(cs.CaptchaError):
+        cs.guard("javascript:void(0)", False, child=True)
+
+
+def test_run_top_page_with_empty_blank_child_passes_guard(tmp_path, monkeypatch):
+    detected = _with_blank_child()
+    monkeypatch.setattr(cs, "evaluate", lambda *a, **kw: detected)
+    code, log = cs.run("S", None, True, tmp_path)
+    assert (code, log.get("result")) == (0, "dry_run")
+
+
+def test_run_blank_child_with_password_is_refused(tmp_path, monkeypatch):
+    detected = _with_blank_child(password=True)
+    monkeypatch.setattr(cs, "evaluate", lambda *a, **kw: detected)
+    monkeypatch.setattr(cs, "solve", lambda *a, **kw: pytest.fail("paid task must not run"))
+    code, log = cs.run("S", None, False, tmp_path)
+    assert code == 2
+    assert log["reason"] == "protected_page: password field in frame about"
+
+
+def test_run_top_blank_url_is_refused(tmp_path, monkeypatch):
+    detected = _node(_widget())["detection"]
+    detected["url"] = detected["frames"][0]["url"] = "about:blank"
+    monkeypatch.setattr(cs, "evaluate", lambda *a, **kw: detected)
+    code, log = cs.run("S", None, True, tmp_path)
+    assert (code, log["reason"]) == (2, "protected_page: not a web page in frame about")
+
+
+def test_run_refusal_reason_omits_path_and_query(tmp_path, monkeypatch):
+    detected = _with_blank_child(url="https://accounts.example.com/login?token=SECRET", password=True)
+    monkeypatch.setattr(cs, "evaluate", lambda *a, **kw: detected)
+    code, log = cs.run("S", None, False, tmp_path)
+    assert code == 2
+    assert "SECRET" not in log["reason"] and "/login" not in log["reason"]
+    assert log["reason"].endswith("in frame https://accounts.example.com")
 
 
 def test_run_fails_closed_after_ambiguous_callback(tmp_path, monkeypatch):
